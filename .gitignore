@@ -1,0 +1,20 @@
+.build/
+.build-ipa/
+.build-*/
+.build_*/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.ipa
+.DS_Store
+
+# 本地验收截图与临时预览图
+sim_*.png
+verify_seek_*.png
+test_*.png
+*_preview.png
+app_icon_verified.png
+clean_vector_icon.png
+crop_avatar_top.png
+cropped_desktop_icon.png

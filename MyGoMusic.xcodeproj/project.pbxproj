@@ -1,0 +1,296 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000010000000000000001 /* MyGoMusicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000001 /* MyGoMusicApp.swift */; };
+		A10001010000000000000001 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002010000000000000001 /* AppModel.swift */; };
+		A10001020000000000000001 /* I18n.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002020000000000000001 /* I18n.swift */; };
+		A10001030000000000000001 /* LocalSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002030000000000000001 /* LocalSource.swift */; };
+		A10001040000000000000001 /* LyricsEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002040000000000000001 /* LyricsEngine.swift */; };
+		A10001050000000000000001 /* MusicModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002050000000000000001 /* MusicModels.swift */; };
+		A10001060000000000000001 /* PlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002060000000000000001 /* PlayerEngine.swift */; };
+		A10001070000000000000001 /* PluginEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002070000000000000001 /* PluginEngine.swift */; };
+		A10001080000000000000001 /* PluginInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002080000000000000001 /* PluginInstaller.swift */; };
+		A10001090000000000000001 /* StageMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002090000000000000001 /* StageMath.swift */; };
+		A10001100000000000000001 /* HomeAndBrowseViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002100000000000000001 /* HomeAndBrowseViews.swift */; };
+		A10001110000000000000001 /* NowPlayingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002110000000000000001 /* NowPlayingView.swift */; };
+		A10001120000000000000001 /* SearchAndLibraryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002120000000000000001 /* SearchAndLibraryViews.swift */; };
+		A10001130000000000000001 /* SettingsAndMainViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002130000000000000001 /* SettingsAndMainViews.swift */; };
+		A10001140000000000000001 /* ThemeAndComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002140000000000000001 /* ThemeAndComponents.swift */; };
+		A10001160000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10002160000000000000001 /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A10000020000000000000001 /* MyGoMusicApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MyGoMusicApp.swift; sourceTree = "<group>"; };
+		A10000070000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10002160000000000000001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A10000080000000000000001 /* MyGoMusic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MyGoMusic.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10002010000000000000001 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		A10002020000000000000001 /* I18n.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = I18n.swift; sourceTree = "<group>"; };
+		A10002030000000000000001 /* LocalSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSource.swift; sourceTree = "<group>"; };
+		A10002040000000000000001 /* LyricsEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LyricsEngine.swift; sourceTree = "<group>"; };
+		A10002050000000000000001 /* MusicModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicModels.swift; sourceTree = "<group>"; };
+		A10002060000000000000001 /* PlayerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerEngine.swift; sourceTree = "<group>"; };
+		A10002070000000000000001 /* PluginEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginEngine.swift; sourceTree = "<group>"; };
+		A10002080000000000000001 /* PluginInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginInstaller.swift; sourceTree = "<group>"; };
+		A10002090000000000000001 /* StageMath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageMath.swift; sourceTree = "<group>"; };
+		A10002100000000000000001 /* HomeAndBrowseViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeAndBrowseViews.swift; sourceTree = "<group>"; };
+		A10002110000000000000001 /* NowPlayingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingView.swift; sourceTree = "<group>"; };
+		A10002120000000000000001 /* SearchAndLibraryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchAndLibraryViews.swift; sourceTree = "<group>"; };
+		A10002130000000000000001 /* SettingsAndMainViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsAndMainViews.swift; sourceTree = "<group>"; };
+		A10002140000000000000001 /* ThemeAndComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeAndComponents.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000090000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A100000A0000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A100000B0000000000000001 /* App */,
+				A10003010000000000000001 /* Sources */,
+				A100000C0000000000000001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A100000B0000000000000001 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				A10000020000000000000001 /* MyGoMusicApp.swift */,
+				A10002160000000000000001 /* Assets.xcassets */,
+				A10000070000000000000001 /* Info.plist */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		A10003010000000000000001 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				A10003020000000000000001 /* MyGoMusicCore */,
+				A10003030000000000000001 /* MyGoMusicUI */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		A10003020000000000000001 /* MyGoMusicCore */ = {
+			isa = PBXGroup;
+			children = (
+				A10002010000000000000001 /* AppModel.swift */,
+				A10002020000000000000001 /* I18n.swift */,
+				A10002030000000000000001 /* LocalSource.swift */,
+				A10002040000000000000001 /* LyricsEngine.swift */,
+				A10002050000000000000001 /* MusicModels.swift */,
+				A10002060000000000000001 /* PlayerEngine.swift */,
+				A10002070000000000000001 /* PluginEngine.swift */,
+				A10002080000000000000001 /* PluginInstaller.swift */,
+				A10002090000000000000001 /* StageMath.swift */,
+			);
+			path = MyGoMusicCore;
+			sourceTree = "<group>";
+		};
+		A10003030000000000000001 /* MyGoMusicUI */ = {
+			isa = PBXGroup;
+			children = (
+				A10002100000000000000001 /* HomeAndBrowseViews.swift */,
+				A10002110000000000000001 /* NowPlayingView.swift */,
+				A10002120000000000000001 /* SearchAndLibraryViews.swift */,
+				A10002130000000000000001 /* SettingsAndMainViews.swift */,
+				A10002140000000000000001 /* ThemeAndComponents.swift */,
+			);
+			path = MyGoMusicUI;
+			sourceTree = "<group>";
+		};
+		A100000C0000000000000001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000080000000000000001 /* MyGoMusic.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A100000D0000000000000001 /* MyGoMusic */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A100000E0000000000000001 /* Build configuration list for PBXNativeTarget "MyGoMusic" */;
+			buildPhases = (
+				A100000F0000000000000001 /* Sources */,
+				A10000090000000000000001 /* Frameworks */,
+				A10004010000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MyGoMusic;
+			productName = MyGoMusic;
+			productReference = A10000080000000000000001 /* MyGoMusic.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000100000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = A10000110000000000000001 /* Build configuration list for PBXProject "MyGoMusic" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = "zh-Hans";
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				"zh-Hans",
+			);
+			mainGroup = A100000A0000000000000001;
+			productRefGroup = A100000C0000000000000001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A100000D0000000000000001 /* MyGoMusic */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10004010000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10001160000000000000001 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A100000F0000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000001 /* MyGoMusicApp.swift in Sources */,
+				A10001010000000000000001 /* AppModel.swift in Sources */,
+				A10001020000000000000001 /* I18n.swift in Sources */,
+				A10001030000000000000001 /* LocalSource.swift in Sources */,
+				A10001040000000000000001 /* LyricsEngine.swift in Sources */,
+				A10001050000000000000001 /* MusicModels.swift in Sources */,
+				A10001060000000000000001 /* PlayerEngine.swift in Sources */,
+				A10001070000000000000001 /* PluginEngine.swift in Sources */,
+				A10001080000000000000001 /* PluginInstaller.swift in Sources */,
+				A10001090000000000000001 /* StageMath.swift in Sources */,
+				A10001100000000000000001 /* HomeAndBrowseViews.swift in Sources */,
+				A10001110000000000000001 /* NowPlayingView.swift in Sources */,
+				A10001120000000000000001 /* SearchAndLibraryViews.swift in Sources */,
+				A10001130000000000000001 /* SettingsAndMainViews.swift in Sources */,
+				A10001140000000000000001 /* ThemeAndComponents.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A10000130000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.20;
+				PRODUCT_BUNDLE_IDENTIFIER = com.egoist.mygomusic.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A10000140000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.20;
+				PRODUCT_BUNDLE_IDENTIFIER = com.egoist.mygomusic.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A100000E0000000000000001 /* Build configuration list for PBXNativeTarget "MyGoMusic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000130000000000000001 /* Debug */,
+				A10000140000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000110000000000000001 /* Build configuration list for PBXProject "MyGoMusic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000130000000000000001 /* Debug */,
+				A10000140000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A10000100000000000000001 /* Project object */;
+}

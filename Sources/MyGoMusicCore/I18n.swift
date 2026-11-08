@@ -1,0 +1,476 @@
+// I18n.swift
+// 对应原项目 internal/i18n/i18n.go 与 zh_cn.go 的多语言国际化系统
+
+import Foundation
+
+public enum AppLanguage: String, CaseIterable, Identifiable, Codable, Sendable {
+    case system = "system"
+    case english = "en"
+    case chinese = "zh-CN"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .system: return I18n.t("Follow System")
+        case .english: return "English"
+        case .chinese: return "简体中文"
+        }
+    }
+}
+
+/// 国际化引擎（完整移植自 internal/i18n）
+public final class I18n: @unchecked Sendable {
+    public static let shared = I18n()
+
+    private let lock = NSLock()
+    private var selected: AppLanguage = .system
+
+    private init() {}
+
+    /// 设置当前语言偏好
+    public static func setLanguage(_ lang: AppLanguage) {
+        shared.lock.lock()
+        shared.selected = lang
+        shared.lock.unlock()
+    }
+
+    /// 获取实际生效的语言代码（"en" 或 "zh-CN"）
+    public static func languageCode() -> String {
+        shared.lock.lock()
+        let current = shared.selected
+        shared.lock.unlock()
+
+        switch current {
+        case .english:
+            return "en"
+        case .chinese:
+            return "zh-CN"
+        case .system:
+            let preferred = Locale.preferredLanguages.first ?? "zh-Hans"
+            if preferred.lowercased().hasPrefix("zh") {
+                return "zh-CN"
+            }
+            return "en"
+        }
+    }
+
+    /// 翻译文本
+    public static func t(_ key: String) -> String {
+        if languageCode() == "zh-CN", let translated = zhCN[key] {
+            return translated
+        }
+        if let pipeIndex = key.firstIndex(of: "|") {
+            return String(key[..<pipeIndex])
+        }
+        return key
+    }
+
+    /// 带上下文的翻译（如 "Save|library"）
+    public static func tc(_ key: String, _ context: String) -> String {
+        return t("\(key)|\(context)")
+    }
+
+    /// 格式化翻译（自动将 Go 风格的 %s 转换为 Foundation String(format:) 所需的 %@）
+    public static func tf(_ key: String, _ args: CVarArg...) -> String {
+        let format = t(key).replacingOccurrences(of: "%s", with: "%@")
+        return String(format: format, arguments: args)
+    }
+
+    /// 歌曲数量格式化
+    public static func songs(_ count: Int) -> String {
+        if count == 1 {
+            return t("1 song")
+        }
+        return tf("%d songs", count)
+    }
+
+    /// 专辑数量格式化
+    public static func albums(_ count: Int) -> String {
+        if count == 1 {
+            return t("1 album")
+        }
+        return tf("%d albums", count)
+    }
+
+    /// 播客节目期数格式化
+    public static func episodes(_ count: Int) -> String {
+        if count == 1 {
+            return t("1 episode")
+        }
+        return tf("%d episodes", count)
+    }
+
+    /// 今日日期格式化（对应 i18n.Today）
+    public static func today(_ date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        if languageCode() == "zh-CN" {
+            formatter.locale = Locale(identifier: "zh_CN")
+            formatter.dateFormat = "M月d日 EEEE"
+        } else {
+            formatter.locale = Locale(identifier: "en_US")
+            formatter.dateFormat = "EEEE, MMMM d"
+        }
+        return formatter.string(from: date)
+    }
+
+    /// 问候语（对应 greeting）
+    public static func greeting(for date: Date = Date()) -> String {
+        let hour = Calendar.current.component(.hour, from: date)
+        if hour < 5 {
+            return t("Good night")
+        } else if hour < 12 {
+            return t("Good morning")
+        } else if hour < 18 {
+            return t("Good afternoon")
+        } else {
+            return t("Good evening")
+        }
+    }
+
+    /// 相对时间格式化
+    public static func relativeTime(from timestampMs: Int64?, now: Date = Date()) -> String {
+        guard let ms = timestampMs, ms > 0 else { return "" }
+        let date = Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0)
+        let seconds = Int(now.timeIntervalSince(date))
+        if seconds < 60 {
+            return t("just now")
+        }
+        let minutes = seconds / 60
+        if minutes == 1 {
+            return t("a minute ago")
+        }
+        if minutes < 60 {
+            return tf("%d minutes ago", minutes)
+        }
+        let hours = minutes / 60
+        if hours == 1 {
+            return t("an hour ago")
+        }
+        if hours < 24 {
+            return tf("%d hours ago", hours)
+        }
+        let days = hours / 24
+        if days == 1 {
+            return t("yesterday")
+        }
+        if days < 30 {
+            return tf("%d days ago", days)
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    // MARK: - 完整简体中文词典（移植自 internal/i18n/zh_cn.go）
+    public static let zhCN: [String: String] = [
+        "%.1f GB used": "已用 %.1f GB",
+        "%d MB used": "已用 %d MB",
+        "%d albums": "%d 张专辑",
+        "%d days ago": "%d 天前",
+        "%d episodes": "%d 期",
+        "%d hours ago": "%d 小时前",
+        "%d minutes ago": "%d 分钟前",
+        "%d songs": "%d 首",
+        "%d songs found": "找到 %d 首歌曲",
+        "%s Mini Player": "%s迷你播放器",
+        "%s and more · %s": "%s 等 · %s",
+        "%s isn't available right now": "%s 暂时不可用",
+        "%s needs setting up first": "%s 需要先进行设置",
+        "%s, %s": "%s，%s",
+        "1 GB": "1 GB",
+        "1 album": "1 张专辑",
+        "1 episode": "1 期",
+        "1 song": "1 首",
+        "10 GB": "10 GB",
+        "2 GB": "2 GB",
+        "5 GB": "5 GB",
+        "About": "简介",
+        "About %s": "关于%s",
+        "About This Episode": "节目简介",
+        "Account": "账户",
+        "Add": "添加",
+        "Add Folder…": "添加文件夹…",
+        "Add a Music Folder": "添加音乐文件夹",
+        "Add a music folder": "添加音乐文件夹",
+        "Add the folders where your music lives": "添加存放音乐的文件夹",
+        "Add to Playlist": "添加到歌单",
+        "Added to Liked Songs": "已添加到我喜欢的音乐",
+        "Added to the playlist": "已添加到歌单",
+        "Adjust each song's volume by what its plugin measured of it, for them to sound as loud as each other": "按插件测得的响度调整每首歌的音量，让歌曲听起来一样响",
+        "Album": "专辑",
+        "Album Cover": "专辑封面",
+        "Albums": "专辑",
+        "Albums you save will show here": "收藏的专辑会显示在这里",
+        "Appearance": "外观",
+        "Artist": "歌手",
+        "Artists": "歌手",
+        "Back": "返回",
+        "Buffering…": "正在缓冲…",
+        "Built-in": "自带",
+        "Cache": "缓存",
+        "Can reach %s": "可访问 %s",
+        "Can reach any website": "可访问任何网站",
+        "Cancel": "取消",
+        "Captions": "字幕",
+        "Captions are off": "字幕已关闭",
+        "Captions for Podcasts": "为播客生成字幕",
+        "Change Repeat Mode": "切换循环模式",
+        "Check for Updates": "检查更新",
+        "Checking for updates…": "正在检查更新…",
+        "Choose where your music lives, and it will all be here: MP3, FLAC, Ogg, WAV and M4A files, with their tags, covers and lyrics.": "选择存放音乐的位置，歌曲都会出现在这里：MP3、FLAC、Ogg、WAV 与 M4A 文件，连同标签、封面和歌词。",
+        "Clear": "清除",
+        "Clear Recent Searches": "清空搜索历史",
+        "Clear Search": "清除搜索",
+        "Clear the Cache": "清除缓存",
+        "Close": "关闭",
+        "Comments": "评论",
+        "Controls": "控制",
+        "Copy": "拷贝",
+        "Copy Link": "复制链接",
+        "Copy Title": "复制歌名",
+        "Copy Title and Artists": "复制歌名和歌手",
+        "Couldn't add it to the playlist. Try again later.": "添加失败，请稍后再试",
+        "Couldn't check for updates": "无法检查更新",
+        "Couldn't create the playlist. Try again later.": "创建歌单失败，请稍后再试",
+        "Couldn't delete the playlist. Try again later.": "删除失败，请稍后再试",
+        "Couldn't download this song": "下载失败，请稍后再试",
+        "Couldn't load the comments": "评论加载失败",
+        "Couldn't load the stations": "电台加载失败",
+        "Couldn't load this album": "专辑加载失败",
+        "Couldn't load this artist": "歌手加载失败",
+        "Couldn't load this page": "页面加载失败",
+        "Couldn't load this playlist": "歌单加载失败",
+        "Couldn't load this podcast": "播客加载失败",
+        "Couldn't load your albums": "专辑加载失败",
+        "Couldn't load your liked songs": "喜欢的音乐加载失败",
+        "Couldn't load your playlists": "歌单加载失败",
+        "Couldn't load your podcasts": "播客加载失败",
+        "Couldn't load. Click to try again.": "加载失败，点按重试",
+        "Couldn't move the song. Try again later.": "移动失败，请稍后再试",
+        "Couldn't play this song": "无法播放这首歌",
+        "Couldn't post your comment. Try again later.": "评论发送失败，请稍后再试",
+        "Couldn't reach this plugin": "无法连接这个插件",
+        "Couldn't remove it from the playlist. Try again later.": "移除失败，请稍后再试",
+        "Couldn't rename the playlist. Try again later.": "重命名失败，请稍后再试",
+        "Couldn't sign out": "退出登录失败",
+        "Create": "创建",
+        "Creating…": "正在创建…",
+        "Current Version %s": "当前版本 %s",
+        "Dark": "深色",
+        "Daily Picks": "每日推荐",
+        "Daily Song Picks": "每日歌曲推荐",
+        "Delete": "删除",
+        "Delete Playlist": "删除歌单",
+        "Delete Playlist…": "删除歌单…",
+        "Delete all the songs kept here": "删除保存在本机的全部歌曲",
+        "Delete the playlist “%s”? This can't be undone.": "确定删除歌单“%s”吗？删除后无法恢复。",
+        "Discover": "发现",
+        "Download": "下载",
+        "Download…": "下载…",
+        "Downloaded %s": "已下载《%s》",
+        "Downloading…": "正在下载…",
+        "Edit": "编辑",
+        "Enable %s": "启用 %s",
+        "Episodes": "节目",
+        "Even Out Loudness": "音量均衡",
+        "Experiments": "实验性功能",
+        "File": "文件",
+        "Fill in %s for it to work": "填写%s后才能使用",
+        "Flow": "流光",
+        "Fog Backdrop": "烟雾背景",
+        "The album-colored fog drifts behind the Now Playing screen.": "播放页背景会随音乐缓慢流动封面色雾效。",
+        "Fog Backdrop Description": "播放页封面色雾效随音乐缓慢流动。",
+        "Follow": "关注",
+        "Follow System": "跟随系统",
+        "Following": "已关注",
+        "Forward": "前进",
+        "From %s": "来自 %s",
+        "From GitHub…": "从 GitHub…",
+        "From a Folder…": "从文件夹…",
+        "From a Zip…": "从 Zip 文件…",
+        "From this computer": "来自本机",
+        "General": "通用",
+        "Go to Album: %s": "查看专辑：%s",
+        "Go to Artist: %s": "查看歌手：%s",
+        "Go to Podcast": "查看播客",
+        "Good afternoon": "下午好",
+        "Good evening": "晚上好",
+        "Good morning": "早上好",
+        "Good night": "夜深了",
+        "Grow From the Cover": "从封面展开",
+        "Hear something new": "听见更多好音乐",
+        "High": "高",
+        "Home": "首页",
+        "Import Audio Files…": "导入音频文件…",
+        "No audio files imported": "没有导入音频文件，请检查所选项目是否包含受支持的音频格式。",
+        "In intros, breaks and outros, a song's top comments show in place of the lyrics": "前奏、间奏与尾奏时，歌词处换成这首歌的热门评论",
+        "Install": "安装",
+        "Install %s": "安装 %s",
+        "Install %s?": "要安装 %s 吗？",
+        "Install a Plugin": "安装插件",
+        "Install from GitHub": "从 GitHub 安装",
+        "Language": "语言",
+        "Leave %s": "退出%s",
+        "Left %s": "已退出%s",
+        "Library": "音乐库",
+        "Light": "浅色",
+        "Like": "喜欢",
+        "Like/Unlike": "喜欢/取消喜欢",
+        "Liked Songs": "我喜欢的音乐",
+        "Loading…": "正在加载…",
+        "Local Files": "本地文件",
+        "Looking for music…": "正在查找音乐…",
+        "Lossless": "无损",
+        "Lyrics": "歌词",
+        "More": "更多",
+        "More for %s": "%s 的更多操作",
+        "Move Down": "下移",
+        "Move Up": "上移",
+        "Music without end": "无尽音乐",
+        "Mute": "静音",
+        "My Page": "我的主页",
+        "My Playlists": "我的歌单",
+        "New Playlist": "新建歌单",
+        "New Playlist…": "新建歌单…",
+        "Next": "下一首",
+        "No albums": "暂无专辑",
+        "No comments yet": "还没有评论",
+        "No episodes yet": "暂无节目",
+        "No lyrics. Enjoy the music.": "纯音乐，请欣赏",
+        "No music found": "没有找到音乐",
+        "No settings found": "没有找到相关设置",
+        "No stations yet": "暂无电台",
+        "Not Playing": "未在播放",
+        "Nothing found": "没有找到相关结果",
+        "Nothing here yet": "这里还什么都没有",
+        "Now Playing": "正在播放",
+        "Effects Preview": "效果预览",
+        "Choose a song to preview its cover colors.": "选择歌曲后可预览封面配色与烟雾效果。",
+        "Off": "关闭",
+        "Open": "打开",
+        "Open %s": "打开%s",
+        "Open Now Playing": "打开正在播放",
+        "Open Settings": "打开设置",
+        "Open on GitHub": "在 GitHub 上打开",
+        "Opening the plugin…": "正在打开插件…",
+        "Pause": "暂停播放",
+        "Play": "播放",
+        "Play/Pause": "播放/暂停",
+        "Playback": "播放",
+        "Playing": "正在播放",
+        "Playing something else elsewhere": "另一端正在播放其他内容",
+        "Playlist": "歌单",
+        "Playlist Name": "歌单名称",
+        "Playlist deleted": "已删除歌单",
+        "Playlists": "歌单",
+        "Plugin": "插件",
+        "Plugins": "插件",
+        "Podcast": "播客",
+        "Podcasts": "播客",
+        "Podcasts you subscribe to will show here": "订阅的播客会显示在这里",
+        "Post": "发送",
+        "Previous": "上一首",
+        "Progress": "播放进度",
+        "Quality": "音质",
+        "Queue": "播放队列",
+        "Radio": "电台",
+        "Recent Searches": "搜索历史",
+        "Recently Played": "最近播放",
+        "Remove": "移除",
+        "Remove %s?": "要移除 %s 吗？",
+        "Remove from Playlist": "从歌单中移除",
+        "Remove from Saved": "取消收藏",
+        "Remove…": "移除…",
+        "Removed from Liked Songs": "已取消喜欢",
+        "Removed from Saved": "已取消收藏",
+        "Rename Playlist": "重命名歌单",
+        "Rename…": "重命名…",
+        "Repeat": "循环",
+        "Rescan": "重新扫描",
+        "Resume": "继续播放",
+        "Retry": "重试",
+        "Save": "保存",
+        "Save|library": "收藏",
+        "Saved": "已收藏",
+        "Saved Albums": "收藏的专辑",
+        "Saved Playlists": "收藏的歌单",
+        "Search": "搜索",
+        "Search Results": "搜索结果",
+        "Search Settings": "搜索设置",
+        "Search for something to play.": "搜索想听的音乐。",
+        "Search for “%s”": "搜索“%s”",
+        "Search · %s": "搜索 · %s",
+        "See All": "查看全部",
+        "Services": "服务",
+        "Settings": "设置",
+        "Settings…": "设置…",
+        "Shuffle": "随机播放",
+        "Sign In": "登录",
+        "Sign Out": "退出登录",
+        "Sign in to %s": "登录 %s",
+        "Sign in to %s to see this": "登录 %s 后才能查看",
+        "Sign in to play this song": "登录后才能播放这首歌",
+        "Signed in as %s": "已登录：%s",
+        "Smoke on the Progress Bar": "进度条烟雾特效",
+        "A glowing playhead trails smoke during playback; it pauses while seeking.": "播放时进度头会发光并拖出烟雾；暂停或拖动进度条时停止。",
+        "Progress Smoke Description": "播放时，进度头会发光并拖出烟雾；暂停或拖动进度条时停止。",
+        "Song": "歌曲",
+        "Song Cache": "歌曲缓存",
+        "Songs": "歌曲",
+        "Songs will show here as they're found.": "找到的歌曲会显示在这里。",
+        "Songs you like will show here": "喜欢的歌曲会显示在这里",
+        "Source": "音源",
+        "Sources": "音源切换",
+        "Sparks": "火花",
+        "Stage": "律动",
+        "Stage Style": "律动效果",
+        "Standard": "标准",
+        "Start Listening": "开始收听",
+        "Stations": "电台",
+        "Steps": "云阶",
+        "Subscribe": "订阅",
+        "Subscribed": "已订阅",
+        "Suggestions": "搜索建议",
+        "System": "跟随系统",
+        "That didn't work. Try again later.": "操作失败，请稍后再试",
+        "That's all the comments": "没有更多评论了",
+        "The plugin needs setting up": "插件需要先进行设置",
+        "The plugin of this song is gone": "这首歌的插件已不存在",
+        "The search failed": "搜索失败，请稍后再试",
+        "The station didn't answer": "电台没有响应",
+        "The station has nothing more right now": "电台暂时没有更多歌曲",
+        "There are no music files in the folders you chose. Try another.": "所选文件夹中没有音乐文件，请换一个试试。",
+        "There's no such public repository on GitHub": "GitHub 上没有这个公开仓库",
+        "This episode has no description": "这期节目没有简介",
+        "This page is gone": "这个页面已不存在",
+        "This song isn't available": "这首歌无法播放",
+        "This station can't play right now. Try again later.": "电台暂时无法播放，请稍后再试",
+        "Tilt": "倾诉",
+        "Top Comment": "热评",
+        "Top Comments in Quiet Parts": "间奏时显示热评",
+        "Tuning in…": "正在调频…",
+        "Turn On": "开启",
+        "Unfollowed": "已取消关注",
+        "Unlike": "取消喜欢",
+        "Unsubscribed": "已取消订阅",
+        "Up Next": "待播清单",
+        "Up to date": "已是最新",
+        "Update to %s": "更新到 %s",
+        "Updates": "更新",
+        "Updating…": "正在更新…",
+        "Various Artists": "群星",
+        "View Comments": "查看评论",
+        "Volume": "音量",
+        "Waiting for you to finish signing in…": "正在等待你完成登录…",
+        "Wall": "选歌",
+        "Write a comment…": "写评论…",
+        "Write a repository as owner/repo, or its address on GitHub": "请填写 owner/repo，或仓库的 GitHub 地址",
+        "Zip Archive": "Zip 压缩包",
+        "a minute ago": "1 分钟前",
+        "an hour ago": "1 小时前",
+        "just now": "刚刚",
+        "owner/repo or URL": "owner/repo 或网址",
+        "yesterday": "昨天"
+    ]
+}
