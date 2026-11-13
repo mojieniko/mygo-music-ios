@@ -12,6 +12,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Run MyGoMusicVerifier & Unit Tests
+        run: |
+          swift build --disable-sandbox
+          swift run --disable-sandbox MyGoMusicVerifier
+          swift test --disable-sandbox
+
       - name: Build MyGoMusic.ipa
         run: |
           chmod +x ./build-ipa.sh

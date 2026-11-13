@@ -3,6 +3,89 @@
 
 import Foundation
 
+// MARK: - Go 风格 JSON 宽容解码辅助
+
+private extension KeyedDecodingContainer {
+    /// 读取标量值为字符串（兼容 JSON string / number / bool，兼容缺失或 null）
+    func decodeLossyString(forKey key: Key, default defaultValue: String = "") -> String {
+        decodeLossyOptionalString(forKey: key) ?? defaultValue
+    }
+
+    func decodeLossyOptionalString(forKey key: Key) -> String? {
+        if let s = try? decodeIfPresent(String.self, forKey: key) {
+            return s
+        }
+        if let i = try? decodeIfPresent(Int64.self, forKey: key) {
+            return String(i)
+        }
+        if let d = try? decodeIfPresent(Double.self, forKey: key), d.isFinite {
+            if d.rounded() == d && abs(d) < Double(Int64.max) {
+                return String(Int64(d))
+            }
+            return String(d)
+        }
+        if let b = try? decodeIfPresent(Bool.self, forKey: key) {
+            return b ? "true" : "false"
+        }
+        return nil
+    }
+
+    func decodeLossyInt64(forKey key: Key, default defaultValue: Int64 = 0) -> Int64 {
+        decodeLossyOptionalInt64(forKey: key) ?? defaultValue
+    }
+
+    func decodeLossyOptionalInt64(forKey key: Key) -> Int64? {
+        if let i = try? decodeIfPresent(Int64.self, forKey: key) {
+            return i
+        }
+        if let d = try? decodeIfPresent(Double.self, forKey: key), d.isFinite {
+            return Int64(d.rounded())
+        }
+        if let s = try? decodeIfPresent(String.self, forKey: key) {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let i = Int64(trimmed) { return i }
+            if let d = Double(trimmed), d.isFinite { return Int64(d.rounded()) }
+        }
+        return nil
+    }
+
+    func decodeLossyOptionalInt(forKey key: Key) -> Int? {
+        guard let v = decodeLossyOptionalInt64(forKey: key) else { return nil }
+        return Int(clamping: v)
+    }
+
+    func decodeLossyOptionalDouble(forKey key: Key) -> Double? {
+        if let d = try? decodeIfPresent(Double.self, forKey: key), d.isFinite {
+            return d
+        }
+        if let i = try? decodeIfPresent(Int64.self, forKey: key) {
+            return Double(i)
+        }
+        if let s = try? decodeIfPresent(String.self, forKey: key),
+           let d = Double(s.trimmingCharacters(in: .whitespacesAndNewlines)), d.isFinite {
+            return d
+        }
+        return nil
+    }
+
+    func decodeLossyOptionalBool(forKey key: Key) -> Bool? {
+        if let b = try? decodeIfPresent(Bool.self, forKey: key) {
+            return b
+        }
+        if let i = try? decodeIfPresent(Int.self, forKey: key) {
+            return i != 0
+        }
+        if let s = try? decodeIfPresent(String.self, forKey: key) {
+            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes": return true
+            case "false", "0", "no": return false
+            default: break
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - 基础音乐实体
 
 /// 歌手模型（对应 music.Artist）
@@ -13,11 +96,23 @@ public struct Artist: Codable, Identifiable, Hashable, Sendable {
     /// 是否已关注该歌手（支持 followArtist 的音乐源使用）
     public var following: Bool?
 
+    enum CodingKeys: String, CodingKey {
+        case id, name, imageUrl, following
+    }
+
     public init(id: String, name: String, imageUrl: String? = nil, following: Bool? = nil) {
         self.id = id
         self.name = name
         self.imageUrl = imageUrl
         self.following = following
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.following = c.decodeLossyOptionalBool(forKey: .following)
     }
 }
 
@@ -31,6 +126,10 @@ public struct Album: Codable, Identifiable, Hashable, Sendable {
     public var released: String?
     /// 是否已收藏该专辑（支持 saveAlbum 的音乐源使用）
     public var saved: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, imageUrl, artists, released, saved
+    }
 
     public init(
         id: String = "",
@@ -46,6 +145,16 @@ public struct Album: Codable, Identifiable, Hashable, Sendable {
         self.artists = artists
         self.released = released
         self.saved = saved
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.artists = (try? c.decodeIfPresent([Artist].self, forKey: .artists)) ?? nil
+        self.released = c.decodeLossyOptionalString(forKey: .released)
+        self.saved = c.decodeLossyOptionalBool(forKey: .saved)
     }
 
     /// 拼接专辑歌手名称
@@ -74,6 +183,11 @@ public struct Track: Codable, Identifiable, Hashable, Sendable {
     public var description: String?
     public var published: String?
 
+    enum CodingKeys: String, CodingKey {
+        case id, source, name, artists, album, duration, url, unavailable
+        case showId, description, published
+    }
+
     public init(
         id: String,
         source: String? = nil,
@@ -98,6 +212,21 @@ public struct Track: Codable, Identifiable, Hashable, Sendable {
         self.showId = showId
         self.description = description
         self.published = published
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.source = c.decodeLossyOptionalString(forKey: .source)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.artists = (try? c.decodeIfPresent([Artist].self, forKey: .artists)) ?? nil
+        self.album = (try? c.decodeIfPresent(Album.self, forKey: .album)) ?? Album()
+        self.duration = c.decodeLossyInt64(forKey: .duration)
+        self.url = c.decodeLossyOptionalString(forKey: .url)
+        self.unavailable = c.decodeLossyOptionalBool(forKey: .unavailable)
+        self.showId = c.decodeLossyOptionalString(forKey: .showId)
+        self.description = c.decodeLossyOptionalString(forKey: .description)
+        self.published = c.decodeLossyOptionalString(forKey: .published)
     }
 
     /// 拼接歌手名称（对应 Track.ArtistNames）
@@ -138,6 +267,10 @@ public struct Playlist: Codable, Identifiable, Hashable, Sendable {
     public var fixed: Bool?
     public var tracks: [Track]?
 
+    enum CodingKeys: String, CodingKey {
+        case id, name, imageUrl, description, owner, trackCount, mine, saved, fixed, tracks
+    }
+
     public init(
         id: String,
         name: String,
@@ -161,6 +294,20 @@ public struct Playlist: Codable, Identifiable, Hashable, Sendable {
         self.fixed = fixed
         self.tracks = tracks
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.description = c.decodeLossyOptionalString(forKey: .description)
+        self.owner = c.decodeLossyOptionalString(forKey: .owner)
+        self.trackCount = c.decodeLossyOptionalInt(forKey: .trackCount)
+        self.mine = c.decodeLossyOptionalBool(forKey: .mine)
+        self.saved = c.decodeLossyOptionalBool(forKey: .saved)
+        self.fixed = c.decodeLossyOptionalBool(forKey: .fixed)
+        self.tracks = (try? c.decodeIfPresent([Track].self, forKey: .tracks)) ?? nil
+    }
 }
 
 /// 歌手详情页模型（对应 music.ArtistPage）
@@ -169,10 +316,21 @@ public struct ArtistPage: Codable, Hashable, Sendable {
     public var tracks: [Track]?
     public var albums: [Album]?
 
+    enum CodingKeys: String, CodingKey {
+        case artist, tracks, albums
+    }
+
     public init(artist: Artist, tracks: [Track]? = nil, albums: [Album]? = nil) {
         self.artist = artist
         self.tracks = tracks
         self.albums = albums
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.artist = (try? c.decodeIfPresent(Artist.self, forKey: .artist)) ?? Artist(id: "", name: "")
+        self.tracks = (try? c.decodeIfPresent([Track].self, forKey: .tracks)) ?? nil
+        self.albums = (try? c.decodeIfPresent([Album].self, forKey: .albums)) ?? nil
     }
 }
 
@@ -181,9 +339,19 @@ public struct AlbumPage: Codable, Hashable, Sendable {
     public var album: Album
     public var tracks: [Track]?
 
+    enum CodingKeys: String, CodingKey {
+        case album, tracks
+    }
+
     public init(album: Album, tracks: [Track]? = nil) {
         self.album = album
         self.tracks = tracks
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.album = (try? c.decodeIfPresent(Album.self, forKey: .album)) ?? Album()
+        self.tracks = (try? c.decodeIfPresent([Track].self, forKey: .tracks)) ?? nil
     }
 }
 
@@ -195,11 +363,23 @@ public struct Account: Codable, Identifiable, Hashable, Sendable {
     /// 个人主页对应的 Browse 页面标识
     public var page: String?
 
+    enum CodingKeys: String, CodingKey {
+        case id, name, imageUrl, page
+    }
+
     public init(id: String, name: String, imageUrl: String? = nil, page: String? = nil) {
         self.id = id
         self.name = name
         self.imageUrl = imageUrl
         self.page = page
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.page = c.decodeLossyOptionalString(forKey: .page)
     }
 }
 
@@ -225,6 +405,10 @@ public struct SearchResult: Codable, Hashable, Sendable {
     public var shows: [Show]?
     public var more: Bool?
 
+    enum CodingKeys: String, CodingKey {
+        case tracks, albums, artists, playlists, shows, more
+    }
+
     public init(
         tracks: [Track]? = nil,
         albums: [Album]? = nil,
@@ -239,6 +423,16 @@ public struct SearchResult: Codable, Hashable, Sendable {
         self.playlists = playlists
         self.shows = shows
         self.more = more
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tracks = (try? c.decodeIfPresent([Track].self, forKey: .tracks)) ?? nil
+        self.albums = (try? c.decodeIfPresent([Album].self, forKey: .albums)) ?? nil
+        self.artists = (try? c.decodeIfPresent([Artist].self, forKey: .artists)) ?? nil
+        self.playlists = (try? c.decodeIfPresent([Playlist].self, forKey: .playlists)) ?? nil
+        self.shows = (try? c.decodeIfPresent([Show].self, forKey: .shows)) ?? nil
+        self.more = c.decodeLossyOptionalBool(forKey: .more)
     }
 
     public var count: Int {
@@ -256,9 +450,17 @@ public struct TrackPage: Codable, Hashable, Sendable {
     public var tracks: [Track]?
     public var more: Bool?
 
+    enum CodingKeys: String, CodingKey { case tracks, more }
+
     public init(tracks: [Track]? = nil, more: Bool? = nil) {
         self.tracks = tracks
         self.more = more
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tracks = (try? c.decodeIfPresent([Track].self, forKey: .tracks)) ?? nil
+        self.more = c.decodeLossyOptionalBool(forKey: .more)
     }
 }
 
@@ -267,9 +469,17 @@ public struct AlbumList: Codable, Hashable, Sendable {
     public var albums: [Album]?
     public var more: Bool?
 
+    enum CodingKeys: String, CodingKey { case albums, more }
+
     public init(albums: [Album]? = nil, more: Bool? = nil) {
         self.albums = albums
         self.more = more
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.albums = (try? c.decodeIfPresent([Album].self, forKey: .albums)) ?? nil
+        self.more = c.decodeLossyOptionalBool(forKey: .more)
     }
 }
 
@@ -285,6 +495,10 @@ public struct Show: Codable, Identifiable, Hashable, Sendable {
     public var publisherPage: String?
     public var episodeCount: Int?
     public var subscribed: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, imageUrl, description, publisher, publisherPage, episodeCount, subscribed
+    }
 
     public init(
         id: String,
@@ -305,6 +519,18 @@ public struct Show: Codable, Identifiable, Hashable, Sendable {
         self.episodeCount = episodeCount
         self.subscribed = subscribed
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.description = c.decodeLossyOptionalString(forKey: .description)
+        self.publisher = c.decodeLossyOptionalString(forKey: .publisher)
+        self.publisherPage = c.decodeLossyOptionalString(forKey: .publisherPage)
+        self.episodeCount = c.decodeLossyOptionalInt(forKey: .episodeCount)
+        self.subscribed = c.decodeLossyOptionalBool(forKey: .subscribed)
+    }
 }
 
 /// 播客详情页模型（对应 music.ShowPage）
@@ -313,10 +539,19 @@ public struct ShowPage: Codable, Hashable, Sendable {
     public var episodes: [Track]?
     public var more: Bool?
 
+    enum CodingKeys: String, CodingKey { case show, episodes, more }
+
     public init(show: Show, episodes: [Track]? = nil, more: Bool? = nil) {
         self.show = show
         self.episodes = episodes
         self.more = more
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.show = (try? c.decodeIfPresent(Show.self, forKey: .show)) ?? Show(id: "", name: "")
+        self.episodes = (try? c.decodeIfPresent([Track].self, forKey: .episodes)) ?? nil
+        self.more = c.decodeLossyOptionalBool(forKey: .more)
     }
 }
 
@@ -327,11 +562,21 @@ public struct Station: Codable, Identifiable, Hashable, Sendable {
     public var description: String?
     public var imageUrl: String?
 
+    enum CodingKeys: String, CodingKey { case id, name, description, imageUrl }
+
     public init(id: String, name: String, description: String? = nil, imageUrl: String? = nil) {
         self.id = id
         self.name = name
         self.description = description
         self.imageUrl = imageUrl
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.description = c.decodeLossyOptionalString(forKey: .description)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
     }
 }
 
@@ -345,6 +590,10 @@ public struct Comment: Codable, Identifiable, Hashable, Sendable {
     public var time: Int64?
     public var likes: Int?
     public var liked: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, author, avatarUrl, text, time, likes, liked
+    }
 
     public init(
         id: String,
@@ -363,6 +612,17 @@ public struct Comment: Codable, Identifiable, Hashable, Sendable {
         self.likes = likes
         self.liked = liked
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.author = c.decodeLossyString(forKey: .author)
+        self.avatarUrl = c.decodeLossyOptionalString(forKey: .avatarUrl)
+        self.text = c.decodeLossyString(forKey: .text)
+        self.time = c.decodeLossyOptionalInt64(forKey: .time)
+        self.likes = c.decodeLossyOptionalInt(forKey: .likes)
+        self.liked = c.decodeLossyOptionalBool(forKey: .liked)
+    }
 }
 
 /// 评论分页模型（对应 music.CommentPage）
@@ -371,10 +631,19 @@ public struct CommentPage: Codable, Hashable, Sendable {
     public var total: Int?
     public var more: Bool?
 
+    enum CodingKeys: String, CodingKey { case comments, total, more }
+
     public init(comments: [Comment]? = nil, total: Int? = nil, more: Bool? = nil) {
         self.comments = comments
         self.total = total
         self.more = more
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.comments = (try? c.decodeIfPresent([Comment].self, forKey: .comments)) ?? nil
+        self.total = c.decodeLossyOptionalInt(forKey: .total)
+        self.more = c.decodeLossyOptionalBool(forKey: .more)
     }
 }
 
@@ -388,6 +657,10 @@ public struct Browse: Codable, Hashable, Sendable {
     public var description: String?
     public var sections: [Section]?
 
+    enum CodingKeys: String, CodingKey {
+        case title, subtitle, imageUrl, description, sections
+    }
+
     public init(
         title: String? = nil,
         subtitle: String? = nil,
@@ -400,6 +673,15 @@ public struct Browse: Codable, Hashable, Sendable {
         self.imageUrl = imageUrl
         self.description = description
         self.sections = sections
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.title = c.decodeLossyOptionalString(forKey: .title)
+        self.subtitle = c.decodeLossyOptionalString(forKey: .subtitle)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.description = c.decodeLossyOptionalString(forKey: .description)
+        self.sections = (try? c.decodeIfPresent([Section].self, forKey: .sections)) ?? nil
     }
 }
 
@@ -418,6 +700,11 @@ public struct Section: Codable, Hashable, Sendable {
     public var empty: String?
     public var pageTitle: String?
     public var subtitle: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title, tracks, albums, artists, playlists, shows, stations, links
+        case morePage, empty, pageTitle, subtitle
+    }
 
     public init(
         title: String? = nil,
@@ -446,6 +733,22 @@ public struct Section: Codable, Hashable, Sendable {
         self.pageTitle = pageTitle
         self.subtitle = subtitle
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.title = c.decodeLossyOptionalString(forKey: .title)
+        self.tracks = (try? c.decodeIfPresent([Track].self, forKey: .tracks)) ?? nil
+        self.albums = (try? c.decodeIfPresent([Album].self, forKey: .albums)) ?? nil
+        self.artists = (try? c.decodeIfPresent([Artist].self, forKey: .artists)) ?? nil
+        self.playlists = (try? c.decodeIfPresent([Playlist].self, forKey: .playlists)) ?? nil
+        self.shows = (try? c.decodeIfPresent([Show].self, forKey: .shows)) ?? nil
+        self.stations = (try? c.decodeIfPresent([Station].self, forKey: .stations)) ?? nil
+        self.links = (try? c.decodeIfPresent([BrowseLink].self, forKey: .links)) ?? nil
+        self.morePage = c.decodeLossyOptionalString(forKey: .morePage)
+        self.empty = c.decodeLossyOptionalString(forKey: .empty)
+        self.pageTitle = c.decodeLossyOptionalString(forKey: .pageTitle)
+        self.subtitle = c.decodeLossyOptionalString(forKey: .subtitle)
+    }
 }
 
 /// 跳转其他 Browse 页的链接卡片（对应 music.Link）
@@ -455,11 +758,21 @@ public struct BrowseLink: Codable, Hashable, Sendable {
     public var imageUrl: String?
     public var page: String
 
+    enum CodingKeys: String, CodingKey { case title, subtitle, imageUrl, page }
+
     public init(title: String, subtitle: String? = nil, imageUrl: String? = nil, page: String) {
         self.title = title
         self.subtitle = subtitle
         self.imageUrl = imageUrl
         self.page = page
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.title = c.decodeLossyString(forKey: .title)
+        self.subtitle = c.decodeLossyOptionalString(forKey: .subtitle)
+        self.imageUrl = c.decodeLossyOptionalString(forKey: .imageUrl)
+        self.page = c.decodeLossyString(forKey: .page)
     }
 }
 
@@ -472,6 +785,8 @@ public struct NavItem: Codable, Hashable, Sendable {
     /// 图标名：home, note, album, artist, playlist, radio, podcast, chart, calendar, heart, search, star
     public var icon: String?
 
+    enum CodingKeys: String, CodingKey { case title, page, builtin, icon }
+
     public init(title: String? = nil, page: String? = nil, builtin: String? = nil, icon: String? = nil) {
         self.title = title
         self.page = page
@@ -481,6 +796,19 @@ public struct NavItem: Codable, Hashable, Sendable {
 }
 
 // MARK: - 音频流、歌词与远程播放
+
+/// 用于解码值类型多样的 HTTP Header 字典
+private struct LossyStringBox: Decodable {
+    let stringValue: String
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self) { stringValue = s; return }
+        if let i = try? c.decode(Int64.self) { stringValue = String(i); return }
+        if let d = try? c.decode(Double.self) { stringValue = String(d); return }
+        if let b = try? c.decode(Bool.self) { stringValue = b ? "true" : "false"; return }
+        stringValue = ""
+    }
+}
 
 /// 音频流描述（对应 music.Stream）
 public struct StreamInfo: Codable, Hashable, Sendable {
@@ -493,6 +821,10 @@ public struct StreamInfo: Codable, Hashable, Sendable {
     public var peak: Double?
     public var gain: Double?
     public var headers: [String: String]?
+
+    enum CodingKeys: String, CodingKey {
+        case url, type, quality, bitRate, size, peak, gain, headers
+    }
 
     public init(
         url: String,
@@ -513,6 +845,26 @@ public struct StreamInfo: Codable, Hashable, Sendable {
         self.gain = gain
         self.headers = headers
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.url = c.decodeLossyString(forKey: .url)
+        self.type = c.decodeLossyOptionalString(forKey: .type)
+        self.quality = c.decodeLossyOptionalString(forKey: .quality)
+        self.bitRate = c.decodeLossyOptionalInt(forKey: .bitRate)
+        self.size = c.decodeLossyOptionalInt64(forKey: .size)
+        self.peak = c.decodeLossyOptionalDouble(forKey: .peak)
+        self.gain = c.decodeLossyOptionalDouble(forKey: .gain)
+        if let rawHeaders = try? c.decodeIfPresent([String: LossyStringBox].self, forKey: .headers) {
+            var dict: [String: String] = [:]
+            for (k, v) in rawHeaders where !v.stringValue.isEmpty {
+                dict[k] = v.stringValue
+            }
+            self.headers = dict.isEmpty ? nil : dict
+        } else {
+            self.headers = nil
+        }
+    }
 }
 
 /// 原始歌词响应（对应 music.Lyrics）
@@ -521,10 +873,19 @@ public struct RawLyrics: Codable, Hashable, Sendable {
     public var translation: String?
     public var lines: [RawLyricLine]?
 
+    enum CodingKeys: String, CodingKey { case lrc, translation, lines }
+
     public init(lrc: String? = nil, translation: String? = nil, lines: [RawLyricLine]? = nil) {
         self.lrc = lrc
         self.translation = translation
         self.lines = lines
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.lrc = c.decodeLossyOptionalString(forKey: .lrc)
+        self.translation = c.decodeLossyOptionalString(forKey: .translation)
+        self.lines = (try? c.decodeIfPresent([RawLyricLine].self, forKey: .lines)) ?? nil
     }
 }
 
@@ -535,6 +896,10 @@ public struct RawLyricLine: Codable, Hashable, Sendable {
     public var text: String?
     public var translation: String?
     public var words: [RawLyricWord]?
+
+    enum CodingKeys: String, CodingKey {
+        case start, end, text, translation, words
+    }
 
     public init(
         start: Int64,
@@ -549,6 +914,15 @@ public struct RawLyricLine: Codable, Hashable, Sendable {
         self.translation = translation
         self.words = words
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.start = c.decodeLossyInt64(forKey: .start)
+        self.end = c.decodeLossyOptionalInt64(forKey: .end)
+        self.text = c.decodeLossyOptionalString(forKey: .text)
+        self.translation = c.decodeLossyOptionalString(forKey: .translation)
+        self.words = (try? c.decodeIfPresent([RawLyricWord].self, forKey: .words)) ?? nil
+    }
 }
 
 /// 原始逐字歌词（对应 music.LyricWord）
@@ -557,10 +931,19 @@ public struct RawLyricWord: Codable, Hashable, Sendable {
     public var end: Int64
     public var text: String
 
+    enum CodingKeys: String, CodingKey { case start, end, text }
+
     public init(start: Int64, end: Int64, text: String) {
         self.start = start
         self.end = end
         self.text = text
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.start = c.decodeLossyInt64(forKey: .start)
+        self.end = c.decodeLossyInt64(forKey: .end)
+        self.text = c.decodeLossyString(forKey: .text)
     }
 }
 
@@ -570,10 +953,19 @@ public struct RemoteDevice: Codable, Identifiable, Hashable, Sendable {
     public var name: String
     public var active: Bool?
 
+    enum CodingKeys: String, CodingKey { case id, name, active }
+
     public init(id: String, name: String, active: Bool? = nil) {
         self.id = id
         self.name = name
         self.active = active
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = c.decodeLossyString(forKey: .id)
+        self.name = c.decodeLossyString(forKey: .name)
+        self.active = c.decodeLossyOptionalBool(forKey: .active)
     }
 }
 
@@ -585,6 +977,10 @@ public struct RemoteState: Codable, Hashable, Sendable {
     public var duration: Int64
     public var volume: Int
     public var device: String?
+
+    enum CodingKeys: String, CodingKey {
+        case playing, trackId, position, duration, volume, device
+    }
 
     public init(
         playing: Bool,
@@ -601,6 +997,16 @@ public struct RemoteState: Codable, Hashable, Sendable {
         self.volume = volume
         self.device = device
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.playing = c.decodeLossyOptionalBool(forKey: .playing) ?? false
+        self.trackId = c.decodeLossyOptionalString(forKey: .trackId)
+        self.position = c.decodeLossyInt64(forKey: .position)
+        self.duration = c.decodeLossyInt64(forKey: .duration)
+        self.volume = c.decodeLossyOptionalInt(forKey: .volume) ?? 100
+        self.device = c.decodeLossyOptionalString(forKey: .device)
+    }
 }
 
 /// 播放模式（对应 music.Playback）
@@ -609,20 +1015,64 @@ public enum PlaybackMode: String, Codable, Hashable, Sendable {
     case remote = "remote"
 }
 
-/// 插件配置项（对应 music.Setting）
+/// 下拉设置选项（对应 music.SettingOption，v0.1.23+）
+public struct PluginSettingOption: Codable, Hashable, Sendable {
+    public var value: String
+    public var label: String
+
+    enum CodingKeys: String, CodingKey { case value, label }
+
+    public init(value: String, label: String) {
+        self.value = value
+        self.label = label
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.value = c.decodeLossyString(forKey: .value)
+        self.label = c.decodeLossyString(forKey: .label, default: self.value)
+    }
+}
+
+/// 插件配置项（对应 music.Setting，兼容 v0.1.23+ 的 text/password/boolean/select）
 public struct PluginSettingSpec: Codable, Identifiable, Hashable, Sendable {
     public var key: String
     public var label: String
     public var help: String?
     public var link: String?
+    /// 字段类型：text（默认）、password、boolean、select；未知类型按 text 处理
+    public var type: String?
+    /// select 类型对应的可选项
+    public var options: [PluginSettingOption]?
 
     public var id: String { key }
 
-    public init(key: String, label: String, help: String? = nil, link: String? = nil) {
+    enum CodingKeys: String, CodingKey { case key, label, help, link, type, options }
+
+    public init(
+        key: String,
+        label: String,
+        help: String? = nil,
+        link: String? = nil,
+        type: String? = nil,
+        options: [PluginSettingOption]? = nil
+    ) {
         self.key = key
         self.label = label
         self.help = help
         self.link = link
+        self.type = type
+        self.options = options
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.key = c.decodeLossyString(forKey: .key)
+        self.label = c.decodeLossyString(forKey: .label, default: self.key)
+        self.help = c.decodeLossyOptionalString(forKey: .help)
+        self.link = c.decodeLossyOptionalString(forKey: .link)
+        self.type = c.decodeLossyOptionalString(forKey: .type)
+        self.options = (try? c.decodeIfPresent([PluginSettingOption].self, forKey: .options)) ?? nil
     }
 }
 
@@ -657,9 +1107,17 @@ public struct SignInPrompt: Codable, Hashable, Sendable {
     public var qr: String?
     public var text: String?
 
+    enum CodingKeys: String, CodingKey { case qr, text }
+
     public init(qr: String? = nil, text: String? = nil) {
         self.qr = qr
         self.text = text
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.qr = c.decodeLossyOptionalString(forKey: .qr)
+        self.text = c.decodeLossyOptionalString(forKey: .text)
     }
 }
 

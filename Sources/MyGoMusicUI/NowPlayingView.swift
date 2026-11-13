@@ -12,14 +12,16 @@ public struct NowPlayingView: View {
 
     @State private var newCommentText = ""
     @State private var scrubbingPosition: TimeInterval? = nil
+    @State private var growAppeared = false
 
     public init() {}
 
     public var body: some View {
         let track = app.player.currentTrack
+        let isRadio = app.player.radioName?.isEmpty == false
         ZStack {
             if let track {
-                VStack(spacing: 14) {
+                VStack(spacing: isRadio ? 16 : 14) {
                     // 2. 顶部下拉关闭指示器与面板切换标签栏
                     topHeaderBar(for: track)
 
@@ -53,8 +55,19 @@ public struct NowPlayingView: View {
                     )
                 }
                 .padding(.horizontal, 22)
-                .padding(.top, 12)
+                .padding(.top, isRadio ? 18 : 12)
                 .padding(.bottom, 20)
+                .scaleEffect(app.settings.growFromCover && !growAppeared ? 0.94 : 1.0)
+                .opacity(app.settings.growFromCover && !growAppeared ? 0.0 : 1.0)
+                .onAppear {
+                    if app.settings.growFromCover {
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.85)) {
+                            growAppeared = true
+                        }
+                    } else {
+                        growAppeared = true
+                    }
+                }
             } else {
                 Text(I18n.t("Not Playing"))
                     .foregroundStyle(.white.opacity(0.6))
@@ -261,7 +274,12 @@ public struct NowPlayingView: View {
     }
 
     private func commentsPaneView(for track: Track) -> some View {
-        VStack(spacing: 12) {
+        let sid = track.source ?? app.activeSourceID
+        let src = app.source(forID: sid)
+        let canLike = src?.can("likeComment") == true
+        let canPost = src?.can("postComment") == true
+
+        return VStack(spacing: 12) {
             ScrollView {
                 if app.isLoadingComments && app.currentTrackComments.isEmpty {
                     ProgressView()
@@ -274,23 +292,45 @@ public struct NowPlayingView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 14) {
                         ForEach(app.currentTrackComments) { comment in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    ArtworkView(
+                                        urlString: comment.avatarUrl,
+                                        pixelSize: 96,
+                                        size: 24,
+                                        cornerRadius: 12,
+                                        systemIcon: "person.crop.circle.fill"
+                                    )
                                     Text(comment.author)
                                         .font(.system(size: 13, weight: .bold))
-                                        .foregroundStyle(.white.opacity(0.85))
+                                        .foregroundStyle(.white.opacity(0.88))
+                                        .lineLimit(1)
                                     Spacer()
                                     Text(I18n.relativeTime(from: comment.time))
                                         .font(.system(size: 11))
-                                        .foregroundStyle(.white.opacity(0.4))
-                                    if let likes = comment.likes, likes > 0 {
-                                        HStack(spacing: 3) {
-                                            Image(systemName: comment.liked == true ? "heart.fill" : "heart")
-                                                .font(.system(size: 11))
-                                            Text("\(likes)")
-                                                .font(.system(size: 11))
+                                        .foregroundStyle(.white.opacity(0.45))
+
+                                    let likes = comment.likes ?? 0
+                                    let liked = comment.liked == true
+                                    if canLike || likes > 0 || liked {
+                                        Button {
+                                            Task { await app.toggleLikeComment(comment) }
+                                        } label: {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: liked ? "heart.fill" : "heart")
+                                                    .font(.system(size: 12))
+                                                if likes > 0 {
+                                                    Text("\(likes)")
+                                                        .font(.system(size: 11, weight: .semibold))
+                                                }
+                                            }
+                                            .foregroundStyle(liked ? MyGoTheme.accent : .white.opacity(0.6))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 3)
+                                            .background(.white.opacity(liked ? 0.14 : 0.06), in: Capsule())
                                         }
-                                        .foregroundStyle(.white.opacity(0.55))
+                                        .buttonStyle(.plain)
+                                        .disabled(!canLike)
                                     }
                                 }
                                 Text(comment.text)
@@ -300,12 +340,18 @@ public struct NowPlayingView: View {
                             .padding(12)
                             .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
                         }
+
+                        if app.commentsHasMore {
+                            LoadMoreButton(isLoading: app.isLoadingMoreComments) {
+                                Task { await app.loadMoreComments() }
+                            }
+                            .padding(.top, 4)
+                        }
                     }
                 }
             }
 
-            let sid = track.source ?? app.activeSourceID
-            if let src = app.source(forID: sid), src.can("postComment") {
+            if canPost {
                 HStack(spacing: 10) {
                     TextField(I18n.t("Write a comment…"), text: $newCommentText)
                         .textFieldStyle(.plain)
@@ -331,25 +377,92 @@ public struct NowPlayingView: View {
     }
 
     private func podcastEpisodeAboutPane(for track: Track) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(I18n.t("About This Episode"))
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.white)
+        ScrollViewReader { capProxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    // 实时语音识别字幕卡片（基于系统 Speech 框架，本地/离线文件支持）
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "captions.bubble.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(app.settings.captions ? MyGoTheme.accent : .white.opacity(0.6))
+                            Text(I18n.t("Live Captions"))
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(.white)
+                            Spacer()
+                            Toggle("", isOn: $app.settings.captions)
+                                .labelsHidden()
+                                .tint(MyGoTheme.accent)
+                        }
 
-                if let pub = track.published, !pub.isEmpty {
-                    Text(pub)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.white.opacity(0.55))
+                        if !app.liveCaptionsStatus.isEmpty {
+                            HStack(spacing: 8) {
+                                Text(app.liveCaptionsStatus)
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(.white.opacity(0.65))
+                                Spacer()
+                                if app.settings.captions && app.timedCaptions.isEmpty {
+                                    Button(I18n.t("Turn On Captions")) {
+                                        Task { await app.requestSpeechPermissionAndRefreshCaptions() }
+                                    }
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(MyGoTheme.accent)
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+
+                        if app.settings.captions && !app.timedCaptions.isEmpty {
+                            let activeCapIdx = LyricsEngine.index(in: app.timedCaptions, at: app.player.position)
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(Array(app.timedCaptions.enumerated()), id: \.offset) { idx, capLine in
+                                    let isActive = (idx == activeCapIdx)
+                                    Text(capLine.text)
+                                        .font(.system(size: isActive ? 15.5 : 14, weight: isActive ? .bold : .regular))
+                                        .foregroundStyle(isActive ? .white : .white.opacity(0.55))
+                                        .multilineTextAlignment(.leading)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.vertical, 4)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            app.player.seek(to: capLine.at)
+                                        }
+                                        .id("cap-\(idx)")
+                                }
+                            }
+                            .onChange(of: activeCapIdx) { _, newIdx in
+                                guard newIdx >= 0 else { return }
+                                withAnimation(.easeInOut(duration: 0.25)) {
+                                    capProxy.scrollTo("cap-\(newIdx)", anchor: .center)
+                                }
+                            }
+                        } else if !app.settings.captions {
+                            Text(I18n.t("Captions are off"))
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                    }
+                    .padding(14)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+
+                    Text(I18n.t("About This Episode"))
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(.white)
+
+                    if let pub = track.published, !pub.isEmpty {
+                        Text(pub)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.white.opacity(0.55))
+                    }
+
+                    Text(track.description?.isEmpty == false ? track.description! : I18n.t("This episode has no description"))
+                        .font(.system(size: 14.5))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineSpacing(4)
                 }
-
-                Text(track.description?.isEmpty == false ? track.description! : I18n.t("This episode has no description"))
-                    .font(.system(size: 14.5))
-                    .foregroundStyle(.white.opacity(0.85))
-                    .lineSpacing(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 12)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 12)
         }
     }
 }
@@ -605,7 +718,7 @@ private struct NowPlayingBottomControlsView: View {
                 .buttonStyle(.plain)
             }
 
-            // 音量滑块
+            // 音量滑块与 AirPlay 输出设备切换
             HStack(spacing: 10) {
                 Image(systemName: "speaker.fill")
                     .font(.system(size: 12))
@@ -615,6 +728,8 @@ private struct NowPlayingBottomControlsView: View {
                 Image(systemName: "speaker.wave.3.fill")
                     .font(.system(size: 12))
                     .foregroundStyle(.white.opacity(0.5))
+                AirPlayRoutePickerView(tintColor: .white.opacity(0.8))
+                    .frame(width: 28, height: 28)
             }
             .padding(.horizontal, 16)
         }
@@ -761,13 +876,21 @@ private struct LyricRowView: View, Equatable {
     let index: Int
     let line: LyricLine
     let tier: LyricHighlightTier
+    let currentTime: TimeInterval
     let onSeek: (TimeInterval) -> Void
 
     static func == (lhs: LyricRowView, rhs: LyricRowView) -> Bool {
-        lhs.index == rhs.index &&
-        lhs.tier == rhs.tier &&
-        lhs.line.text == rhs.line.text &&
-        lhs.line.translation == rhs.line.translation
+        guard lhs.index == rhs.index &&
+                lhs.tier == rhs.tier &&
+                lhs.line.text == rhs.line.text &&
+                lhs.line.translation == rhs.line.translation &&
+                lhs.line.words.count == rhs.line.words.count else {
+            return false
+        }
+        if lhs.tier == .current && !lhs.line.words.isEmpty {
+            return abs(lhs.currentTime - rhs.currentTime) < 0.025
+        }
+        return true
     }
 
     var body: some View {
@@ -782,9 +905,8 @@ private struct LyricRowView: View, Equatable {
         }()
 
         VStack(alignment: .leading, spacing: 4) {
-            Text(line.text)
+            lyricLineText(isCurrent: isCurrent, fallbackOpacity: opacity)
                 .font(.system(size: isCurrent ? 23 : 18, weight: isCurrent ? .bold : .semibold))
-                .foregroundStyle(isCurrent ? .white : .white.opacity(opacity))
                 .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -802,6 +924,29 @@ private struct LyricRowView: View, Equatable {
         .onTapGesture {
             onSeek(line.at)
         }
+    }
+
+    /// 逐字卡拉OK拼合渲染：仅当前行且存在逐字时间戳时启用，未唱到文字柔和半透明，已唱/正唱渐变点亮
+    private func lyricLineText(isCurrent: Bool, fallbackOpacity: Double) -> Text {
+        guard isCurrent, !line.words.isEmpty else {
+            return Text(line.text)
+                .foregroundColor(isCurrent ? .white : .white.opacity(fallbackOpacity))
+        }
+        var combined = Text("")
+        for word in line.words {
+            let wordColor: Color
+            if currentTime >= word.end || (word.end <= word.start && currentTime >= word.start) {
+                wordColor = .white
+            } else if currentTime >= word.start {
+                let dur = max(0.04, word.end - word.start)
+                let p = min(max((currentTime - word.start) / dur, 0), 1)
+                wordColor = .white.opacity(0.55 + 0.45 * p)
+            } else {
+                wordColor = .white.opacity(0.45)
+            }
+            combined = combined + Text(word.text).foregroundColor(wordColor)
+        }
+        return combined
     }
 }
 
@@ -937,10 +1082,12 @@ private struct LyricsScrollView: View {
                                 // 使用标准 VStack 保证所有歌词行坐标绝对精确，无论如何拖拽/跳转均 100% 居中对齐，杜绝 Lazy 虚拟化偏移
                                 VStack(alignment: .leading, spacing: 18) {
                                     ForEach(Array(lines.enumerated()), id: \.offset) { idx, line in
+                                        let rowTier = tier(for: idx, current: curIdx)
                                         LyricRowView(
                                             index: idx,
                                             line: line,
-                                            tier: tier(for: idx, current: curIdx),
+                                            tier: rowTier,
+                                            currentTime: (rowTier == .current && !line.words.isEmpty) ? effectivePosition : 0,
                                             onSeek: { targetTime in
                                                 autoSnapTask?.cancel()
                                                 isUserScrolling = false

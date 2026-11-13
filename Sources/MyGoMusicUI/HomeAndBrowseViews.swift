@@ -6,7 +6,7 @@ import MyGoMusicCore
 #endif
 import SwiftUI
 
-// MARK: - 导航目标枚举
+// MARK: - 导航目标与环境跳转扩展
 
 public enum NavigationTarget: Hashable {
     case browse(page: String, title: String?)
@@ -19,6 +19,63 @@ public enum NavigationTarget: Hashable {
     case savedAlbums
     case stations
     case podcasts
+}
+
+public extension SourceInfo {
+    func customTitle(forBuiltin builtinKey: String) -> String? {
+        guard let t = navigation?.first(where: { $0.builtin == builtinKey })?.title?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !t.isEmpty else {
+            return nil
+        }
+        return t
+    }
+
+    func customIcon(forBuiltin builtinKey: String) -> String? {
+        navigation?.first(where: { $0.builtin == builtinKey })?.icon
+    }
+}
+
+private struct MyGoNavigateKey: EnvironmentKey {
+    static let defaultValue: (NavigationTarget) -> Void = { _ in }
+}
+
+public extension EnvironmentValues {
+    var mygoNavigate: (NavigationTarget) -> Void {
+        get { self[MyGoNavigateKey.self] }
+        set { self[MyGoNavigateKey.self] = newValue }
+    }
+}
+
+/// 公共分页“加载更多”按钮
+public struct LoadMoreButton: View {
+    public let isLoading: Bool
+    public let action: () -> Void
+
+    public init(isLoading: Bool, action: @escaping () -> Void) {
+        self.isLoading = isLoading
+        self.action = action
+    }
+
+    public var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Text(I18n.t(isLoading ? "Loading…" : "Load More"))
+                    .font(.system(size: 13.5, weight: .semibold))
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 10)
+            .background(Color.primary.opacity(0.08), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isLoading)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 6)
+    }
 }
 
 // MARK: - 首页视图（对应 homePage / browseRows）
@@ -49,9 +106,8 @@ public struct HomeView: View {
                     }
                 }
                 .padding(.vertical, 16)
-                .padding(.bottom, 92)
             }
-            .navigationTitle(I18n.t("Home"))
+            .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "home") ?? I18n.t("Home"))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
@@ -65,6 +121,9 @@ public struct HomeView: View {
             }
             .navigationDestination(for: NavigationTarget.self) { target in
                 destinationView(for: target)
+            }
+            .environment(\.mygoNavigate) { target in
+                navPath.append(target)
             }
         }
     }
@@ -483,7 +542,7 @@ public struct BrowseSectionsStack: View {
                         }
                     }
 
-                    // 电台卡片栏
+                    // 电台卡片栏（支持点击卡片任何位置及播放按钮）
                     if let stations = section.stations, !stations.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 16) {
@@ -494,6 +553,9 @@ public struct BrowseSectionsStack: View {
                                         imageURL: station.imageUrl,
                                         systemIcon: "dot.radiowaves.left.and.right",
                                         onPlay: {
+                                            Task { await app.startStation(station) }
+                                        },
+                                        onTap: {
                                             Task { await app.startStation(station) }
                                         }
                                     )
@@ -548,6 +610,7 @@ public struct BrowseSectionsStack: View {
 
 public struct BrowsePageView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.mygoNavigate) private var mygoNavigate
     public let page: String
     public let fallbackTitle: String?
 
@@ -579,11 +642,12 @@ public struct BrowsePageView: View {
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, minHeight: 200)
                 } else if let sections = browseData?.sections {
-                    BrowseSectionsStack(sections: sections, isHome: false) { _ in }
+                    BrowseSectionsStack(sections: sections, isHome: false) { target in
+                        mygoNavigate(target)
+                    }
                 }
             }
             .padding(.vertical, 12)
-            .padding(.bottom, 92)
         }
         .navigationTitle(browseData?.title ?? fallbackTitle ?? I18n.t("Discover"))
         .task {
@@ -604,6 +668,9 @@ public struct SectionTracksPageView: View {
     public let title: String
     public let subtitle: String?
     public let tracks: [Track]
+    public var hasMore: Bool = false
+    public var isLoadingMore: Bool = false
+    public var onLoadMore: (() async -> Void)? = nil
 
     public var body: some View {
         ScrollView {
@@ -649,9 +716,14 @@ public struct SectionTracksPageView: View {
                         .padding(.horizontal, 8)
                     }
                 }
+
+                if hasMore, let onLoadMore {
+                    LoadMoreButton(isLoading: isLoadingMore) {
+                        Task { await onLoadMore() }
+                    }
+                }
             }
             .padding(.vertical, 12)
-            .padding(.bottom, 92)
         }
         .navigationTitle(title)
     }
@@ -664,6 +736,7 @@ public struct AlbumDetailView: View {
 
     @State private var albumPage: AlbumPage? = nil
     @State private var isLoading = true
+    @State private var isSaved = false
 
     public var body: some View {
         ScrollView {
@@ -691,14 +764,14 @@ public struct AlbumDetailView: View {
                             .font(.system(size: 13.5))
                             .foregroundStyle(.secondary)
 
-                        HStack(spacing: 12) {
+                        HStack(spacing: 10) {
                             Button {
                                 app.player.playQueue(tracks, start: 0)
                             } label: {
                                 Label(I18n.t("Play"), systemImage: "play.fill")
                                     .font(.system(size: 14, weight: .bold))
                                     .foregroundStyle(.white)
-                                    .padding(.horizontal, 22)
+                                    .padding(.horizontal, 20)
                                     .padding(.vertical, 10)
                                     .background(MyGoTheme.accent, in: Capsule())
                             }
@@ -709,11 +782,28 @@ public struct AlbumDetailView: View {
                             } label: {
                                 Label(I18n.t("Shuffle"), systemImage: "shuffle")
                                     .font(.system(size: 14, weight: .semibold))
-                                    .padding(.horizontal, 22)
+                                    .padding(.horizontal, 20)
                                     .padding(.vertical, 10)
                                     .background(Color.primary.opacity(0.08), in: Capsule())
                             }
                             .buttonStyle(.plain)
+
+                            if app.activeSource.can("saveAlbum") {
+                                let srcID = app.activeSourceID
+                                Button {
+                                    Task {
+                                        isSaved = await app.toggleSaveAlbum(sourceID: srcID, albumID: albumID, currentlySaved: isSaved)
+                                    }
+                                } label: {
+                                    Image(systemName: isSaved ? "heart.fill" : "heart")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
+                                        .frame(width: 40, height: 40)
+                                        .background(Color.primary.opacity(0.08), in: Circle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(I18n.t(isSaved ? "Saved" : "Save Album"))
+                            }
                         }
                     }
                     .padding(.top, 12)
@@ -727,13 +817,13 @@ public struct AlbumDetailView: View {
                         }
                     }
                 }
-                .padding(.bottom, 92)
             }
         }
         .navigationTitle(albumPage?.album.name ?? fallbackName)
         .task {
             isLoading = true
             albumPage = try? await app.activeSource.album(id: albumID)
+            isSaved = albumPage?.album.saved ?? app.savedAlbums.contains(where: { $0.id == albumID })
             if let tracks = albumPage?.tracks {
                 await app.checkLikes(for: tracks)
             }
@@ -749,6 +839,7 @@ public struct ArtistDetailView: View {
 
     @State private var artistPage: ArtistPage? = nil
     @State private var isLoading = true
+    @State private var isFollowing = false
 
     public var body: some View {
         ScrollView {
@@ -770,8 +861,8 @@ public struct ArtistDetailView: View {
                         Text(page.artist.name)
                             .font(.system(size: 24, weight: .bold))
 
-                        if !tracks.isEmpty {
-                            HStack(spacing: 12) {
+                        HStack(spacing: 10) {
+                            if !tracks.isEmpty {
                                 Button {
                                     app.player.playQueue(tracks, start: 0)
                                 } label: {
@@ -792,6 +883,26 @@ public struct ArtistDetailView: View {
                                         .padding(.horizontal, 20)
                                         .padding(.vertical, 9)
                                         .background(Color.primary.opacity(0.08), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            if app.activeSource.can("followArtist") {
+                                let srcID = app.activeSourceID
+                                Button {
+                                    Task {
+                                        isFollowing = await app.toggleFollowArtist(sourceID: srcID, artistID: artistID, currentlyFollowing: isFollowing)
+                                    }
+                                } label: {
+                                    Label(
+                                        I18n.t(isFollowing ? "Following" : "Follow"),
+                                        systemImage: isFollowing ? "checkmark" : "plus"
+                                    )
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(isFollowing ? MyGoTheme.accent : .primary)
+                                    .padding(.horizontal, 18)
+                                    .padding(.vertical, 9)
+                                    .background(Color.primary.opacity(0.08), in: Capsule())
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -838,13 +949,13 @@ public struct ArtistDetailView: View {
                         }
                     }
                 }
-                .padding(.bottom, 92)
             }
         }
         .navigationTitle(artistPage?.artist.name ?? fallbackName)
         .task {
             isLoading = true
             artistPage = try? await app.activeSource.artist(id: artistID)
+            isFollowing = artistPage?.artist.following ?? false
             if let tracks = artistPage?.tracks {
                 await app.checkLikes(for: tracks)
             }
@@ -860,6 +971,8 @@ public struct PlaylistDetailView: View {
 
     @State private var playlistData: Playlist? = nil
     @State private var isLoading = true
+    @State private var isSaved = false
+    @State private var isEditingOrder = false
 
     public var body: some View {
         ScrollView {
@@ -868,6 +981,10 @@ public struct PlaylistDetailView: View {
                     .frame(maxWidth: .infinity, minHeight: 240)
             } else if let pl = playlistData {
                 let tracks = pl.tracks ?? []
+                let isOwner = pl.mine == true
+                let canRemove = isOwner && app.activeSource.can("removeFromPlaylist")
+                let canMove = isOwner && app.activeSource.can("movePlaylistTrack")
+
                 VStack(spacing: 20) {
                     VStack(spacing: 12) {
                         ArtworkView(
@@ -895,15 +1012,15 @@ public struct PlaylistDetailView: View {
                                 .padding(.horizontal, 24)
                         }
 
-                        if !tracks.isEmpty {
-                            HStack(spacing: 12) {
+                        HStack(spacing: 10) {
+                            if !tracks.isEmpty {
                                 Button {
                                     app.player.playQueue(tracks, start: 0)
                                 } label: {
                                     Label(I18n.t("Play"), systemImage: "play.fill")
                                         .font(.system(size: 14, weight: .bold))
                                         .foregroundStyle(.white)
-                                        .padding(.horizontal, 22)
+                                        .padding(.horizontal, 20)
                                         .padding(.vertical, 10)
                                         .background(MyGoTheme.accent, in: Capsule())
                                 }
@@ -914,9 +1031,25 @@ public struct PlaylistDetailView: View {
                                 } label: {
                                     Label(I18n.t("Shuffle"), systemImage: "shuffle")
                                         .font(.system(size: 14, weight: .semibold))
-                                        .padding(.horizontal, 22)
+                                        .padding(.horizontal, 20)
                                         .padding(.vertical, 10)
                                         .background(Color.primary.opacity(0.08), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            if !isOwner && app.activeSource.can("savePlaylist") {
+                                let srcID = app.activeSourceID
+                                Button {
+                                    Task {
+                                        isSaved = await app.toggleSavePlaylist(sourceID: srcID, playlistID: playlistID, currentlySaved: isSaved)
+                                    }
+                                } label: {
+                                    Image(systemName: isSaved ? "heart.fill" : "heart")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
+                                        .frame(width: 40, height: 40)
+                                        .background(Color.primary.opacity(0.08), in: Circle())
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -926,24 +1059,103 @@ public struct PlaylistDetailView: View {
 
                     VStack(spacing: 2) {
                         ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
-                            TrackRowView(track: tr, index: idx) {
-                                app.player.playTrack(tracks, at: idx)
+                            HStack(spacing: 4) {
+                                TrackRowView(track: tr, index: idx) {
+                                    app.player.playTrack(tracks, at: idx)
+                                }
+
+                                if isEditingOrder {
+                                    if canMove {
+                                        Button {
+                                            Task { await moveRow(from: idx, to: max(0, idx - 1)) }
+                                        } label: {
+                                            Image(systemName: "arrow.up.circle")
+                                                .foregroundStyle(idx == 0 ? Color.secondary.opacity(0.35) : .primary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(idx == 0)
+
+                                        Button {
+                                            Task { await moveRow(from: idx, to: min(tracks.count - 1, idx + 1)) }
+                                        } label: {
+                                            Image(systemName: "arrow.down.circle")
+                                                .foregroundStyle(idx == tracks.count - 1 ? Color.secondary.opacity(0.35) : .primary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(idx == tracks.count - 1)
+                                    }
+
+                                    if canRemove {
+                                        Button(role: .destructive) {
+                                            Task { await removeRow(trackID: tr.id) }
+                                        } label: {
+                                            Image(systemName: "minus.circle.fill")
+                                                .foregroundStyle(.red)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
                             }
                             .padding(.horizontal, 8)
+                            .contextMenu {
+                                if canMove && idx > 0 {
+                                    Button(I18n.t("Move Up"), systemImage: "arrow.up") {
+                                        Task { await moveRow(from: idx, to: idx - 1) }
+                                    }
+                                }
+                                if canMove && idx < tracks.count - 1 {
+                                    Button(I18n.t("Move Down"), systemImage: "arrow.down") {
+                                        Task { await moveRow(from: idx, to: idx + 1) }
+                                    }
+                                }
+                                if canRemove {
+                                    Button(I18n.t("Remove from Playlist"), systemImage: "trash", role: .destructive) {
+                                        Task { await removeRow(trackID: tr.id) }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                .padding(.bottom, 92)
             }
         }
         .navigationTitle(playlistData?.name ?? fallbackName)
+        .toolbar {
+            if let pl = playlistData, pl.mine == true,
+               (app.activeSource.can("removeFromPlaylist") || app.activeSource.can("movePlaylistTrack")) {
+                ToolbarItem(placement: .automatic) {
+                    Button(isEditingOrder ? I18n.t("Done") : I18n.t("Edit")) {
+                        withAnimation { isEditingOrder.toggle() }
+                    }
+                }
+            }
+        }
         .task {
             isLoading = true
             playlistData = try? await app.activeSource.playlist(id: playlistID)
+            isSaved = playlistData?.saved ?? app.savedPlaylists.contains(where: { $0.id == playlistID })
             if let tracks = playlistData?.tracks {
                 await app.checkLikes(for: tracks)
             }
             isLoading = false
+        }
+    }
+
+    private func removeRow(trackID: String) async {
+        let srcID = app.activeSourceID
+        if await app.removeTrack(trackID, fromPlaylist: playlistID, sourceID: srcID) {
+            playlistData?.tracks?.removeAll { $0.id == trackID }
+        }
+    }
+
+    private func moveRow(from: Int, to: Int) async {
+        let srcID = app.activeSourceID
+        guard var list = playlistData?.tracks,
+              from >= 0, from < list.count, to >= 0, to < list.count, from != to else { return }
+        if await app.moveTrack(inPlaylist: playlistID, sourceID: srcID, from: from, to: to) {
+            let item = list.remove(at: from)
+            list.insert(item, at: to)
+            playlistData?.tracks = list
         }
     }
 }
@@ -955,6 +1167,8 @@ public struct PodcastShowDetailView: View {
 
     @State private var showPage: ShowPage? = nil
     @State private var isLoading = true
+    @State private var isSubscribed = false
+    @State private var isLoadingMore = false
 
     public var body: some View {
         ScrollView {
@@ -986,6 +1200,25 @@ public struct PodcastShowDetailView: View {
                                 .multilineTextAlignment(.center)
                                 .padding(.horizontal, 24)
                         }
+                        if app.activeSource.can("subscribeShow") {
+                            let srcID = app.activeSourceID
+                            Button {
+                                Task {
+                                    isSubscribed = await app.toggleSubscribeShow(sourceID: srcID, showID: showID, currentlySubscribed: isSubscribed)
+                                }
+                            } label: {
+                                Label(
+                                    I18n.t(isSubscribed ? "Subscribed" : "Subscribe"),
+                                    systemImage: isSubscribed ? "checkmark" : "plus"
+                                )
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(isSubscribed ? MyGoTheme.accent : .white)
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 9)
+                                .background(isSubscribed ? Color.primary.opacity(0.08) : MyGoTheme.accent, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.top, 12)
@@ -1000,16 +1233,39 @@ public struct PodcastShowDetailView: View {
                             }
                             .padding(.horizontal, 8)
                         }
+
+                        if page.more == true {
+                            LoadMoreButton(isLoading: isLoadingMore) {
+                                Task { await loadMoreEpisodes() }
+                            }
+                        }
                     }
                 }
-                .padding(.bottom, 92)
             }
         }
         .navigationTitle(showPage?.show.name ?? fallbackName)
         .task {
             isLoading = true
             showPage = try? await app.activeSource.show(id: showID, offset: 0)
+            isSubscribed = showPage?.show.subscribed ?? app.subscribedShows.contains(where: { $0.id == showID })
             isLoading = false
+        }
+    }
+
+    private func loadMoreEpisodes() async {
+        guard !isLoadingMore, let current = showPage, current.more == true else { return }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+        let offset = current.episodes?.count ?? 0
+        if let next = try? await app.activeSource.show(id: showID, offset: offset) {
+            let incoming = next.episodes ?? []
+            var existing = current.episodes ?? []
+            let seen = Set(existing.map(\.id))
+            for ep in incoming where !seen.contains(ep.id) {
+                existing.append(ep)
+            }
+            showPage?.episodes = existing
+            showPage?.more = (next.more == true) && !incoming.isEmpty
         }
     }
 }
@@ -1019,9 +1275,14 @@ public struct LikedSongsView: View {
 
     public var body: some View {
         SectionTracksPageView(
-            title: I18n.t("Liked Songs"),
+            title: app.activeSource.info().customTitle(forBuiltin: "liked") ?? I18n.t("Liked Songs"),
             subtitle: I18n.songs(app.likedTracks.count),
-            tracks: app.likedTracks
+            tracks: app.likedTracks,
+            hasMore: app.likedHasMore,
+            isLoadingMore: app.isLoadingMoreLiked,
+            onLoadMore: {
+                await app.loadMoreLikedSongs()
+            }
         )
     }
 }
@@ -1036,24 +1297,31 @@ public struct SavedAlbumsPageView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 220)
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 20) {
-                    ForEach(app.savedAlbums) { album in
-                        NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name)) {
-                            CoverCardView(
-                                title: album.name,
-                                subtitle: album.artistNames,
-                                imageURL: album.imageUrl,
-                                systemIcon: "opticaldisc"
-                            )
+                VStack(spacing: 16) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 20) {
+                        ForEach(app.savedAlbums) { album in
+                            NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name)) {
+                                CoverCardView(
+                                    title: album.name,
+                                    subtitle: album.artistNames,
+                                    imageURL: album.imageUrl,
+                                    systemIcon: "opticaldisc"
+                                )
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                    }
+
+                    if app.savedAlbumsHasMore {
+                        LoadMoreButton(isLoading: app.isLoadingMoreSavedAlbums) {
+                            Task { await app.loadMoreSavedAlbums() }
+                        }
                     }
                 }
                 .padding(16)
-                .padding(.bottom, 92)
             }
         }
-        .navigationTitle(I18n.t("Saved Albums"))
+        .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "savedAlbums") ?? I18n.t("Saved Albums"))
     }
 }
 
@@ -1076,15 +1344,17 @@ public struct StationsPageView: View {
                             systemIcon: "dot.radiowaves.left.and.right",
                             onPlay: {
                                 Task { await app.startStation(station) }
+                            },
+                            onTap: {
+                                Task { await app.startStation(station) }
                             }
                         )
                     }
                 }
                 .padding(16)
-                .padding(.bottom, 92)
             }
         }
-        .navigationTitle(I18n.t("Stations"))
+        .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "stations") ?? I18n.t("Stations"))
     }
 }
 
@@ -1112,9 +1382,8 @@ public struct SubscribedPodcastsPageView: View {
                     }
                 }
                 .padding(16)
-                .padding(.bottom, 92)
             }
         }
-        .navigationTitle(I18n.t("Podcasts"))
+        .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "shows") ?? I18n.t("Podcasts"))
     }
 }

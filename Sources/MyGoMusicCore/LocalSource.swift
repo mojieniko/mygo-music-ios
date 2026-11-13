@@ -35,7 +35,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     ]
 
     private static let supportedExtensions: Set<String> = [
-        "mp3", "flac", "ogg", "wav", "m4a", "aac"
+        "mp3", "flac", "wav", "m4a", "aac"
     ]
 
     public let dataDir: URL
@@ -50,6 +50,8 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     private var artistsByID: [String: ArtistPage] = [:]
     private var orderedArtists: [Artist] = []
     private var isScanningFlag = false
+    private var scanGeneration: Int = 0
+    private var activeScanTask: Task<Void, Never>?
 
     public var onChange: (@Sendable () -> Void)?
 
@@ -71,6 +73,13 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
             self.lib.folders.insert(defaultMusicFolder.path, at: 0)
         }
         rebuildCatalogSynchronously()
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.rescanAsync()
+        }
+        lock.lock()
+        self.activeScanTask = task
+        lock.unlock()
     }
 
     // MARK: - 线程安全锁辅助方法
@@ -184,45 +193,123 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         }
     }
 
+    private struct CachedMetadataEntry: Codable {
+        var modTime: TimeInterval
+        var fileSize: Int64
+        var track: Track
+    }
+
+    /// 触发非阻塞扫描：先快速建立文件名/磁盘元数据缓存索引，再在后台异步解析 AVAsset 精确标签
     public func rescan() {
         rebuildCatalogSynchronously()
         onChange?()
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.rescanAsync()
+        }
+        lock.lock()
+        activeScanTask?.cancel()
+        activeScanTask = task
+        lock.unlock()
     }
 
-    /// 同步扫描所有已添加文件夹并构建专辑、歌手与歌曲索引
+    /// 异步完整扫描所有目录并使用现代 `AVAsset.load` API 提取时长、标签与内嵌封面
+    public func rescanAsync() async {
+        let (gen, scanFolders, coversDir) = withLock { () -> (Int, [String], URL) in
+            scanGeneration += 1
+            isScanningFlag = true
+            return (scanGeneration, lib.folders, dataDir.appendingPathComponent("covers", isDirectory: true))
+        }
+
+        let fileURLs = Self.enumerateAudioFiles(in: scanFolders)
+        var diskCache = loadMetadataCache()
+        var resolvedTracks: [Track] = []
+        var pendingURLs: [(URL, TimeInterval, Int64)] = []
+
+        for fileURL in fileURLs {
+            let path = fileURL.standardizedFileURL.path
+            let values = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            let mtime = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let fsize = Int64(values?.fileSize ?? 0)
+            if let cached = diskCache[path],
+               abs(cached.modTime - mtime) < 0.01,
+               cached.fileSize == fsize {
+                resolvedTracks.append(cached.track)
+            } else {
+                pendingURLs.append((fileURL, mtime, fsize))
+            }
+        }
+
+        if !pendingURLs.isEmpty {
+            let maxConcurrent = 4
+            await withTaskGroup(of: (String, TimeInterval, Int64, Track).self) { group in
+                var iterator = pendingURLs.makeIterator()
+                for _ in 0..<maxConcurrent {
+                    if let next = iterator.next() {
+                        group.addTask {
+                            let track = await Self.readTrackMetadataAsync(at: next.0, coversDir: coversDir)
+                            return (next.0.standardizedFileURL.path, next.1, next.2, track)
+                        }
+                    }
+                }
+                while let result = await group.next() {
+                    if Task.isCancelled { break }
+                    diskCache[result.0] = CachedMetadataEntry(
+                        modTime: result.1,
+                        fileSize: result.2,
+                        track: result.3
+                    )
+                    resolvedTracks.append(result.3)
+                    if let next = iterator.next() {
+                        group.addTask {
+                            let track = await Self.readTrackMetadataAsync(at: next.0, coversDir: coversDir)
+                            return (next.0.standardizedFileURL.path, next.1, next.2, track)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 清理已从磁盘删除的文件缓存条目
+        let currentPathSet = Set(fileURLs.map { $0.standardizedFileURL.path })
+        diskCache = diskCache.filter { currentPathSet.contains($0.key) }
+        saveMetadataCache(diskCache)
+
+        let stillCurrent = withLock { gen == scanGeneration }
+        guard stillCurrent else { return }
+
+        applyDiscoveredTracks(resolvedTracks)
+        onChange?()
+    }
+
+    /// 同步快速构建索引（复用元数据缓存 + 文件名回退，无阻塞 AVAsset 同步 API 调用）
     public func rebuildCatalogSynchronously() {
         lock.lock()
         isScanningFlag = true
         let scanFolders = lib.folders
         lock.unlock()
 
+        let fileURLs = Self.enumerateAudioFiles(in: scanFolders)
+        let diskCache = loadMetadataCache()
         var discoveredTracks: [Track] = []
-        var seenPaths = Set<String>()
-        let fm = FileManager.default
+        discoveredTracks.reserveCapacity(fileURLs.count)
 
-        for folderPath in scanFolders {
-            let folderURL = URL(fileURLWithPath: folderPath)
-            guard let enumerator = fm.enumerator(
-                at: folderURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-                options: [.skipsHiddenFiles]
-            ) else {
-                continue
-            }
-            for case let fileURL as URL in enumerator {
-                let ext = fileURL.pathExtension.lowercased()
-                guard Self.supportedExtensions.contains(ext) else { continue }
-                let cleanPath = fileURL.standardizedFileURL.path
-                guard !seenPaths.contains(cleanPath) else { continue }
-                seenPaths.insert(cleanPath)
-
-                let track = Self.readTrackMetadata(at: fileURL, coversDir: dataDir.appendingPathComponent("covers", isDirectory: true))
-                discoveredTracks.append(track)
+        for fileURL in fileURLs {
+            let cleanPath = fileURL.standardizedFileURL.path
+            if let cached = diskCache[cleanPath] {
+                discoveredTracks.append(cached.track)
+            } else {
+                discoveredTracks.append(Self.skeletonTrack(at: fileURL))
             }
         }
 
-        // 按歌名排序
-        discoveredTracks.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        applyDiscoveredTracks(discoveredTracks)
+    }
+
+    private func applyDiscoveredTracks(_ tracks: [Track]) {
+        let discoveredTracks = tracks.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
 
         var byID: [String: Track] = [:]
         var albumGroups: [String: (album: Album, tracks: [Track])] = [:]
@@ -281,47 +368,114 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         lock.unlock()
     }
 
-    private static func readTrackMetadata(at fileURL: URL, coversDir: URL) -> Track {
-        let baseName = fileURL.deletingPathExtension().lastPathComponent
-        var title = baseName
-        var artistName = "Unknown Artist"
-        var albumName = "Unknown Album"
-        var durationMs: Int64 = 0
-        var imageURL: String? = nil
+    private func loadMetadataCache() -> [String: CachedMetadataEntry] {
+        let cacheURL = dataDir.appendingPathComponent("metadata_cache.json")
+        guard let data = try? Data(contentsOf: cacheURL),
+              let decoded = try? JSONDecoder().decode([String: CachedMetadataEntry].self, from: data) else {
+            return [:]
+        }
+        return decoded
+    }
 
-        // 支持 "Artist - Title" 文件名自动拆分作为回退
+    private func saveMetadataCache(_ cache: [String: CachedMetadataEntry]) {
+        let cacheURL = dataDir.appendingPathComponent("metadata_cache.json")
+        if let data = try? JSONEncoder().encode(cache) {
+            try? data.write(to: cacheURL, options: .atomic)
+        }
+    }
+
+    private static func enumerateAudioFiles(in folders: [String]) -> [URL] {
+        var result: [URL] = []
+        var seenPaths = Set<String>()
+        let fm = FileManager.default
+        for folderPath in folders {
+            let folderURL = URL(fileURLWithPath: folderPath)
+            guard let enumerator = fm.enumerator(
+                at: folderURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+            for case let fileURL as URL in enumerator {
+                let ext = fileURL.pathExtension.lowercased()
+                guard supportedExtensions.contains(ext) else { continue }
+                let cleanPath = fileURL.standardizedFileURL.path
+                guard !seenPaths.contains(cleanPath) else { continue }
+                seenPaths.insert(cleanPath)
+                result.append(fileURL)
+            }
+        }
+        return result
+    }
+
+    private static func inferNamesFromFilename(_ fileURL: URL) -> (title: String, artist: String) {
+        let baseName = fileURL.deletingPathExtension().lastPathComponent
         if let dashRange = baseName.range(of: " - ") {
             let left = String(baseName[..<dashRange.lowerBound]).trimmingCharacters(in: .whitespaces)
             let right = String(baseName[dashRange.upperBound...]).trimmingCharacters(in: .whitespaces)
             if !left.isEmpty && !right.isEmpty {
-                artistName = left
-                title = right
+                return (right, left)
+            }
+        }
+        return (baseName, "Unknown Artist")
+    }
+
+    private static func skeletonTrack(at fileURL: URL) -> Track {
+        let inferred = inferNamesFromFilename(fileURL)
+        let albumName = fileURL.deletingLastPathComponent().lastPathComponent
+        let cleanAlbum = albumName.isEmpty || albumName == "MusicFiles" ? "Unknown Album" : albumName
+        let artistID = "artist:" + inferred.artist.lowercased()
+        let albumID = "album:" + cleanAlbum.lowercased() + ":" + inferred.artist.lowercased()
+        let artist = Artist(id: artistID, name: inferred.artist)
+        let album = Album(id: albumID, name: cleanAlbum, imageUrl: nil, artists: [artist])
+        return Track(
+            id: fileURL.standardizedFileURL.path,
+            source: Self.sourceID,
+            name: inferred.title,
+            artists: [artist],
+            album: album,
+            duration: 0
+        )
+    }
+
+    private static func readTrackMetadataAsync(at fileURL: URL, coversDir: URL) async -> Track {
+        let inferred = inferNamesFromFilename(fileURL)
+        var title = inferred.title
+        var artistName = inferred.artist
+        var albumName = "Unknown Album"
+        var durationMs: Int64 = 0
+        var imageURL: String? = nil
+
+        let asset = AVURLAsset(url: fileURL)
+        if let loadedDuration = try? await asset.load(.duration) {
+            let seconds = CMTimeGetSeconds(loadedDuration)
+            if seconds.isFinite && seconds > 0 {
+                durationMs = Int64((seconds * 1000.0).rounded())
             }
         }
 
-        let asset = AVURLAsset(url: fileURL)
-        let seconds = CMTimeGetSeconds(asset.duration)
-        if seconds.isFinite && seconds > 0 {
-            durationMs = Int64((seconds * 1000.0).rounded())
-        }
-
-        for item in asset.commonMetadata {
+        let commonItems = (try? await asset.load(.commonMetadata)) ?? []
+        for item in commonItems {
             guard let commonKey = item.commonKey else { continue }
             switch commonKey {
             case .commonKeyTitle:
-                if let val = item.stringValue, !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let val = try? await item.load(.stringValue),
+                   !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     title = val.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             case .commonKeyArtist:
-                if let val = item.stringValue, !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let val = try? await item.load(.stringValue),
+                   !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     artistName = val.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             case .commonKeyAlbumName:
-                if let val = item.stringValue, !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let val = try? await item.load(.stringValue),
+                   !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     albumName = val.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             case .commonKeyArtwork:
-                if let data = item.dataValue, !data.isEmpty {
+                if let data = try? await item.load(.dataValue), !data.isEmpty {
                     try? FileManager.default.createDirectory(at: coversDir, withIntermediateDirectories: true)
                     let hash = PluginCrypto.md5Hex(fileURL.standardizedFileURL.path)
                     let coverFile = coversDir.appendingPathComponent("\(hash).jpg")
@@ -687,14 +841,85 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     public func likeComment(trackId: String, commentId: String, on: Bool) async throws { throw SourceError.unsupported("likeComment") }
     public func postComment(trackId: String, text: String) async throws -> Comment { throw SourceError.unsupported("postComment") }
 
+    /// 兼容中文 Windows 常见编码的 LRC 文本解码器（UTF-8 / BOM UTF-16 / GB18030 / GBK / ISO-8859-1）
+    public static func decodeTextWithFallback(_ data: Data) -> String? {
+        guard !data.isEmpty else { return nil }
+        // 处理 UTF-16 BOM
+        if data.starts(with: [0xFE, 0xFF]) || data.starts(with: [0xFF, 0xFE]) {
+            if let s = String(data: data, encoding: .utf16), !s.isEmpty { return s }
+        }
+        // 处理 UTF-8 BOM 并优先尝试严谨 UTF-8 解码
+        let utf8Slice = data.starts(with: [0xEF, 0xBB, 0xBF]) ? data.dropFirst(3) : data[...]
+        if let s = String(data: utf8Slice, encoding: .utf8) {
+            return s
+        }
+        // 简体中文常见 GB18030 / GBK 回退
+        let gb18030Raw = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+        let gb18030Enc = String.Encoding(rawValue: gb18030Raw)
+        if let s = String(data: data, encoding: gb18030Enc), !s.isEmpty {
+            return s
+        }
+        let gbkRaw = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.dosChineseSimplif.rawValue))
+        let gbkEnc = String.Encoding(rawValue: gbkRaw)
+        if let s = String(data: data, encoding: gbkEnc), !s.isEmpty {
+            return s
+        }
+        // Big5 & Shift-JIS & UTF-16 & Latin1 兜底
+        let big5Raw = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.big5.rawValue))
+        if let s = String(data: data, encoding: String.Encoding(rawValue: big5Raw)), !s.isEmpty {
+            return s
+        }
+        if let s = String(data: data, encoding: .shiftJIS), !s.isEmpty {
+            return s
+        }
+        if let s = String(data: data, encoding: .utf16LittleEndian), !s.isEmpty {
+            return s
+        }
+        return String(data: data, encoding: .isoLatin1)
+    }
+
     public func lyrics(id: String) async throws -> RawLyrics {
         let exists = withLock { tracksByID[id] != nil }
         guard exists else { throw SourceError.unavailable("no track \(id)") }
 
         let audioURL = URL(fileURLWithPath: id)
+        // 1. 优先同名 .lrc（支持 GBK/GB18030/UTF-8/UTF-16 自动编码识别）
         let lrcURL = audioURL.deletingPathExtension().appendingPathExtension("lrc")
-        if let lrcText = try? String(contentsOf: lrcURL, encoding: .utf8) {
+        if let lrcData = try? Data(contentsOf: lrcURL),
+           let lrcText = Self.decodeTextWithFallback(lrcData),
+           !lrcText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return RawLyrics(lrc: lrcText)
+        }
+
+        // 2. 回退读取音频内嵌歌词（ID3 USLT / iTunes ©lyr / FLAC LYRICS）
+        let asset = AVURLAsset(url: audioURL)
+        let items = (try? await asset.load(.metadata)) ?? []
+        for item in items {
+            let keyStr = (item.key as? String ?? "").lowercased()
+            let idStr = (item.identifier?.rawValue ?? "").lowercased()
+            let isLyricTag = keyStr == "uslt"
+                || keyStr == "©lyr"
+                || keyStr == "lyr"
+                || keyStr.contains("lyric")
+                || idStr.contains("lyric")
+                || idStr.contains("uslt")
+            guard isLyricTag else { continue }
+            if let embedded = try? await item.load(.stringValue),
+               !embedded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let normalized = embedded.replacingOccurrences(of: "\r\n", with: "\n")
+                    .replacingOccurrences(of: "\r", with: "\n")
+                if normalized.range(of: #"\[\d{1,2}:\d{2}"#, options: .regularExpression) != nil {
+                    return RawLyrics(lrc: normalized)
+                }
+                let lines = normalized
+                    .components(separatedBy: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                    .map { RawLyricLine(start: -1, text: $0) }
+                if !lines.isEmpty {
+                    return RawLyrics(lines: lines)
+                }
+            }
         }
         return RawLyrics()
     }

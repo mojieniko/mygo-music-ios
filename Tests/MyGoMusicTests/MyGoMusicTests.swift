@@ -2,6 +2,8 @@
 // 验证 MyGo Music iOS 版核心引擎（歌词、JS 插件运行时、本地音乐库、律动算法、仓库解析）与原版 Go 实现的一致性
 
 #if canImport(XCTest)
+import AVFoundation
+import Compression
 import Foundation
 import XCTest
 @testable import MyGoMusicCore
@@ -53,6 +55,10 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(minimal.quality, .high)
         XCTAssertTrue(minimal.fog)
         XCTAssertTrue(minimal.smoke)
+        XCTAssertTrue(minimal.fade)
+        XCTAssertTrue(minimal.growFromCover)
+        XCTAssertEqual(minimal.githubToken, "")
+        XCTAssertTrue(minimal.pluginUpdates.isEmpty)
         XCTAssertTrue(minimal.searchHistory.isEmpty)
 
         let legacyJSON = #"{"language":"zh-CN","source":"local","volume":0.4}"#
@@ -255,6 +261,132 @@ final class MyGoMusicTests: XCTestCase {
 
         let tiltParts = StageMath.tiltParts(for: line)
         XCTAssertFalse(tiltParts.isEmpty)
+    }
+
+    // MARK: - 6. 生态插件（B 站 / 网易云）TS 多文件打包、Polyfill 与容错解码测试
+
+    func testEcosystemPluginTSBundlingAbortTimerGetSetCookieAndMinAppVersion() async throws {
+        let tmpRoot = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-eco-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+
+        let pluginsDir = tmpRoot.appendingPathComponent("plugins", isDirectory: true)
+        let dataDir = tmpRoot.appendingPathComponent("plugin-data", isDirectory: true)
+        let pluginDir = pluginsDir.appendingPathComponent("eco-sim", isDirectory: true)
+        let libDir = pluginDir.appendingPathComponent("lib", isDirectory: true)
+        try FileManager.default.createDirectory(at: libDir, withIntermediateDirectories: true)
+
+        let manifest: [String: Any] = [
+            "id": "eco-sim",
+            "name": "Eco Sim",
+            "version": "1.0.0",
+            "minAppVersion": "0.1.21",
+            "main": "index.ts",
+            "playback": "stream",
+            "permissions": ["network": ["*.bilibili.com", "*.music.163.com"]],
+            "settings": [
+                ["key": "cookie", "label": "Cookie", "type": "password"],
+                ["key": "mode", "label": "Mode", "type": "select", "options": [["value": "hi", "label": "Hi-Res"]]]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted])
+            .write(to: pluginDir.appendingPathComponent("plugin.json"))
+
+        try """
+        export interface SignIn { bvid: string; }
+        export function sign(arg: SignIn): string { return host.crypto.md5(arg.bvid); }
+        export function splitSetCookies(): string[] {
+            const h = new Headers([
+                ["set-cookie", "A=1; Expires=Thu, 01 Jan 2099 00:00:00 GMT; Path=/"],
+                ["set-cookie", "B=2; Path=/"]
+            ]);
+            return h.getSetCookie();
+        }
+        """.write(to: libDir.appendingPathComponent("utils.ts"), atomically: true, encoding: .utf8)
+
+        try """
+        import { sign, splitSetCookies } from "./lib/utils.ts";
+        async function loadHome(): Promise<any> {
+            const c = new AbortController();
+            let fired = false;
+            c.signal.addEventListener("abort", () => { fired = true; });
+            c.abort();
+            if (!c.signal.aborted || !fired) throw new Error("abort failed");
+            const list = splitSetCookies();
+            if (list.length !== 2) throw new Error("cookie split failed");
+            let canceled = false;
+            const bad = setTimeout(() => { canceled = true; }, 5);
+            clearTimeout(bad);
+            const label = await new Promise<string>((r) => setTimeout(() => r("ok"), 20));
+            if (canceled) throw new Error("clearTimeout failed");
+            return { title: sign({ bvid: "BV1" }) + ":" + label, sections: [] };
+        }
+        function resolveStream(): any {
+            return { url: "https://upos.bilivideo.com/audio.m4s?x=1", type: "m4s", headers: { "Referer": "https://www.bilibili.com" } };
+        }
+        export { loadHome as home, resolveStream as stream };
+        """.write(to: pluginDir.appendingPathComponent("index.ts"), atomically: true, encoding: .utf8)
+
+        // 不满足 minAppVersion 的插件应被拒绝加载并记录到 failures
+        let badDir = pluginsDir.appendingPathComponent("too-new", isDirectory: true)
+        try FileManager.default.createDirectory(at: badDir, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["id": "too-new", "name": "Too New", "minAppVersion": "99.0.0", "main": "index.js"])
+            .write(to: badDir.appendingPathComponent("plugin.json"))
+        try "export function home() { return {}; }".write(to: badDir.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        let res = PluginInstaller.discoverDetailed(pluginsDir: pluginsDir, dataRootDir: dataDir)
+        XCTAssertEqual(res.plugins.count, 1)
+        XCTAssertEqual(res.failures.count, 1)
+        let plugin = res.plugins[0]
+        let home = try await plugin.home()
+        XCTAssertTrue((home.title ?? "").hasSuffix(":ok"))
+        let s = try await plugin.stream(id: "1", quality: "high")
+        XCTAssertEqual(s.type, "m4s")
+
+        let mergedCookies = PluginHTTPUtilities.splitSetCookieHeader(
+            "MUSIC_U=abc; Expires=Thu, 01 Jan 2099 00:00:00 GMT; Path=/, __csrf=xyz; Path=/"
+        )
+        XCTAssertEqual(mergedCookies.count, 2)
+    }
+
+    // MARK: - 7. 磁盘缓存 LRU、流媒体 UTType、编码兼容与 .ogg 过滤测试
+
+    func testCacheLRUStreamUTTypeTextFallbackAndCustomNavigation() throws {
+        // AudioDiskCache LRU
+        let cacheRoot = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-lru-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: cacheRoot) }
+        let cache = AudioDiskCache(cacheDir: cacheRoot)
+        cache.limitMB = 1
+        let payload = Data(repeating: 0x33, count: 480 * 1024)
+        let k1 = AudioDiskCache.cacheKey(sourceID: "s", trackID: "1", quality: "high")
+        let k2 = AudioDiskCache.cacheKey(sourceID: "s", trackID: "2", quality: "high")
+        let k3 = AudioDiskCache.cacheKey(sourceID: "s", trackID: "3", quality: "high")
+        _ = try cache.store(data: payload, key: k1, fileExtension: "mp3")
+        Thread.sleep(forTimeInterval: 0.02)
+        _ = try cache.store(data: payload, key: k2, fileExtension: "mp3")
+        Thread.sleep(forTimeInterval: 0.02)
+        _ = cache.cachedFileURL(forKey: k1)
+        Thread.sleep(forTimeInterval: 0.02)
+        _ = try cache.store(data: payload, key: k3, fileExtension: "mp3")
+        XCTAssertNil(cache.cachedFileURL(forKey: k2))
+        XCTAssertNotNil(cache.cachedFileURL(forKey: k1))
+        XCTAssertNotNil(cache.cachedFileURL(forKey: k3))
+        cache.clear()
+        XCTAssertEqual(cache.usedBytes(), 0)
+
+        // AudioStreamProxy UTType
+        let biliURL = URL(string: "https://upos-sz-mirror.bilivideo.com/track?e=1")!
+        XCTAssertEqual(AudioStreamProxy.resolveAudioUTType(streamType: "m4s", responseMIMEType: nil, url: biliURL), AVFileType.mp4.rawValue)
+        XCTAssertEqual(AudioStreamProxy.resolveAudioUTType(streamType: "flac", responseMIMEType: nil, url: biliURL), "org.xiph.flac")
+        XCTAssertEqual(AudioStreamProxy.resolveAudioUTType(streamType: nil, responseMIMEType: "audio/mpeg", url: biliURL), AVFileType.mp3.rawValue)
+
+        // GB18030 解码与 .ogg 过滤
+        let gbk = Data([0xC4, 0xE3, 0xBA, 0xC3]) // "你好"
+        XCTAssertEqual(LocalMusicSource.decodeTextWithFallback(gbk), "你好")
+
+        // 自定义导航标题
+        let info = SourceInfo(id: "s", name: "S", navigation: [NavItem(title: "定制首页", builtin: "home", icon: "star")])
+        XCTAssertEqual(info.customTitle(forBuiltin: "home"), "定制首页")
+        XCTAssertEqual(info.customIcon(forBuiltin: "home"), "star")
     }
 }
 #endif

@@ -4,7 +4,10 @@
 #if canImport(MyGoMusicCore)
 import MyGoMusicCore
 #endif
+import AVKit
 import CoreImage
+import CryptoKit
+import ImageIO
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -46,7 +49,24 @@ public enum MyGoQRCodeGenerator {
         #endif
     }
 
-    public static func makeSwiftUIImage(from data: Data) -> Image? {
+    /// 根据目标显示像素进行 `ImageIO` 高效降采样解码，避免超高分辨率封面占用过多内存
+    public static func makeSwiftUIImage(from data: Data, maxPixelSize: Int? = nil) -> Image? {
+        if let maxPixel = maxPixelSize, maxPixel > 0,
+           let source = CGImageSourceCreateWithData(data as CFData, nil) {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel
+            ]
+            if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                #if canImport(UIKit)
+                return Image(uiImage: UIImage(cgImage: cg))
+                #elseif canImport(AppKit)
+                return Image(nsImage: NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+                #endif
+            }
+        }
         #if canImport(UIKit)
         guard let ui = UIImage(data: data) else { return nil }
         return Image(uiImage: ui)
@@ -57,14 +77,26 @@ public enum MyGoQRCodeGenerator {
     }
 }
 
-// MARK: - 带插件防盗链 Header 支持的封面图片缓存加载器
+// MARK: - 带插件防盗链与内存/磁盘两级缓存的封面图片加载器
 
 @MainActor
 public final class ArtworkImageLoader: ObservableObject {
-    private static let cache = NSCache<NSString, NSData>()
+    private static let cache: NSCache<NSString, NSData> = {
+        let c = NSCache<NSString, NSData>()
+        c.totalCostLimit = 64 * 1024 * 1024
+        c.countLimit = 280
+        return c
+    }()
+    private static let diskCacheDir: URL = {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MyGoMusicArtworkCache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
     private static let paletteContext = CIContext()
     @Published public private(set) var image: Image? = nil
     @Published public private(set) var dominantColor: Color? = nil
+    private var currentTaskKey: String = ""
 
     public init() {}
 
@@ -81,9 +113,13 @@ public final class ArtworkImageLoader: ObservableObject {
             return
         }
 
-        let cacheKey = resolved as NSString
+        let decodeLimit = max(pixelSize * 2, 320)
+        let keyString = "\(resolved)|\(decodeLimit)"
+        currentTaskKey = keyString
+        let cacheKey = keyString as NSString
+
         if let cached = Self.cache.object(forKey: cacheKey),
-           let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: cached as Data) {
+           let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: cached as Data, maxPixelSize: decodeLimit) {
             self.image = img
             if extractDominantColor { updateDominantColor(from: cached as Data) }
             return
@@ -93,8 +129,8 @@ public final class ArtworkImageLoader: ObservableObject {
            let comma = resolved.firstIndex(of: ",") {
             let b64 = String(resolved[resolved.index(after: comma)...])
             if let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters),
-               let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: data) {
-                Self.cache.setObject(data as NSData, forKey: cacheKey)
+               let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: data, maxPixelSize: decodeLimit) {
+                Self.cache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
                 self.image = img
                 if extractDominantColor { updateDominantColor(from: data) }
             }
@@ -118,11 +154,24 @@ public final class ArtworkImageLoader: ObservableObject {
 
         if url.isFileURL {
             if let data = try? Data(contentsOf: url),
-               let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: data) {
-                Self.cache.setObject(data as NSData, forKey: cacheKey)
+               let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: data, maxPixelSize: decodeLimit) {
+                Self.cache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
                 self.image = img
                 if extractDominantColor { updateDominantColor(from: data) }
             }
+            return
+        }
+
+        // 先尝试从磁盘图片缓存命中（跨重启复用）
+        let diskURL = Self.diskFileURL(forKey: resolved)
+        if let diskData = await Task.detached(priority: .utility, operation: {
+            try? Data(contentsOf: diskURL)
+        }).value,
+           currentTaskKey == keyString,
+           let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: diskData, maxPixelSize: decodeLimit) {
+            Self.cache.setObject(diskData as NSData, forKey: cacheKey, cost: diskData.count)
+            self.image = img
+            if extractDominantColor { updateDominantColor(from: diskData) }
             return
         }
 
@@ -136,11 +185,24 @@ public final class ArtworkImageLoader: ObservableObject {
 
         if let (data, resp) = try? await URLSession.shared.data(for: req),
            (resp as? HTTPURLResponse)?.statusCode ?? 200 < 400,
-           let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: data) {
-            Self.cache.setObject(data as NSData, forKey: cacheKey)
+           currentTaskKey == keyString,
+           let img = MyGoQRCodeGenerator.makeSwiftUIImage(from: data, maxPixelSize: decodeLimit) {
+            Self.cache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
+            let dataToSave = data
+            let cacheDir = Self.diskCacheDir
+            Task.detached(priority: .utility) {
+                try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+                try? dataToSave.write(to: diskURL, options: .atomic)
+            }
             self.image = img
             if extractDominantColor { updateDominantColor(from: data) }
         }
+    }
+
+    private static func diskFileURL(forKey raw: String) -> URL {
+        let digest = SHA256.hash(data: Data(raw.utf8))
+        let name = digest.map { String(format: "%02x", $0) }.joined()
+        return diskCacheDir.appendingPathComponent("\(name).img")
     }
 
     private func updateDominantColor(from data: Data) {
@@ -410,10 +472,21 @@ public struct DailyFeatureCardView: View {
         }
         .buttonStyle(.plain)
         .onAppear {
-            if isPlayingFromCard {
-                withAnimation(.linear(duration: 12).repeatForever(autoreverses: false)) {
-                    spinAngle = 360
-                }
+            updateSpinAnimation(active: isPlayingFromCard)
+        }
+        .onChange(of: isPlayingFromCard) { _, playing in
+            updateSpinAnimation(active: playing)
+        }
+    }
+
+    private func updateSpinAnimation(active: Bool) {
+        if active {
+            withAnimation(.linear(duration: 12).repeatForever(autoreverses: false)) {
+                spinAngle = 360
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.45)) {
+                spinAngle = 0
             }
         }
     }
@@ -543,6 +616,7 @@ public struct CoverCardView: View {
     public var systemIcon: String = "music.note"
     public var isCircular: Bool = false
     public var onPlay: (() -> Void)? = nil
+    public var onTap: (() -> Void)? = nil
 
     public init(
         title: String,
@@ -550,7 +624,8 @@ public struct CoverCardView: View {
         imageURL: String? = nil,
         systemIcon: String = "music.note",
         isCircular: Bool = false,
-        onPlay: (() -> Void)? = nil
+        onPlay: (() -> Void)? = nil,
+        onTap: (() -> Void)? = nil
     ) {
         self.title = title
         self.subtitle = subtitle
@@ -558,10 +633,11 @@ public struct CoverCardView: View {
         self.systemIcon = systemIcon
         self.isCircular = isCircular
         self.onPlay = onPlay
+        self.onTap = onTap
     }
 
     public var body: some View {
-        VStack(alignment: isCircular ? .center : .leading, spacing: 8) {
+        let cardContent = VStack(alignment: isCircular ? .center : .leading, spacing: 8) {
             ZStack(alignment: .bottomTrailing) {
                 ArtworkView(
                     urlString: imageURL,
@@ -599,5 +675,63 @@ public struct CoverCardView: View {
             }
         }
         .frame(width: 148)
+        .contentShape(Rectangle())
+
+        if let onTap {
+            cardContent.onTapGesture(perform: onTap)
+        } else {
+            cardContent
+        }
     }
 }
+
+// MARK: - 原生 AirPlay 音频输出设备选择器
+
+public struct AirPlayRoutePickerView: View {
+    public var tintColor: Color = .white
+
+    public init(tintColor: Color = .white) {
+        self.tintColor = tintColor
+    }
+
+    public var body: some View {
+        #if canImport(UIKit)
+        UIKitRoutePickerRepresentable(tintColor: UIColor(tintColor))
+            .frame(width: 28, height: 28)
+        #elseif canImport(AppKit)
+        AppKitRoutePickerRepresentable(tintColor: NSColor(tintColor))
+            .frame(width: 28, height: 28)
+        #endif
+    }
+}
+
+#if canImport(UIKit)
+private struct UIKitRoutePickerRepresentable: UIViewRepresentable {
+    let tintColor: UIColor
+
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.backgroundColor = .clear
+        picker.tintColor = tintColor
+        picker.activeTintColor = UIColor(MyGoTheme.accent)
+        picker.prioritizesVideoDevices = false
+        return picker
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {
+        uiView.tintColor = tintColor
+    }
+}
+#elseif canImport(AppKit)
+private struct AppKitRoutePickerRepresentable: NSViewRepresentable {
+    let tintColor: NSColor
+
+    func makeNSView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.isRoutePickerButtonBordered = false
+        return picker
+    }
+
+    func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
+}
+#endif

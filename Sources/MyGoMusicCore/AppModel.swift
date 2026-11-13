@@ -3,6 +3,9 @@
 
 import Combine
 import Foundation
+#if canImport(Speech)
+import Speech
+#endif
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -58,15 +61,20 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var stageSparks: Bool = true
     public var volume: Double = 0.8
     public var normalize: Bool = true
+    public var fade: Bool = true
     public var hotComments: Bool = true
     public var fog: Bool = true
     public var cacheMB: Int = 2048
     public var searchHistory: [String] = []
+    public var githubToken: String = ""
+    public var pluginUpdates: [String: String] = [:]
+    public var pluginsCheckedAt: TimeInterval = 0
 
     private enum CodingKeys: String, CodingKey {
         case language, source, captions, disabledPlugins, quality, appearance
         case growFromCover, smoke, lyricsStage, stageStyle, stageSparks, volume
-        case normalize, hotComments, fog, cacheMB, searchHistory
+        case normalize, fade, hotComments, fog, cacheMB, searchHistory
+        case githubToken, pluginUpdates, pluginsCheckedAt
     }
 
     public init() {}
@@ -86,10 +94,14 @@ public struct AppSettings: Codable, Equatable, Sendable {
         stageSparks = try values.decodeIfPresent(Bool.self, forKey: .stageSparks) ?? true
         volume = try values.decodeIfPresent(Double.self, forKey: .volume) ?? 0.8
         normalize = try values.decodeIfPresent(Bool.self, forKey: .normalize) ?? true
+        fade = try values.decodeIfPresent(Bool.self, forKey: .fade) ?? true
         hotComments = try values.decodeIfPresent(Bool.self, forKey: .hotComments) ?? true
         fog = try values.decodeIfPresent(Bool.self, forKey: .fog) ?? true
         cacheMB = try values.decodeIfPresent(Int.self, forKey: .cacheMB) ?? 2048
         searchHistory = try values.decodeIfPresent([String].self, forKey: .searchHistory) ?? []
+        githubToken = try values.decodeIfPresent(String.self, forKey: .githubToken) ?? ""
+        pluginUpdates = try values.decodeIfPresent([String: String].self, forKey: .pluginUpdates) ?? [:]
+        pluginsCheckedAt = try values.decodeIfPresent(TimeInterval.self, forKey: .pluginsCheckedAt) ?? 0
     }
 }
 
@@ -131,10 +143,24 @@ public final class AppModel: ObservableObject {
             player.volume = settings.volume
             player.diskCache.limitMB = settings.cacheMB
             saveSettings()
+            if oldValue.captions != settings.captions {
+                if settings.captions {
+                    Task { @MainActor [weak self] in
+                        await self?.requestSpeechPermissionAndRefreshCaptions()
+                    }
+                } else {
+                    captionTask?.cancel()
+                    timedCaptions = []
+                    liveCaptionsStatus = ""
+                }
+            }
         }
     }
 
     @Published public private(set) var pluginSources: [JSPluginSource] = []
+    @Published public private(set) var pluginLoadFailures: [PluginLoadFailure] = []
+    @Published public private(set) var pluginOrigins: [String: PluginOrigin] = [:]
+    @Published public private(set) var isCheckingUpdates: Bool = false
     @Published public var activeSourceID: String = "kugou-lite"
 
     // 当前活动音乐源的数据缓存
@@ -145,19 +171,27 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var myPlaylists: [Playlist] = []
     @Published public private(set) var savedPlaylists: [Playlist] = []
     @Published public private(set) var likedTracks: [Track] = []
+    @Published public private(set) var likedHasMore: Bool = false
+    @Published public private(set) var isLoadingMoreLiked: Bool = false
     @Published public private(set) var savedAlbums: [Album] = []
+    @Published public private(set) var savedAlbumsHasMore: Bool = false
+    @Published public private(set) var isLoadingMoreSavedAlbums: Bool = false
     @Published public private(set) var stations: [Station] = []
     @Published public private(set) var subscribedShows: [Show] = []
     @Published public private(set) var currentAccount: Account? = nil
     @Published public private(set) var accountsBySource: [String: Account] = [:]
     @Published public private(set) var likedMap: [String: Bool] = [:]
 
-    // 正在播放与评论状态
+    // 正在播放、实时字幕与评论状态
     @Published public var isNowPlayingPresented: Bool = false
     @Published public var activeNowPlayingPane: NowPlayingPane = .lyrics
     @Published public private(set) var currentTrackComments: [Comment] = []
     @Published public private(set) var currentTrackCommentTotal: Int = 0
+    @Published public private(set) var commentsHasMore: Bool = false
     @Published public private(set) var isLoadingComments: Bool = false
+    @Published public private(set) var isLoadingMoreComments: Bool = false
+    @Published public private(set) var timedCaptions: [LyricLine] = []
+    @Published public private(set) var liveCaptionsStatus: String = ""
 
     // 搜索状态
     @Published public var searchQuery: String = ""
@@ -165,6 +199,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var searchResult: SearchResult = SearchResult()
     @Published public private(set) var searchSuggestions: [String] = []
     @Published public private(set) var isSearching: Bool = false
+    @Published public private(set) var isLoadingMoreSearch: Bool = false
 
     // 插件安装、二维码/提示登录与 WebView 登录状态
     @Published public var toastMessage: String? = nil
@@ -180,6 +215,8 @@ public final class AppModel: ObservableObject {
     private var webSignInContinuation: CheckedContinuation<String, Error>? = nil
     private var playerCancellable: AnyCancellable?
     private var trackChangeCancellable: AnyCancellable?
+    private var captionTask: Task<Void, Never>?
+    private var commentLikePendingIDs: Set<String> = []
     private var searchGeneration = 0
     private var suggestionGeneration = 0
     private var sourceRefreshGeneration = 0
@@ -238,6 +275,9 @@ public final class AppModel: ObservableObject {
         self.player.normalizeProvider = { [weak self] in
             self?.settings.normalize ?? true
         }
+        self.player.fadeEnabledProvider = { [weak self] in
+            self?.settings.fade ?? true
+        }
         self.player.onSourceFailure = { [weak self] sourceID, err in
             Task { @MainActor in
                 guard let self else { return }
@@ -253,18 +293,22 @@ public final class AppModel: ObservableObject {
             }
         }
 
-        // 监听当前播放曲目变化以加载评论和喜欢状态
+        // 监听当前播放曲目变化以加载评论、喜欢状态和播客实时字幕
         self.trackChangeCancellable = self.player.$currentTrack
             .removeDuplicates()
             .sink { [weak self] newTrack in
                 Task { @MainActor in
                     guard let self else { return }
+                    self.timedCaptions = []
+                    self.liveCaptionsStatus = ""
+                    self.captionTask?.cancel()
                     if let tr = newTrack {
                         #if canImport(UIKit)
                         await self.updateNowPlayingArtwork(for: tr)
                         #endif
                         await self.checkLikes(for: [tr])
                         await self.loadComments(for: tr)
+                        await self.refreshCaptionsForCurrentTrack()
                     } else {
                         #if canImport(UIKit)
                         self.artworkGeneration &+= 1
@@ -272,6 +316,7 @@ public final class AppModel: ObservableObject {
                         #endif
                         self.currentTrackComments = []
                         self.currentTrackCommentTotal = 0
+                        self.commentsHasMore = false
                     }
                 }
             }
@@ -325,11 +370,26 @@ public final class AppModel: ObservableObject {
     // MARK: - 音源管理（对应 makeSources / enabledChanged / switchSource）
 
     public func reloadPlugins() {
-        let discovered = PluginInstaller.discover(pluginsDir: pluginsDir, dataRootDir: pluginDataDir)
-            .filter { $0.manifest.id != "demo" }
+        let result = PluginInstaller.discoverDetailed(pluginsDir: pluginsDir, dataRootDir: pluginDataDir)
+        let discovered = result.plugins.filter { $0.manifest.id != "demo" }
+        var origins: [String: PluginOrigin] = [:]
+        var updates = settings.pluginUpdates
         for p in discovered {
             wirePluginCallbacks(p)
+            if let origin = PluginInstaller.readOrigin(in: p.pluginDir) {
+                origins[p.manifest.id] = origin
+            }
+            if let pendingVer = updates[p.manifest.id],
+               let curVer = p.manifest.version,
+               !PluginInstaller.isNewerVersion(pendingVer, than: curVer) {
+                updates.removeValue(forKey: p.manifest.id)
+            }
         }
+        if updates != settings.pluginUpdates {
+            settings.pluginUpdates = updates
+        }
+        self.pluginOrigins = origins
+        self.pluginLoadFailures = result.failures.filter { $0.folderName != "demo" }
         self.pluginSources = discovered
         Task {
             for p in discovered where p.can("account") {
@@ -557,10 +617,14 @@ public final class AppModel: ObservableObject {
             guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             if let page {
                 self.likedTracks = page.tracks ?? []
+                self.likedHasMore = page.more == true
                 await checkLikes(for: self.likedTracks)
+            } else {
+                self.likedHasMore = false
             }
         } else {
             self.likedTracks = []
+            self.likedHasMore = false
         }
 
         if src.can("savedAlbums") {
@@ -568,9 +632,13 @@ public final class AppModel: ObservableObject {
             guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             if let list {
                 self.savedAlbums = list.albums ?? []
+                self.savedAlbumsHasMore = list.more == true
+            } else {
+                self.savedAlbumsHasMore = false
             }
         } else {
             self.savedAlbums = []
+            self.savedAlbumsHasMore = false
         }
 
         if src.can("stations") {
@@ -687,6 +755,118 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    public func removeTrack(_ trackID: String, fromPlaylist playlistID: String, sourceID: String) async -> Bool {
+        guard let src = source(forID: sourceID), src.can("removeFromPlaylist") else { return false }
+        do {
+            try await src.removeFromPlaylist(id: playlistID, trackIds: [trackID])
+            if sourceID == activeSourceID { await refreshActiveSource() }
+            return true
+        } catch {
+            showToast(I18n.t("That didn't work. Try again later."))
+            return false
+        }
+    }
+
+    public func moveTrack(inPlaylist playlistID: String, sourceID: String, from: Int, to: Int) async -> Bool {
+        guard from != to, let src = source(forID: sourceID), src.can("movePlaylistTrack") else { return false }
+        do {
+            try await src.movePlaylistTrack(id: playlistID, from: from, to: to)
+            if sourceID == activeSourceID { await refreshActiveSource() }
+            return true
+        } catch {
+            showToast(I18n.t("That didn't work. Try again later."))
+            return false
+        }
+    }
+
+    public func toggleSaveAlbum(sourceID: String, albumID: String, currentlySaved: Bool) async -> Bool {
+        guard let src = source(forID: sourceID), src.can("saveAlbum") else { return currentlySaved }
+        let target = !currentlySaved
+        do {
+            try await src.saveAlbum(id: albumID, on: target)
+            if sourceID == activeSourceID, src.can("savedAlbums"), let list = try? await src.savedAlbums(offset: 0) {
+                self.savedAlbums = list.albums ?? []
+                self.savedAlbumsHasMore = list.more == true
+            }
+            return target
+        } catch {
+            showToast(I18n.t("That didn't work. Try again later."))
+            return currentlySaved
+        }
+    }
+
+    public func toggleFollowArtist(sourceID: String, artistID: String, currentlyFollowing: Bool) async -> Bool {
+        guard let src = source(forID: sourceID), src.can("followArtist") else { return currentlyFollowing }
+        let target = !currentlyFollowing
+        do {
+            try await src.followArtist(id: artistID, on: target)
+            return target
+        } catch {
+            showToast(I18n.t("That didn't work. Try again later."))
+            return currentlyFollowing
+        }
+    }
+
+    public func toggleSavePlaylist(sourceID: String, playlistID: String, currentlySaved: Bool) async -> Bool {
+        guard let src = source(forID: sourceID), src.can("savePlaylist") else { return currentlySaved }
+        let target = !currentlySaved
+        do {
+            try await src.savePlaylist(id: playlistID, on: target)
+            if sourceID == activeSourceID, src.can("playlists"), let pls = try? await src.playlists() {
+                self.myPlaylists = pls.filter { $0.mine == true }
+                self.savedPlaylists = pls.filter { $0.mine != true }
+            }
+            return target
+        } catch {
+            showToast(I18n.t("That didn't work. Try again later."))
+            return currentlySaved
+        }
+    }
+
+    public func toggleSubscribeShow(sourceID: String, showID: String, currentlySubscribed: Bool) async -> Bool {
+        guard let src = source(forID: sourceID), src.can("subscribeShow") else { return currentlySubscribed }
+        let target = !currentlySubscribed
+        do {
+            try await src.subscribeShow(id: showID, on: target)
+            if sourceID == activeSourceID, src.can("shows"), let sh = try? await src.shows() {
+                self.subscribedShows = sh
+            }
+            return target
+        } catch {
+            showToast(I18n.t("That didn't work. Try again later."))
+            return currentlySubscribed
+        }
+    }
+
+    public func loadMoreLikedSongs() async {
+        let src = activeSource
+        let srcID = src.info().id
+        guard likedHasMore, !isLoadingMoreLiked, src.can("liked") else { return }
+        isLoadingMoreLiked = true
+        defer { isLoadingMoreLiked = false }
+        let offset = likedTracks.count
+        if let page = try? await src.liked(offset: offset), activeSourceID == srcID {
+            let incoming = page.tracks ?? []
+            self.likedTracks = Self.appendUnique(self.likedTracks, items: incoming)
+            self.likedHasMore = page.more == true && !incoming.isEmpty
+            await checkLikes(for: incoming)
+        }
+    }
+
+    public func loadMoreSavedAlbums() async {
+        let src = activeSource
+        let srcID = src.info().id
+        guard savedAlbumsHasMore, !isLoadingMoreSavedAlbums, src.can("savedAlbums") else { return }
+        isLoadingMoreSavedAlbums = true
+        defer { isLoadingMoreSavedAlbums = false }
+        let offset = savedAlbums.count
+        if let list = try? await src.savedAlbums(offset: offset), activeSourceID == srcID {
+            let incoming = list.albums ?? []
+            self.savedAlbums = Self.appendUnique(self.savedAlbums, items: incoming)
+            self.savedAlbumsHasMore = list.more == true && !incoming.isEmpty
+        }
+    }
+
     public func startStation(_ station: Station) async {
         let src = activeSource
         guard src.can("stationNext") else { return }
@@ -711,6 +891,7 @@ public final class AppModel: ObservableObject {
         guard let src = source(forID: sid), src.can("comments") else {
             currentTrackComments = []
             currentTrackCommentTotal = 0
+            commentsHasMore = false
             return
         }
         isLoadingComments = true
@@ -718,6 +899,52 @@ public final class AppModel: ObservableObject {
         if let page = try? await src.comments(trackId: track.id, offset: 0) {
             currentTrackComments = page.comments ?? []
             currentTrackCommentTotal = page.total ?? currentTrackComments.count
+            commentsHasMore = page.more == true
+        } else {
+            commentsHasMore = false
+        }
+    }
+
+    public func loadMoreComments() async {
+        guard commentsHasMore, !isLoadingMoreComments, let tr = player.currentTrack else { return }
+        let sid = tr.source ?? activeSourceID
+        guard let src = source(forID: sid), src.can("comments") else { return }
+        isLoadingMoreComments = true
+        defer { isLoadingMoreComments = false }
+        let offset = currentTrackComments.count
+        if let page = try? await src.comments(trackId: tr.id, offset: offset),
+           player.currentTrack?.compositeKey == tr.compositeKey {
+            let incoming = page.comments ?? []
+            currentTrackComments = Self.appendUnique(currentTrackComments, items: incoming)
+            if let total = page.total { currentTrackCommentTotal = total }
+            commentsHasMore = page.more == true && !incoming.isEmpty
+        }
+    }
+
+    public func toggleLikeComment(_ comment: Comment) async {
+        guard !commentLikePendingIDs.contains(comment.id), let tr = player.currentTrack else { return }
+        let sid = tr.source ?? activeSourceID
+        guard let src = source(forID: sid), src.can("likeComment") else { return }
+        guard let idx = currentTrackComments.firstIndex(where: { $0.id == comment.id }) else { return }
+
+        commentLikePendingIDs.insert(comment.id)
+        defer { commentLikePendingIDs.remove(comment.id) }
+
+        let oldLiked = currentTrackComments[idx].liked == true
+        let newLiked = !oldLiked
+        let oldCount = currentTrackComments[idx].likes ?? 0
+        let newCount = max(0, oldCount + (newLiked ? 1 : -1))
+        currentTrackComments[idx].liked = newLiked
+        currentTrackComments[idx].likes = newCount
+
+        do {
+            try await src.likeComment(trackId: tr.id, commentId: comment.id, on: newLiked)
+        } catch {
+            if let revertIdx = currentTrackComments.firstIndex(where: { $0.id == comment.id }) {
+                currentTrackComments[revertIdx].liked = oldLiked
+                currentTrackComments[revertIdx].likes = oldCount
+            }
+            showToast(I18n.t("That didn't work. Try again later."))
         }
     }
 
@@ -733,6 +960,16 @@ public final class AppModel: ObservableObject {
         } catch {
             showToast(I18n.t("Couldn't post your comment. Try again later."))
         }
+    }
+
+    private static func appendUnique<T: Identifiable>(_ existing: [T], items: [T]) -> [T] where T.ID: Hashable {
+        var seen = Set(existing.map(\.id))
+        var combined = existing
+        for item in items where !seen.contains(item.id) {
+            seen.insert(item.id)
+            combined.append(item)
+        }
+        return combined
     }
 
     // MARK: - 搜索与账号操作
@@ -768,6 +1005,59 @@ public final class AppModel: ObservableObject {
             }
         } catch {
             if searchGeneration == generation { showToast(I18n.t("The search failed")) }
+        }
+    }
+
+    public func loadMoreSearch() async {
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = activeSource
+        let kind = searchKind
+        guard !q.isEmpty, searchResult.more == true, !isLoadingMoreSearch, source.can("search") else { return }
+
+        let offset: Int
+        switch kind {
+        case .tracks: offset = searchResult.tracks?.count ?? 0
+        case .albums: offset = searchResult.albums?.count ?? 0
+        case .artists: offset = searchResult.artists?.count ?? 0
+        case .playlists: offset = searchResult.playlists?.count ?? 0
+        case .shows: offset = searchResult.shows?.count ?? 0
+        }
+
+        let generation = searchGeneration
+        isLoadingMoreSearch = true
+        defer { isLoadingMoreSearch = false }
+
+        do {
+            let next = try await source.search(query: q, kind: kind, offset: offset)
+            guard searchGeneration == generation, activeSourceID == source.info().id else { return }
+
+            var merged = searchResult
+            let incomingTracks = next.tracks ?? []
+            if !incomingTracks.isEmpty {
+                merged.tracks = Self.appendUnique(merged.tracks ?? [], items: incomingTracks)
+                await checkLikes(for: incomingTracks)
+            }
+            if let albums = next.albums, !albums.isEmpty {
+                merged.albums = Self.appendUnique(merged.albums ?? [], items: albums)
+            }
+            if let artists = next.artists, !artists.isEmpty {
+                merged.artists = Self.appendUnique(merged.artists ?? [], items: artists)
+            }
+            if let pls = next.playlists, !pls.isEmpty {
+                merged.playlists = Self.appendUnique(merged.playlists ?? [], items: pls)
+            }
+            if let shows = next.shows, !shows.isEmpty {
+                merged.shows = Self.appendUnique(merged.shows ?? [], items: shows)
+            }
+            let gainedAny = !(next.tracks?.isEmpty ?? true)
+                || !(next.albums?.isEmpty ?? true)
+                || !(next.artists?.isEmpty ?? true)
+                || !(next.playlists?.isEmpty ?? true)
+                || !(next.shows?.isEmpty ?? true)
+            merged.more = (next.more == true) && gainedAny
+            self.searchResult = merged
+        } catch {
+            showToast(I18n.t("The search failed"))
         }
     }
 
@@ -880,15 +1170,16 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: - 插件安装与 Deep Link（mygo-music://install-plugin?repo=owner/repo）
+    // MARK: - 插件安装、更新与 Deep Link（mygo-music://install-plugin?repo=owner/repo）
 
     public func installPluginFromGitHub(repoInput: String) async {
         isInstallingPlugin = true
         installErrorMessage = nil
         defer { isInstallingPlugin = false }
         do {
-            let pending = try await PluginInstaller.fetchFromGitHub(repoInput: repoInput)
+            let pending = try await PluginInstaller.fetchFromGitHub(repoInput: repoInput, token: settings.githubToken)
             let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
+            settings.pluginUpdates.removeValue(forKey: installed.manifest.id)
             reloadPlugins()
             switchSource(to: installed.manifest.id)
             showToast("Installed \(installed.info().name)")
@@ -897,14 +1188,247 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    public func importLocalPlugin(from url: URL) async {
+        isInstallingPlugin = true
+        installErrorMessage = nil
+        defer { isInstallingPlugin = false }
+        do {
+            let pending = try PluginInstaller.openFromLocal(url)
+            let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
+            settings.pluginUpdates.removeValue(forKey: installed.manifest.id)
+            reloadPlugins()
+            switchSource(to: installed.manifest.id)
+            showToast("Installed \(installed.info().name)")
+        } catch {
+            installErrorMessage = error.localizedDescription
+            showToast(error.localizedDescription)
+        }
+    }
+
+    public func checkForPluginUpdates(manual: Bool = true) async {
+        guard !isCheckingUpdates else { return }
+        if !manual {
+            let now = Date().timeIntervalSince1970
+            if now - settings.pluginsCheckedAt < 86400 { return }
+        }
+        isCheckingUpdates = true
+        defer { isCheckingUpdates = false }
+
+        var newUpdates = settings.pluginUpdates
+        var foundCount = 0
+        for p in pluginSources {
+            guard PluginInstaller.readOrigin(in: p.pluginDir) != nil else { continue }
+            if let info = try? await PluginInstaller.checkUpdate(for: p.pluginDir, token: settings.githubToken) {
+                if info.hasUpdate {
+                    newUpdates[p.manifest.id] = info.latestVersion
+                    foundCount += 1
+                    if let tmp = info.pending?.sourcePath {
+                        try? FileManager.default.removeItem(at: tmp)
+                    }
+                } else {
+                    newUpdates.removeValue(forKey: p.manifest.id)
+                }
+            }
+        }
+        settings.pluginUpdates = newUpdates
+        settings.pluginsCheckedAt = Date().timeIntervalSince1970
+
+        if manual {
+            if foundCount > 0 {
+                if let first = newUpdates.first {
+                    showToast(I18n.tf("Update to %s available", first.value))
+                }
+            } else {
+                showToast(I18n.t("No updates available"))
+            }
+        }
+    }
+
+    public func updatePlugin(id: String) async {
+        guard let target = pluginSources.first(where: { $0.manifest.id == id }) else { return }
+        guard let origin = PluginInstaller.readOrigin(in: target.pluginDir) else {
+            showToast(I18n.t("Not installed via GitHub"))
+            return
+        }
+        isInstallingPlugin = true
+        installErrorMessage = nil
+        defer { isInstallingPlugin = false }
+        do {
+            let pending = try await PluginInstaller.fetchFromGitHub(repoInput: origin.repo, token: settings.githubToken)
+            let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
+            settings.pluginUpdates.removeValue(forKey: id)
+            reloadPlugins()
+            if activeSourceID == id {
+                await refreshActiveSource()
+            }
+            showToast("Updated \(installed.info().name) v\(installed.manifest.version ?? "")")
+        } catch {
+            installErrorMessage = error.localizedDescription
+            showToast(error.localizedDescription)
+        }
+    }
+
+    public func grantProcessPermission(for pluginID: String) {
+        guard let target = pluginSources.first(where: { $0.manifest.id == pluginID }) else { return }
+        try? target.setProcessGranted(true)
+        objectWillChange.send()
+    }
+
     public func removePlugin(id: String) {
         guard let target = pluginSources.first(where: { $0.manifest.id == id }) else { return }
         try? FileManager.default.removeItem(at: target.pluginDir)
+        settings.pluginUpdates.removeValue(forKey: id)
         reloadPlugins()
         if activeSourceID == id {
             switchSource(to: enabledSources.first?.info().id ?? LocalMusicSource.sourceID)
         }
     }
+
+    // MARK: - 播客实时语音识别字幕（对应 internal/app/ui_captions.go）
+
+    public func requestSpeechPermissionAndRefreshCaptions() async {
+        #if canImport(Speech)
+        guard Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil else {
+            await refreshCaptionsForCurrentTrack()
+            return
+        }
+        let status = SFSpeechRecognizer.authorizationStatus()
+        if status == .notDetermined {
+            let granted: Bool = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { authStatus in
+                    continuation.resume(returning: authStatus == .authorized)
+                }
+            }
+            if !granted {
+                liveCaptionsStatus = I18n.t("Speech recognition not authorized")
+                return
+            }
+        } else if status != .authorized {
+            liveCaptionsStatus = I18n.t("Speech recognition not authorized")
+            return
+        }
+        await refreshCaptionsForCurrentTrack()
+        #endif
+    }
+
+    public func refreshCaptionsForCurrentTrack() async {
+        captionTask?.cancel()
+        guard settings.captions, let track = player.currentTrack, track.isEpisode else {
+            timedCaptions = []
+            liveCaptionsStatus = ""
+            return
+        }
+
+        #if canImport(Speech)
+        guard Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil else {
+            liveCaptionsStatus = I18n.t("Speech recognition not authorized")
+            return
+        }
+        let status = SFSpeechRecognizer.authorizationStatus()
+        guard status == .authorized else {
+            liveCaptionsStatus = status == .notDetermined ? "" : I18n.t("Speech recognition not authorized")
+            return
+        }
+
+        // 定位可识别的本地或已缓存音轨文件
+        let localAudioURL: URL?
+        if let streamURLStr = player.currentStream?.url {
+            if streamURLStr.hasPrefix("file://"), let u = URL(string: streamURLStr) {
+                localAudioURL = u
+            } else if streamURLStr.hasPrefix("/") {
+                localAudioURL = URL(fileURLWithPath: streamURLStr)
+            } else {
+                let sourceID = track.source ?? LocalMusicSource.sourceID
+                let key = AudioDiskCache.cacheKey(
+                    sourceID: sourceID,
+                    trackID: track.id,
+                    quality: settings.quality.rawValue
+                )
+                localAudioURL = player.diskCache.cachedFileURL(forKey: key)?.fileURL
+            }
+        } else {
+            localAudioURL = nil
+        }
+
+        guard let audioFileURL = localAudioURL else {
+            liveCaptionsStatus = I18n.t("Recognizing captions…")
+            return
+        }
+
+        guard let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else {
+            liveCaptionsStatus = I18n.t("Speech recognition not authorized")
+            return
+        }
+
+        liveCaptionsStatus = I18n.t("Recognizing captions…")
+        let trackKey = track.compositeKey
+        captionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let request = SFSpeechURLRecognitionRequest(url: audioFileURL)
+            request.shouldReportPartialResults = true
+            if recognizer.supportsOnDeviceRecognition {
+                request.requiresOnDeviceRecognition = true
+            }
+            let streamLines = AsyncStream<[LyricLine]> { continuation in
+                let recTask = recognizer.recognitionTask(with: request) { result, error in
+                    if let result {
+                        let built = Self.buildCaptionLines(from: result.bestTranscription.segments)
+                        continuation.yield(built)
+                        if result.isFinal {
+                            continuation.finish()
+                        }
+                    } else if error != nil {
+                        continuation.finish()
+                    }
+                }
+                continuation.onTermination = { _ in
+                    recTask.cancel()
+                }
+            }
+            for await lines in streamLines {
+                guard !Task.isCancelled, self.player.currentTrack?.compositeKey == trackKey else { break }
+                if !lines.isEmpty {
+                    self.timedCaptions = lines
+                }
+            }
+            if !Task.isCancelled, self.player.currentTrack?.compositeKey == trackKey {
+                self.liveCaptionsStatus = ""
+            }
+        }
+        #endif
+    }
+
+    #if canImport(Speech)
+    private static func buildCaptionLines(from segments: [SFTranscriptionSegment]) -> [LyricLine] {
+        guard !segments.isEmpty else { return [] }
+        var lines: [LyricLine] = []
+        var bufferText = ""
+        var bufferStart: TimeInterval = segments[0].timestamp
+        var bufferEnd: TimeInterval = segments[0].timestamp + segments[0].duration
+
+        for seg in segments {
+            let word = seg.substring.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !word.isEmpty else { continue }
+            if bufferText.isEmpty {
+                bufferStart = seg.timestamp
+            }
+            if !bufferText.isEmpty {
+                bufferText += " "
+            }
+            bufferText += word
+            bufferEnd = seg.timestamp + max(seg.duration, 0.2)
+
+            if bufferText.count >= 42 || (bufferEnd - bufferStart) >= 4.0 {
+                lines.append(LyricLine(at: bufferStart, end: bufferEnd, text: bufferText))
+                bufferText = ""
+            }
+        }
+        if !bufferText.isEmpty {
+            lines.append(LyricLine(at: bufferStart, end: bufferEnd, text: bufferText))
+        }
+        return lines
+    }
+    #endif
 
     public func handleDeepLink(_ url: URL) {
         guard let scheme = url.scheme?.lowercased(),

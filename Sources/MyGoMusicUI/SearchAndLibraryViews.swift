@@ -45,19 +45,12 @@ public struct SearchView: View {
                     .padding(.vertical, 9)
                     .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                    Picker(I18n.t("Search"), selection: $app.searchKind) {
-                        Text(I18n.t("Songs")).tag(SearchKind.tracks)
-                        Text(I18n.t("Albums")).tag(SearchKind.albums)
-                        Text(I18n.t("Artists")).tag(SearchKind.artists)
-                        Text(I18n.t("Playlists")).tag(SearchKind.playlists)
-                        Text(I18n.t("Podcasts")).tag(SearchKind.shows)
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: app.searchKind) { _, _ in
-                        if !app.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-                            Task { await app.performSearch() }
+                    searchKindChips
+                        .onChange(of: app.searchKind) { _, _ in
+                            if !app.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                                Task { await app.performSearch() }
+                            }
                         }
-                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
@@ -74,10 +67,14 @@ public struct SearchView: View {
                                 suggestionsSection
                             }
                             searchResultsSection
+                            if app.searchResult.more == true {
+                                LoadMoreButton(isLoading: app.isLoadingMoreSearch) {
+                                    Task { await app.loadMoreSearch() }
+                                }
+                            }
                         }
                     }
                     .padding(.vertical, 10)
-                    .padding(.bottom, 92)
                 }
             }
             .navigationTitle(I18n.t("Search"))
@@ -91,6 +88,43 @@ public struct SearchView: View {
             }
             .navigationDestination(for: NavigationTarget.self) { target in
                 HomeView.buildDestination(for: target)
+            }
+            .environment(\.mygoNavigate) { target in
+                navPath.append(target)
+            }
+            .environment(\.mygoNavigate) { target in
+                navPath.append(target)
+            }
+        }
+    }
+
+    private var searchKindChips: some View {
+        let items: [(SearchKind, String)] = [
+            (.tracks, I18n.t("Songs")),
+            (.albums, I18n.t("Albums")),
+            (.artists, I18n.t("Artists")),
+            (.playlists, I18n.t("Playlists")),
+            (.shows, I18n.t("Podcasts"))
+        ]
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(items, id: \.0) { kind, label in
+                    let isSelected = app.searchKind == kind
+                    Button {
+                        app.searchKind = kind
+                    } label: {
+                        Text(label)
+                            .font(.system(size: 13.5, weight: isSelected ? .bold : .medium))
+                            .foregroundStyle(isSelected ? .white : .primary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                isSelected ? AnyShapeStyle(MyGoTheme.accent) : AnyShapeStyle(Color.primary.opacity(0.08)),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }
@@ -291,6 +325,7 @@ public struct SearchView: View {
 
 public struct LibraryView: View {
     @EnvironmentObject private var app: AppModel
+    @State private var navPath = NavigationPath()
     @State private var showNewPlaylistAlert = false
     @State private var newPlaylistName = ""
     @State private var renamingPlaylist: Playlist? = nil
@@ -300,36 +335,49 @@ public struct LibraryView: View {
     public init() {}
 
     public var body: some View {
-        NavigationStack {
+        let info = app.activeSource.info()
+        NavigationStack(path: $navPath) {
             List {
-                // 当前音源内置与自定义导航入口
-                SwiftUI.Section(app.activeSource.info().name) {
+                // 当前音源内置与自定义导航入口（遵循插件 navigation 的自定义标题/图标）
+                SwiftUI.Section(info.name) {
                     if app.activeSource.can("liked") {
                         NavigationLink(value: NavigationTarget.likedSongs) {
-                            Label(I18n.t("Liked Songs"), systemImage: "heart.fill")
-                                .foregroundStyle(.primary)
+                            Label(
+                                info.customTitle(forBuiltin: "liked") ?? I18n.t("Liked Songs"),
+                                systemImage: info.customIcon(forBuiltin: "liked").map { sfSymbol(for: $0) } ?? "heart.fill"
+                            )
+                            .foregroundStyle(.primary)
                         }
                     }
                     if app.activeSource.can("savedAlbums") {
                         NavigationLink(value: NavigationTarget.savedAlbums) {
-                            Label(I18n.t("Saved Albums"), systemImage: "square.stack.fill")
+                            Label(
+                                info.customTitle(forBuiltin: "savedAlbums") ?? I18n.t("Saved Albums"),
+                                systemImage: info.customIcon(forBuiltin: "savedAlbums").map { sfSymbol(for: $0) } ?? "square.stack.fill"
+                            )
                         }
                     }
                     if app.activeSource.can("stations") {
                         NavigationLink(value: NavigationTarget.stations) {
-                            Label(I18n.t("Stations"), systemImage: "dot.radiowaves.left.and.right")
+                            Label(
+                                info.customTitle(forBuiltin: "stations") ?? I18n.t("Stations"),
+                                systemImage: info.customIcon(forBuiltin: "stations").map { sfSymbol(for: $0) } ?? "dot.radiowaves.left.and.right"
+                            )
                         }
                     }
                     if app.activeSource.can("shows") {
                         NavigationLink(value: NavigationTarget.podcasts) {
-                            Label(I18n.t("Podcasts"), systemImage: "mic.fill")
+                            Label(
+                                info.customTitle(forBuiltin: "shows") ?? I18n.t("Podcasts"),
+                                systemImage: info.customIcon(forBuiltin: "shows").map { sfSymbol(for: $0) } ?? "mic.fill"
+                            )
                         }
                     }
 
                     // 插件自定义导航页（如 Songs, Albums, Artists, Charts 等）
-                    if let navItems = app.activeSource.info().navigation {
+                    if let navItems = info.navigation {
                         ForEach(Array(navItems.enumerated()), id: \.offset) { _, item in
-                            if let page = item.page, !page.isEmpty {
+                            if let page = item.page, !page.isEmpty, item.builtin == nil {
                                 NavigationLink(value: NavigationTarget.browse(page: page, title: item.title)) {
                                     Label(item.title ?? page, systemImage: sfSymbol(for: item.icon))
                                 }
@@ -444,6 +492,9 @@ public struct LibraryView: View {
             }
             .navigationDestination(for: NavigationTarget.self) { target in
                 HomeView.buildDestination(for: target)
+            }
+            .environment(\.mygoNavigate) { target in
+                navPath.append(target)
             }
             .alert(I18n.t("New Playlist"), isPresented: $showNewPlaylistAlert) {
                 TextField(I18n.t("Playlist Name"), text: $newPlaylistName)

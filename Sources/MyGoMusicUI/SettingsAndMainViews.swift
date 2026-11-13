@@ -5,6 +5,7 @@
 import MyGoMusicCore
 #endif
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 
 // MARK: - 设置与插件管理页（对应 ui_settings.go / plugin_install.go）
@@ -12,6 +13,7 @@ import WebKit
 public struct SettingsView: View {
     @EnvironmentObject private var app: AppModel
     @State private var showInstallSheet = false
+    @State private var showPluginImporter = false
     @State private var githubRepoInput = ""
     @State private var cacheUsedBytes: Int64 = 0
 
@@ -51,6 +53,15 @@ public struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+
+                    Toggle(isOn: $app.settings.fade) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(I18n.t("Fade Between Songs"))
+                            Text(I18n.t("Smoothly fade audio out and in when switching or pausing tracks"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 // 3. 律动舞台与视觉实验（对应 Experiments / Stage）
@@ -62,6 +73,16 @@ public struct SettingsView: View {
                     }
 
                     Toggle(I18n.t("Sparks"), isOn: $app.settings.stageSparks)
+
+                    Toggle(isOn: $app.settings.growFromCover) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(I18n.t("Grow From the Cover"))
+                            Text(I18n.t("Open Now Playing with a spring transition from the mini bar"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
                     Toggle(isOn: $app.settings.fog) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(I18n.t("Fog Backdrop"))
@@ -84,6 +105,15 @@ public struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(I18n.t("Top Comments in Quiet Parts"))
                             Text(I18n.t("In intros, breaks and outros, a song's top comments show in place of the lyrics"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Toggle(isOn: $app.settings.captions) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(I18n.t("Captions for Podcasts"))
+                            Text(I18n.t("Automatically generate timed captions for local podcast episodes"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -144,13 +174,39 @@ public struct SettingsView: View {
 
                     // 已安装的 JS/TS 插件列表
                     ForEach(app.pluginSources, id: \.manifest.id) { plugin in
+                        let pid = plugin.manifest.id
                         PluginSourceRowView(
                             source: plugin,
                             isBuiltIn: false,
+                            pendingUpdateVersion: app.settings.pluginUpdates[pid],
+                            origin: app.pluginOrigins[pid],
+                            onUpdate: {
+                                Task { await app.updatePlugin(id: pid) }
+                            },
                             onRemove: {
-                                app.removePlugin(id: plugin.manifest.id)
+                                app.removePlugin(id: pid)
                             }
                         )
+                    }
+
+                    // 加载失败诊断卡片（例如 minAppVersion 不满足或脚本语法错误）
+                    if !app.pluginLoadFailures.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(I18n.t("Plugin Load Errors"))
+                                .font(.system(size: 12.5, weight: .bold))
+                                .foregroundStyle(.red)
+                            ForEach(app.pluginLoadFailures) { failure in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(failure.folderName)
+                                        .font(.system(size: 13, weight: .semibold))
+                                    Text(failure.reason)
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 2)
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
 
                     Button {
@@ -161,6 +217,45 @@ public struct SettingsView: View {
                         Label(I18n.t("Install from GitHub"), systemImage: "plus.circle.fill")
                             .foregroundStyle(MyGoTheme.accent)
                     }
+
+                    Button {
+                        showPluginImporter = true
+                    } label: {
+                        Label(I18n.t("Import Plugin (Folder / Zip)…"), systemImage: "folder.badge.plus")
+                            .foregroundStyle(MyGoTheme.accent)
+                    }
+
+                    if !app.pluginOrigins.isEmpty {
+                        Button {
+                            Task { await app.checkForPluginUpdates(manual: true) }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if app.isCheckingUpdates {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text(I18n.t("Checking for updates…"))
+                                } else {
+                                    Label(I18n.t("Check for Updates"), systemImage: "arrow.triangle.2.circlepath")
+                                }
+                            }
+                            .foregroundStyle(MyGoTheme.accent)
+                        }
+                        .disabled(app.isCheckingUpdates)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(I18n.t("GitHub Token"))
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        SecureField(I18n.t("Optional token to avoid GitHub rate limits"), text: $app.settings.githubToken)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 13))
+                            .autocorrectionDisabled()
+                            #if os(iOS)
+                            .textInputAutocapitalization(.never)
+                            #endif
+                    }
+                    .padding(.vertical, 2)
                 } header: {
                     Text(I18n.t("Plugins"))
                 } footer: {
@@ -213,6 +308,21 @@ public struct SettingsView: View {
             .sheet(isPresented: $showInstallSheet) {
                 installPluginSheet
             }
+            .fileImporter(
+                isPresented: $showPluginImporter,
+                allowedContentTypes: [.folder, .zip],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    Task {
+                        let secured = url.startAccessingSecurityScopedResource()
+                        defer {
+                            if secured { url.stopAccessingSecurityScopedResource() }
+                        }
+                        await app.importLocalPlugin(from: url)
+                    }
+                }
+            }
         }
     }
 
@@ -234,13 +344,15 @@ public struct SettingsView: View {
                 } header: {
                     Text(I18n.t("Install from GitHub"))
                 } footer: {
-                    Text("例如: egoist/mygo-music-youtube-music 或 AkinoKaede/mygo-music-netease-cloud-music")
+                    Text("例如: egoist/mygo-music-youtube-music 或 GentleM4dman/mygo-music-bilibili")
                 }
 
                 SwiftUI.Section("推荐社区插件") {
                     ForEach([
                         ("egoist/mygo-music-youtube-music", "YouTube Music 官方插件"),
+                        ("GentleM4dman/mygo-music-bilibili", "哔哩哔哩音乐插件"),
                         ("AkinoKaede/mygo-music-netease-cloud-music", "网易云音乐插件"),
+                        ("sogud/mygo-music-netease", "网易云音乐插件（社区分支）"),
                         ("xingkaixin/mygo-music-spotify", "Spotify 插件")
                     ], id: \.0) { repo, desc in
                         Button {
@@ -290,6 +402,9 @@ private struct PluginSourceRowView: View {
     @EnvironmentObject private var app: AppModel
     let source: MusicSource
     let isBuiltIn: Bool
+    var pendingUpdateVersion: String? = nil
+    var origin: PluginOrigin? = nil
+    var onUpdate: (() -> Void)? = nil
     let onRemove: (() -> Void)?
 
     var body: some View {
@@ -314,12 +429,25 @@ private struct PluginSourceRowView: View {
                                 .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
                         }
+                        if let pending = pendingUpdateVersion, !pending.isEmpty {
+                            Text("→ v\(pending)")
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(MyGoTheme.accent, in: Capsule())
+                        }
                     }
                     if let jsPlugin = source as? JSPluginSource {
                         let nets = jsPlugin.manifest.permissions?.network ?? []
                         Text(nets.isEmpty ? I18n.t("Asks for no network") : I18n.tf("Can reach %s", nets.joined(separator: ", ")))
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
+                        if let repo = origin?.repo, !repo.isEmpty {
+                            Text(repo)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                 }
 
@@ -331,6 +459,27 @@ private struct PluginSourceRowView: View {
                 ))
                 .labelsHidden()
                 .tint(MyGoTheme.accent)
+            }
+
+            // 本地进程权限提示与一次性授权
+            if let jsPlugin = source as? JSPluginSource, jsPlugin.hasProcessPermissionDeclaration {
+                HStack(spacing: 8) {
+                    if jsPlugin.isProcessGranted() {
+                        Label(I18n.t("Process permission granted"), systemImage: "checkmark.shield")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Label(I18n.t("Needs Process Permission"), systemImage: "exclamationmark.shield.fill")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button(I18n.t("Grant Permission")) {
+                            app.grantProcessPermission(for: info.id)
+                        }
+                        .font(.system(size: 11.5, weight: .bold))
+                        .buttonStyle(.bordered)
+                    }
+                }
             }
 
             // 账号登录与状态管理（对应 internal/app/ui_account.go 中的 accountRow）
@@ -396,14 +545,25 @@ private struct PluginSourceRowView: View {
                 }
             }
 
-            if !isBuiltIn, let onRemove {
-                HStack {
-                    Spacer()
-                    Button(role: .destructive, action: onRemove) {
-                        Label(I18n.t("Remove"), systemImage: "trash")
-                            .font(.system(size: 12.5, weight: .medium))
+            if !isBuiltIn {
+                HStack(spacing: 12) {
+                    if let pending = pendingUpdateVersion, !pending.isEmpty, let onUpdate {
+                        Button(action: onUpdate) {
+                            Label(I18n.tf("Update to %s", "v\(pending)"), systemImage: "arrow.down.circle.fill")
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(MyGoTheme.accent)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(app.isInstallingPlugin)
                     }
-                    .buttonStyle(.borderless)
+                    Spacer()
+                    if let onRemove {
+                        Button(role: .destructive, action: onRemove) {
+                            Label(I18n.t("Remove"), systemImage: "trash")
+                                .font(.system(size: 12.5, weight: .medium))
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
             }
         }
@@ -417,48 +577,168 @@ private struct PluginSettingFieldRow: View {
     let source: MusicSource
     let spec: PluginSettingSpec
     @State private var value: String = ""
+    @State private var savedValue: String = ""
+
+    private var fieldKind: String {
+        (spec.type ?? "text").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(spec.label)
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let linkStr = spec.link, let url = URL(string: linkStr) {
-                    Button(I18n.t("Help")) {
-                        openURL(url)
-                    }
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(MyGoTheme.accent)
-                    .buttonStyle(.plain)
-                }
-            }
-
-            HStack(spacing: 8) {
-                TextField(spec.help ?? spec.label, text: $value)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 13.5))
-                    .onSubmit {
-                        saveValue()
-                    }
-                if value != source.setting(spec.key) {
-                    Button(I18n.t("Save")) {
-                        saveValue()
-                    }
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(MyGoTheme.accent)
-                    .buttonStyle(.bordered)
+        VStack(alignment: .leading, spacing: 6) {
+            if fieldKind == "boolean" {
+                booleanRow
+            } else {
+                headerRow
+                switch fieldKind {
+                case "select":
+                    selectInputRow
+                case "password":
+                    secretOrTextInputRow(isSecret: true)
+                default:
+                    secretOrTextInputRow(isSecret: false)
                 }
             }
         }
         .onAppear {
-            value = source.setting(spec.key)
+            loadInitialValue()
+        }
+        .onChange(of: source.info().id) { _, _ in
+            loadInitialValue()
         }
     }
 
-    private func saveValue() {
-        try? source.setSetting(spec.key, value: value)
+    private var headerRow: some View {
+        HStack {
+            Text(spec.label)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if let linkStr = spec.link, let url = URL(string: linkStr) {
+                Button(I18n.t("Help")) {
+                    openURL(url)
+                }
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(MyGoTheme.accent)
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var booleanRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Toggle(isOn: Binding(
+                get: { value.lowercased() == "true" || value == "1" },
+                set: { newBool in
+                    let str = newBool ? "true" : "false"
+                    value = str
+                    saveValue(str)
+                }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(spec.label)
+                        .font(.system(size: 13.5, weight: .medium))
+                    if let help = spec.help, !help.isEmpty {
+                        Text(help)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .tint(MyGoTheme.accent)
+
+            if let linkStr = spec.link, let url = URL(string: linkStr) {
+                Button(I18n.t("Help")) {
+                    openURL(url)
+                }
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(MyGoTheme.accent)
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var selectInputRow: some View {
+        let options = spec.options ?? []
+        let hasUnknownValue = !value.isEmpty && !options.contains(where: { $0.value == value })
+        return VStack(alignment: .leading, spacing: 3) {
+            Picker(spec.label, selection: Binding(
+                get: { value },
+                set: { newVal in
+                    value = newVal
+                    saveValue(newVal)
+                }
+            )) {
+                if options.isEmpty && value.isEmpty {
+                    Text(I18n.t("Current value")).tag("")
+                }
+                if hasUnknownValue {
+                    Text("\(I18n.t("Current value")): \(value)").tag(value)
+                }
+                ForEach(options, id: \.value) { opt in
+                    Text(opt.label).tag(opt.value)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+
+            if let help = spec.help, !help.isEmpty {
+                Text(help)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func secretOrTextInputRow(isSecret: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Group {
+                if isSecret {
+                    SecureField(spec.help ?? spec.label, text: $value)
+                } else {
+                    TextField(spec.help ?? spec.label, text: $value)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 13.5))
+            .autocorrectionDisabled()
+            #if os(iOS)
+            .textInputAutocapitalization(.never)
+            #endif
+            .onSubmit {
+                saveValue(value)
+            }
+
+            if value != savedValue {
+                HStack(spacing: 8) {
+                    Button(I18n.t("Save changes")) {
+                        saveValue(value)
+                    }
+                    .font(.system(size: 12, weight: .bold))
+                    .buttonStyle(.borderedProminent)
+                    .tint(MyGoTheme.accent)
+
+                    Button(I18n.t("Discard changes")) {
+                        value = savedValue
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+    }
+
+    private func loadInitialValue() {
+        var current = source.setting(spec.key)
+        if fieldKind == "select", current.isEmpty, let first = spec.options?.first {
+            current = first.value
+        }
+        value = current
+        savedValue = current
+    }
+
+    private func saveValue(_ newValue: String) {
+        savedValue = newValue
+        try? source.setSetting(spec.key, value: newValue)
         Task { await app.refreshActiveSource() }
     }
 }
@@ -574,7 +854,13 @@ public struct MiniPlayerBarView: View {
             .padding(.horizontal, 12)
             .contentShape(Rectangle())
             .onTapGesture {
-                app.isNowPlayingPresented = true
+                if app.settings.growFromCover {
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.86)) {
+                        app.isNowPlayingPresented = true
+                    }
+                } else {
+                    app.isNowPlayingPresented = true
+                }
             }
         }
     }
@@ -693,10 +979,11 @@ public struct SignInDialogSheetView: View {
 public struct WebSignInSheetView: View {
     @EnvironmentObject private var app: AppModel
     public let request: WebSignInRequest
+    @State private var reloadTrigger = 0
 
     public var body: some View {
         NavigationStack {
-            EphemeralSignInWebView(request: request) { cookieHeader in
+            EphemeralSignInWebView(request: request, reloadTrigger: reloadTrigger) { cookieHeader in
                 app.completeWebSignIn(cookieHeader: cookieHeader)
             }
             .navigationTitle(I18n.tf("Sign in to %s", request.pluginName ?? request.pluginId ?? "Plugin"))
@@ -709,6 +996,14 @@ public struct WebSignInSheetView: View {
                         app.cancelWebSignIn()
                     }
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        reloadTrigger += 1
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel(I18n.t("Reload Page"))
+                }
             }
         }
     }
@@ -717,6 +1012,7 @@ public struct WebSignInSheetView: View {
 #if canImport(UIKit)
 private struct EphemeralSignInWebView: UIViewRepresentable {
     let request: WebSignInRequest
+    let reloadTrigger: Int
     let onResolved: (String) -> Void
 
     func makeCoordinator() -> WebSignInCoordinator {
@@ -725,11 +1021,17 @@ private struct EphemeralSignInWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let webView = context.coordinator.makeWebView()
+        context.coordinator.lastReloadTrigger = reloadTrigger
         context.coordinator.start()
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        if context.coordinator.lastReloadTrigger != reloadTrigger {
+            context.coordinator.lastReloadTrigger = reloadTrigger
+            uiView.reload()
+        }
+    }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: WebSignInCoordinator) {
         coordinator.stop()
@@ -738,6 +1040,7 @@ private struct EphemeralSignInWebView: UIViewRepresentable {
 #elseif canImport(AppKit)
 private struct EphemeralSignInWebView: NSViewRepresentable {
     let request: WebSignInRequest
+    let reloadTrigger: Int
     let onResolved: (String) -> Void
 
     func makeCoordinator() -> WebSignInCoordinator {
@@ -746,11 +1049,17 @@ private struct EphemeralSignInWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let webView = context.coordinator.makeWebView()
+        context.coordinator.lastReloadTrigger = reloadTrigger
         context.coordinator.start()
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        if context.coordinator.lastReloadTrigger != reloadTrigger {
+            context.coordinator.lastReloadTrigger = reloadTrigger
+            nsView.reload()
+        }
+    }
 
     static func dismantleNSView(_ nsView: WKWebView, coordinator: WebSignInCoordinator) {
         coordinator.stop()
@@ -759,9 +1068,10 @@ private struct EphemeralSignInWebView: NSViewRepresentable {
 #endif
 
 @MainActor
-private final class WebSignInCoordinator: NSObject {
+private final class WebSignInCoordinator: NSObject, WKUIDelegate {
     let request: WebSignInRequest
     let onResolved: (String) -> Void
+    var lastReloadTrigger = 0
     private var webView: WKWebView?
     private var pollTimer: Timer?
     private var finished = false
@@ -775,11 +1085,25 @@ private final class WebSignInCoordinator: NSObject {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
         let wv = WKWebView(frame: .zero, configuration: config)
+        wv.uiDelegate = self
         if let ua = request.userAgent, !ua.isEmpty {
             wv.customUserAgent = ua
         }
         self.webView = wv
         return wv
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        // 第三方 OAuth 登录常以 target="_blank" 弹窗跳转，在当前内置无痕 WebView 直接接管加载
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+        }
+        return nil
     }
 
     func start() {
@@ -807,16 +1131,26 @@ private final class WebSignInCoordinator: NSObject {
                 guard let self, !self.finished else { return }
                 let matching = cookies.filter { cookie in
                     let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-                    return targetHost == domain || targetHost.hasSuffix("." + domain)
+                    return !domain.isEmpty && (targetHost == domain || targetHost.hasSuffix("." + domain))
                 }
-                let byName = Dictionary(grouping: matching, by: \.name)
+                // 按 Cookie 名称去重，优先保留非空值及域名更精确的匹配项
+                var resolved: [String: HTTPCookie] = [:]
+                for cookie in matching where !cookie.value.isEmpty {
+                    if let prev = resolved[cookie.name] {
+                        if cookie.domain.count >= prev.domain.count {
+                            resolved[cookie.name] = cookie
+                        }
+                    } else {
+                        resolved[cookie.name] = cookie
+                    }
+                }
                 for reqName in self.request.until {
-                    let hasValid = byName[reqName]?.contains(where: { !$0.value.isEmpty }) ?? false
-                    if !hasValid { return }
+                    if resolved[reqName] == nil { return }
                 }
                 self.finished = true
                 self.stop()
-                let header = matching.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+                let ordered = resolved.values.sorted { $0.name < $1.name }
+                let header = ordered.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
                 self.onResolved(header)
             }
         }
@@ -828,6 +1162,9 @@ private final class WebSignInCoordinator: NSObject {
 public struct MainView: View {
     @EnvironmentObject private var app: AppModel
     @State private var selectedTab: Int = 0
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
 
     public init() {}
 
@@ -839,28 +1176,46 @@ public struct MainView: View {
         }
     }
 
+    private var miniPlayerBottomPadding: CGFloat {
+        #if os(iOS)
+        return horizontalSizeClass == .regular ? 12 : 56
+        #else
+        return 12
+        #endif
+    }
+
+    @ViewBuilder
+    private func tabWithMiniPlayerInset<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Color.clear
+                    .frame(height: app.player.currentTrack == nil ? 0 : 72)
+                    .allowsHitTesting(false)
+            }
+    }
+
     public var body: some View {
         ZStack(alignment: .bottom) {
             TabView(selection: $selectedTab) {
-                HomeView()
+                tabWithMiniPlayerInset { HomeView() }
                     .tabItem {
                         Label(I18n.t("Home"), systemImage: "house.fill")
                     }
                     .tag(0)
 
-                SearchView()
+                tabWithMiniPlayerInset { SearchView() }
                     .tabItem {
                         Label(I18n.t("Search"), systemImage: "magnifyingglass")
                     }
                     .tag(1)
 
-                LibraryView()
+                tabWithMiniPlayerInset { LibraryView() }
                     .tabItem {
                         Label(I18n.t("Library"), systemImage: "music.note.list")
                     }
                     .tag(2)
 
-                SettingsView()
+                tabWithMiniPlayerInset { SettingsView() }
                     .tabItem {
                         Label(I18n.t("Settings"), systemImage: "gearshape.fill")
                     }
@@ -868,21 +1223,21 @@ public struct MainView: View {
             }
             .tint(MyGoTheme.accent)
 
-            // 悬浮于底部标签栏上方的 Mini Player Bar
-            MiniPlayerBarView()
-                .padding(.bottom, 54)
+            // 悬浮于底部标签栏上方的提示胶囊与 Mini Player Bar（统一堆栈避免重叠）
+            VStack(spacing: 8) {
+                if let toast = app.toastMessage {
+                    Text(toast)
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.black.opacity(0.82), in: Capsule())
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
 
-            // 全局轻提示 Toast
-            if let toast = app.toastMessage {
-                Text(toast)
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.black.opacity(0.82), in: Capsule())
-                    .padding(.bottom, 118)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                MiniPlayerBarView()
             }
+            .padding(.bottom, miniPlayerBottomPadding)
         }
         .preferredColorScheme(preferredScheme)
         #if os(iOS)
@@ -898,8 +1253,9 @@ public struct MainView: View {
                 .frame(minWidth: 420, minHeight: 640)
         }
         #endif
+        #if DEBUG
         .onAppear {
-            // 调试用启动参数：直接打开正在播放页，便于在模拟器中截图检查布局
+            // 调试用启动参数：仅在 DEBUG 构建生效，便于在模拟器中截图检查布局
             if ProcessInfo.processInfo.arguments.contains("-MyGoOpenNowPlaying"), app.player.currentTrack != nil {
                 app.activeNowPlayingPane = .lyrics
                 app.isNowPlayingPresented = true
@@ -918,6 +1274,7 @@ public struct MainView: View {
                 }
             }
         }
+        #endif
         .sheet(isPresented: $app.isSignInSheetPresented) {
             SignInDialogSheetView()
                 .environmentObject(app)
