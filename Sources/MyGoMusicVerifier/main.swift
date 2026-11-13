@@ -27,39 +27,47 @@ private func assertTrue(_ cond: Bool, _ message: String = "", file: String = #fi
 struct MyGoMusicVerifier {
     static func main() async {
         do {
-            print("▶ [1/8] 验证 LyricsEngine（LRC多时间戳解析、翻译对齐、逐字均摊、演职员表与间奏检测）...")
+            print("▶ [1/9] 验证 LyricsEngine（LRC多时间戳解析、翻译对齐、逐字均摊、演职员表与间奏检测）...")
             try verifyLyricsEngine()
             print("  ✓ LyricsEngine 通过")
 
-            print("▶ [2/8] 验证 JavaScriptCore 插件引擎（基础夹具 + B 站/网易云多文件 TS、AbortController、setTimeout、getSetCookie、minAppVersion）...")
+            print("▶ [2/9] 验证 JavaScriptCore 插件引擎（基础夹具 + B 站/网易云多文件 TS、AbortController、setTimeout、getSetCookie、minAppVersion）...")
             try await verifyPluginRuntime()
             print("  ✓ JavaScriptCore 插件引擎与生态适配 通过")
 
-            print("▶ [3/8] 验证 PluginCrypto（MD5、AES-128-ECB）、网络权限通配符与 Go 风格宽容模型解码...")
+            print("▶ [3/9] 验证 PluginCrypto（MD5、AES-128-ECB）、网络权限通配符与 Go 风格宽容模型解码...")
             try verifyPluginCryptoAndModels()
             print("  ✓ PluginCrypto、权限检查与宽容解码 通过")
 
-            print("▶ [4/8] 验证 PluginInstaller（流式 ZIP Deflate/__MACOSX 解压/仓库解析）与 LocalMusicSource（GB18030/.ogg过滤）...")
+            print("▶ [4/9] 验证 PluginInstaller（流式 ZIP Deflate/__MACOSX 解压/仓库解析）与 LocalMusicSource（GB18030/.ogg过滤）...")
             try await verifyInstallerAndLocalSource()
             print("  ✓ PluginInstaller 与 LocalMusicSource 通过")
 
-            print("▶ [5/8] 验证 StageMath Folia 律动舞台物理与分行算法（流光、云阶、倾诉、火花）...")
+            print("▶ [5/9] 验证 StageMath Folia 律动舞台物理与分行算法（流光、云阶、倾诉、火花）...")
             try verifyStageMath()
             print("  ✓ StageMath 律动舞台算法 通过")
 
-            print("▶ [6/8] 验证 AudioDiskCache（limitMB=0 禁用、LRU 磁盘容量淘汰与清空）...")
+            print("▶ [6/9] 验证 AudioDiskCache（limitMB=0 禁用、LRU 磁盘容量淘汰与清空）...")
             try verifyAudioDiskCacheLRU()
             print("  ✓ AudioDiskCache LRU 缓存淘汰 通过")
 
-            print("▶ [7/8] 验证 AudioStreamProxy 音频格式 UTType 识别（.m4s/mp4/flac/mp3）...")
+            print("▶ [7/9] 验证 AudioStreamProxy 音频格式 UTType 识别（.m4s/mp4/flac/mp3）...")
             try verifyStreamUTTypeMapping()
             print("  ✓ AudioStreamProxy 音频格式识别 通过")
 
-            print("▶ [8/8] 验证 SourceInfo 自定义导航标题与图标扩展...")
+            print("▶ [8/9] 验证 SourceInfo 自定义导航标题与图标扩展...")
             try verifySourceNavigationCustomization()
             print("  ✓ SourceInfo 自定义导航扩展 通过")
 
-            print("\n🎉 所有 8 组核心测试套件全部通过！")
+            print("▶ [9/10] 验证 PlayerEngine 灰色无权限曲目连播跳过与不可播格式拦截...")
+            try await verifyPlaybackQueueAndFormatGuards()
+            print("  ✓ PlayerEngine 灰色曲目跳过与格式保护 通过")
+
+            print("▶ [10/10] 验证全曲硬件 FFT 频谱解码、律动节拍同步与桌面高标准舞台模式...")
+            try await verifyStageVisualizerRhythmAndFFT()
+            print("  ✓ 律动音画同步与桌面高标准舞台验证 通过")
+
+            print("\n🎉 所有 10 组核心测试套件全部通过！")
         } catch {
             fputs("❌ 测试失败: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -503,15 +511,28 @@ struct MyGoMusicVerifier {
             AVFileType.m4a.rawValue
         )
 
-        // 直链分流判断：标准 HTTP 直链优先原生 AVURLAsset，仅 .m4s 或带自定义 headers 才走代理
+        // 直链分流判断：网易云等标准音频格式即使带 User-Agent/Referer 也优先原生 AVURLAsset（传 AVURLAssetHTTPHeaderFieldsKey），
+        // 仅 .m4s、含 Cookie/Authorization/X-* 敏感头或无明确原生格式的带头流才首跳走代理
         let directMP3 = StreamInfo(url: "https://m701.music.126.net/song.mp3", type: "mp3", headers: nil)
         try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directMP3.url)!, stream: directMP3))
+
+        let neteaseMP3WithHeaders = StreamInfo(
+            url: "https://m701.music.126.net/song.mp3",
+            type: "mp3",
+            headers: ["User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"]
+        )
+        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: neteaseMP3WithHeaders.url)!, stream: neteaseMP3WithHeaders))
+        try assertEqual(PlayerEngine.directAssetHTTPHeaders(for: neteaseMP3WithHeaders)["Referer"], "https://music.163.com/")
 
         let directOuterNoExt = StreamInfo(url: "https://music.163.com/song/media/outer/url?id=123", headers: [:])
         try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directOuterNoExt.url)!, stream: directOuterNoExt))
 
-        let directFLAC = StreamInfo(url: "https://m8.music.126.net/track.flac", type: "flac")
-        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directFLAC.url)!, stream: directFLAC))
+        let directFLACWithHeaders = StreamInfo(
+            url: "https://m8.music.126.net/track.flac",
+            type: "flac",
+            headers: ["Referer": "https://music.163.com/"]
+        )
+        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directFLACWithHeaders.url)!, stream: directFLACWithHeaders))
 
         let hlsWithHeaders = StreamInfo(url: "https://cdn.example.com/live.m3u8", type: "application/vnd.apple.mpegurl", headers: ["Referer": "https://music.163.com"])
         try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: hlsWithHeaders.url)!, stream: hlsWithHeaders))
@@ -519,8 +540,16 @@ struct MyGoMusicVerifier {
         let biliM4S = StreamInfo(url: "https://upos.bilivideo.com/audio.m4s")
         try assertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: biliM4S.url)!, stream: biliM4S))
 
-        let customHeaderMP3 = StreamInfo(url: "https://cdn.example.com/track.mp3", type: "mp3", headers: ["Referer": "https://www.bilibili.com/"])
-        try assertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: customHeaderMP3.url)!, stream: customHeaderMP3))
+        let cookieHeaderMP3 = StreamInfo(url: "https://cdn.example.com/track.mp3", type: "mp3", headers: ["Cookie": "SESSION=abc"])
+        try assertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: cookieHeaderMP3.url)!, stream: cookieHeaderMP3))
+
+        let unknownWithHeader = StreamInfo(url: "https://cdn.example.com/stream?id=1", type: nil, headers: ["Referer": "https://music.163.com/"])
+        try assertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: unknownWithHeader.url)!, stream: unknownWithHeader))
+
+        // OGG / OPUS 不支持的格式应提前识别
+        let oggStream = StreamInfo(url: "https://cdn.example.com/track.ogg", type: "ogg")
+        try assertEqual(PlayerEngine.unsupportedAudioFormat(url: URL(string: oggStream.url)!, stream: oggStream), "OGG")
+        try assertEqual(PlayerEngine.unsupportedAudioFormat(url: URL(string: directMP3.url)!, stream: directMP3), nil)
 
         // makeProxyAssetURL 不应对未知无后缀直链强行伪造 .mp4 扩展名
         let unknownProxy = AudioStreamProxy(
@@ -556,6 +585,174 @@ struct MyGoMusicVerifier {
         try assertEqual(info.customIcon(forBuiltin: "home"), "star")
         try assertEqual(info.customTitle(forBuiltin: "liked"), "红心歌单")
         try assertTrue(info.customTitle(forBuiltin: "stations") == nil)
+    }
+
+    static func verifyPlaybackQueueAndFormatGuards() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-verifier-player-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+
+        let wavA = tmpDir.appendingPathComponent("a.wav")
+        let wavB = tmpDir.appendingPathComponent("b.wav")
+        try writeTestWAV(to: wavA)
+        try writeTestWAV(to: wavB)
+
+        let grey0 = Track(id: "g0", name: "灰歌0", unavailable: true)
+        let ok1 = Track(id: "ok1", source: LocalMusicSource.sourceID, name: "可播1", url: wavA.path)
+        let grey2 = Track(id: "g2", name: "灰歌2", unavailable: true)
+        let ok3 = Track(id: "ok3", source: LocalMusicSource.sourceID, name: "可播3", url: wavB.path)
+        let localSrc = LocalMusicSource(dataDir: tmpDir)
+
+        try await MainActor.run {
+            let engine = PlayerEngine(cacheDir: tmpDir.appendingPathComponent("cache"))
+            engine.sourceResolver = { _ in localSrc }
+
+            // playQueue 应跳过开头的灰歌0 直接播可播1
+            engine.playQueue([grey0, ok1, grey2, ok3], start: 0)
+            try assertEqual(engine.currentTrack?.id, "ok1")
+
+            // next 应跳过灰歌2 直达可播3
+            engine.next()
+            try assertEqual(engine.currentTrack?.id, "ok3")
+
+            // previous 应跳过灰歌2 回到可播1
+            engine.previous()
+            try assertEqual(engine.currentTrack?.id, "ok1")
+
+            // 全灰列表直接明确报错并停止加载
+            engine.playQueue([grey0, grey2], start: 0)
+            try assertTrue(!engine.isLoading)
+            try assertTrue(!engine.isPlaying)
+            try assertTrue((engine.errorMessage ?? "").isEmpty == false)
+            engine.pause()
+        }
+    }
+
+    static func verifyStageVisualizerRhythmAndFFT() async throws {
+        // 1) 验证歌词节拍引擎：起音脉冲、间奏沉降与多模式分布
+        let lines = LyricsEngine.build(
+            lrc: """
+            [00:01.00]光束穿破漆黑的夜空，听见心跳合奏的声音
+            [00:08.00]Keep shining through the rhythm
+            """
+        )
+        let idleRhythm = StageMath.lyricRhythm(at: 1.1, lines: lines, isPlaying: false)
+        try assertEqual(idleRhythm, .idle)
+
+        let sungRhythm = StageMath.lyricRhythm(at: 1.02, lines: lines, isPlaying: true)
+        try assertTrue(sungRhythm.vocal > 0.45, "唱词瞬间应具备显著人声共振强度")
+
+        let shapes = StageMath.stageShapes(for: lines[0], fontSize: 34)
+        let neutralState = StageMath.stageWordState(word: lines[0].words[0], shape: shapes[0], pos: 1.15, rhythm: .idle)
+        let pulsedState = StageMath.stageWordState(
+            word: lines[0].words[0],
+            shape: shapes[0],
+            pos: 1.15,
+            rhythm: AudioRhythmState(bands: [0.9, 0.9, 0.9, 0.8, 0.7], bass: 0.9, vocal: 0.95, treble: 0.7, energy: 0.88, beatPulse: 0.95, isRealAudio: true)
+        )
+        try assertTrue(pulsedState.glow > neutralState.glow, "高音律能量应增强单词霓虹光晕")
+        try assertTrue(pulsedState.scale > neutralState.scale, "重拍脉冲应适度放大当前字弹性峰值")
+
+        // 2) 验证 Tilt 自适应折段缩比与火花射线生成
+        let tiltLayout = StageMath.fitTiltLayout(for: lines[0], maxWidth: 210, baseFontSize: 40)
+        try assertTrue(!tiltLayout.parts.isEmpty)
+        try assertTrue(tiltLayout.fontSize <= 40.0)
+        let streaksNormal = StageMath.sparkStreaks(size: CGSize(width: 60, height: 40), since: 0.12, seed: 1000, isLastWord: false)
+        let streaksLast = StageMath.sparkStreaks(size: CGSize(width: 60, height: 40), since: 0.12, seed: 1000, isLastWord: true)
+        try assertEqual(streaksNormal.count, 9)
+        try assertEqual(streaksLast.count, 16)
+
+        // 3) 验证 Quiet 静音热评规则
+        let quietLines = LyricsEngine.build(lrc: "[00:12.00]First sung line")
+        let comments = [
+            Comment(id: "c1", author: "A", text: "前奏太好听了"),
+            Comment(id: "c2", author: "B", text: String(repeating: "超", count: 160))
+        ]
+        let quietHit = StageMath.activeQuietComment(
+            lines: quietLines,
+            trackDuration: 60,
+            lyricsLoaded: true,
+            hotCommentsEnabled: true,
+            comments: comments,
+            at: 4.0
+        )
+        try assertEqual(quietHit?.comment.id, "c1")
+
+        // 4) 验证 PlayerEngine 真实 WAV 音轨硬件 vDSP FFT 全曲频谱解码与拖动对应（0.15s 近静音 vs 0.65s 85Hz 强鼓点）
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-fft-verifier-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+
+        let kickWAV = tmpDir.appendingPathComponent("rhythm_probe.wav")
+        try writeRhythmStepWAV(to: kickWAV)
+        let localSrc = LocalMusicSource(dataDir: tmpDir)
+        localSrc.addFolders([tmpDir.path])
+        await localSrc.rescanAsync()
+        let scanned = try await localSrc.search(query: "", kind: .tracks, offset: 0)
+        guard let probeTrack = scanned.tracks?.first else {
+            throw NSError(domain: "Verifier", code: 200, userInfo: [NSLocalizedDescriptionKey: "LocalMusicSource 未扫描出 WAV 测试曲目"])
+        }
+
+        let engine = await MainActor.run { () -> PlayerEngine in
+            let e = PlayerEngine(cacheDir: tmpDir.appendingPathComponent("cache"))
+            e.sourceResolver = { _ in localSrc }
+            e.playQueue([probeTrack], start: 0)
+            return e
+        }
+
+        let deadline = Date().addingTimeInterval(5.0)
+        var matched: AudioRhythmState?
+        while Date() < deadline {
+            try await Task.sleep(nanoseconds: 40_000_000)
+            let s = await MainActor.run { engine.sampleAudioRhythm(at: 0.65, isScrubbing: true) }
+            if s.isRealAudio {
+                matched = s
+                break
+            }
+        }
+        guard let activeSample = matched else {
+            let errText = await MainActor.run { engine.errorMessage ?? "unknown" }
+            await MainActor.run { engine.pause() }
+            throw NSError(domain: "Verifier", code: 201, userInfo: [NSLocalizedDescriptionKey: "FFT 全曲频谱未能在预期时间内完成解码 (err=\(errText))"])
+        }
+        let quietSample = await MainActor.run {
+            let q = engine.sampleAudioRhythm(at: 0.12, isScrubbing: true)
+            engine.pause()
+            return q
+        }
+        try assertTrue(activeSample.bass > quietSample.bass + 0.18, "强低频鼓点时段 (0.65s) 的真低频能量应显著高于静音起段 (0.12s)")
+    }
+
+    private static func writeRhythmStepWAV(to url: URL) throws {
+        let sampleRate = 44_100
+        let totalSamples = sampleRate // 1.0 秒音频：前 0.35s 极静，0.40s~0.95s 强 85Hz 正弦低音
+        let dataSize = UInt32(totalSamples * 2)
+        var data = Data()
+        func appendLE<T: FixedWidthInteger>(_ value: T) {
+            var le = value.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        data.append(contentsOf: "RIFF".utf8)
+        appendLE(UInt32(36) + dataSize)
+        data.append(contentsOf: "WAVEfmt ".utf8)
+        appendLE(UInt32(16))
+        appendLE(UInt16(1))
+        appendLE(UInt16(1))
+        appendLE(UInt32(sampleRate))
+        appendLE(UInt32(sampleRate * 2))
+        appendLE(UInt16(2))
+        appendLE(UInt16(16))
+        data.append(contentsOf: "data".utf8)
+        appendLE(dataSize)
+        for i in 0..<totalSamples {
+            let t = Double(i) / Double(sampleRate)
+            let amp: Double = t < 0.35 ? 120.0 : 24_000.0
+            let sample = Int16(sin(2.0 * .pi * 85.0 * t) * amp)
+            appendLE(sample)
+        }
+        try data.write(to: url, options: .atomic)
     }
 
     private static func writeDeflateZip(entries: [(name: String, data: Data)], to url: URL) throws {

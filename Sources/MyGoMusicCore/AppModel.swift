@@ -265,7 +265,7 @@ public final class AppModel: ObservableObject {
 
         self.player.volume = initialSettings.volume
         self.player.diskCache.limitMB = initialSettings.cacheMB
-        self.activeNowPlayingPane = .lyrics
+        self.activeNowPlayingPane = initialSettings.lyricsStage ? .stage : .lyrics
 
         // 发现并加载所有插件
         reloadPlugins()

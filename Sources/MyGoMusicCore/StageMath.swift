@@ -182,7 +182,7 @@ public enum StageMath {
     }
 
     /// 计算流光（Flow）模式下整行每个词的姿态（对应 stageShapes）
-    public static func stageShapes(for line: LyricLine, fontSize: Double) -> [WordShape] {
+    public static func stageShapes(for line: LyricLine, fontSize: Double, spreadScale: Double = 1.0) -> [WordShape] {
         let seed = floor(line.at * 1000.0)
         var shapes: [WordShape] = []
         var widths: [Double] = []
@@ -196,19 +196,25 @@ public enum StageMath {
                 x: (lineRandom(seed: ws, offset: 1) - 0.5) * 36.0,
                 y: (lineRandom(seed: ws, offset: 2) - 0.5) * 36.0,
                 rotate: (lineRandom(seed: ws, offset: 3) - 0.5) * 10.0,
-                scale: 1.1 + lineRandom(seed: ws, offset: 4) * 0.2,
+                scale: 1.06 + lineRandom(seed: ws, offset: 4) * 0.14,
                 drift: (lineRandom(seed: ws, offset: 5) - 0.5) * 10.0
             ))
         }
-        spaceWords(&shapes, widths: widths, gap: fontSize * 0.08)
+        spaceWords(&shapes, widths: widths, gap: fontSize * 0.08, spreadScale: spreadScale)
         if !shapes.isEmpty {
             shapes[shapes.count - 1].last = true
         }
         return shapes
     }
 
-    /// 按手机可用宽度预排词行，避免每帧让 SwiftUI 重测所有字形。
-    public static func flowRows(for line: LyricLine, shapes: [WordShape], fontSize: Double, availableWidth: Double) -> [[Int]] {
+    /// 按手机可用宽度预排词行，避免每帧让 SwiftUI 重测所有字形，并自动消除单字孤行。
+    public static func flowRows(
+        for line: LyricLine,
+        shapes: [WordShape],
+        fontSize: Double,
+        availableWidth: Double,
+        marginScale: Double = 1.0
+    ) -> [[Int]] {
         guard !line.words.isEmpty else { return [] }
         let limit = max(availableWidth, fontSize)
         var rows: [[Int]] = []
@@ -217,16 +223,27 @@ public enum StageMath {
 
         for index in line.words.indices {
             let shape = index < shapes.count ? shapes[index] : WordShape()
-            let itemWidth = wordWidth(line.words[index].text, fontSize: fontSize) + shape.margin
-            if !row.isEmpty && rowWidth + itemWidth > limit {
+            let baseWidth = wordWidth(line.words[index].text, fontSize: fontSize)
+            if !row.isEmpty && rowWidth + baseWidth > limit {
                 rows.append(row)
                 row = []
                 rowWidth = 0
             }
             row.append(index)
-            rowWidth += itemWidth
+            rowWidth += baseWidth + shape.margin * marginScale
         }
         if !row.isEmpty { rows.append(row) }
+
+        // 当折成 2 行且尾行出现极短孤词/单字孤行时，均衡从上一行匀 1~2 词保持视觉重心平稳
+        if rows.count == 2 && rows[0].count >= 4 && rows[1].count <= 2 {
+            let targetSecond = max(2, min(rows[0].count / 2, (rows[0].count + rows[1].count) / 2))
+            let moveCount = max(0, targetSecond - rows[1].count)
+            if moveCount > 0 && rows[0].count - moveCount >= 2 {
+                let moved = rows[0].suffix(moveCount)
+                rows[0].removeLast(moveCount)
+                rows[1].insert(contentsOf: moved, at: 0)
+            }
+        }
         return rows
     }
 
@@ -241,17 +258,19 @@ public enum StageMath {
         return Double(max(1, text.count)) * fontSize * (isCJK ? 1.0 : 0.56)
     }
 
-    /// 词间距补偿（防止放大时重叠，对应 spaceWords）
-    public static func spaceWords(_ shapes: inout [WordShape], widths: [Double], gap: Double) {
+    /// 词间距补偿（防止放大时重叠，对应 spaceWords，支持按屏幕缩放系数匹配实际散落位移）
+    public static func spaceWords(_ shapes: inout [WordShape], widths: [Double], gap: Double, spreadScale: Double = 1.0) {
+        let clampedSpread = max(0.25, spreadScale)
         for i in shapes.indices {
             let grow = widths[i] * (shapes[i].scale * 1.12 - 1.0) / 2.0
             var next = 0.0
             var toward = 0.0
             if i + 1 < shapes.count {
                 next = widths[i + 1] * (shapes[i + 1].scale * 1.12 - 1.0) / 2.0
-                toward = shapes[i].x - shapes[i + 1].x
+                toward = (shapes[i].x - shapes[i + 1].x) * clampedSpread
             }
-            shapes[i].margin = max(2.0 * gap, grow + next + toward + gap)
+            let effectiveMargin = max(1.6 * gap, grow + next + toward + gap)
+            shapes[i].margin = i == shapes.count - 1 ? 0.0 : min(gap * 4.5, effectiveMargin)
         }
     }
 

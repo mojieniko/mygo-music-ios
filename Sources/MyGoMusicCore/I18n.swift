@@ -507,6 +507,10 @@ public final class I18n: @unchecked Sendable {
         "Process permission granted": "已授予进程权限",
         "Update": "更新",
         "Lock Screen Lyrics": "锁屏歌词",
-        "Show the active lyric line in the Lock Screen media title while playing": "播放时在系统锁屏和蓝牙媒体卡片实时显示当前歌词"
+        "Show the active lyric line in the Lock Screen media title while playing": "播放时在系统锁屏和蓝牙媒体卡片实时显示当前歌词",
+        "Playback timed out while buffering. Please try again.": "缓冲超时，请检查网络或切换音质后重试",
+        "Current audio format (%@) is not supported on iOS yet": "当前音频格式（%@）暂不支持在 iOS 播放",
+        "No playable tracks in this list (VIP or copyright restricted)": "当前列表暂无可播放歌曲（需要 VIP 或无版权）",
+        "VIP / No Rights": "VIP / 暂无版权"
     ]
 }

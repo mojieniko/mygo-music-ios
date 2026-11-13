@@ -17,8 +17,10 @@
 		A10001070000000000000001 /* PluginEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002070000000000000001 /* PluginEngine.swift */; };
 		A10001080000000000000001 /* PluginInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002080000000000000001 /* PluginInstaller.swift */; };
 		A10001090000000000000001 /* StageMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002090000000000000001 /* StageMath.swift */; };
+		A10001170000000000000001 /* StageVisualizerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002170000000000000001 /* StageVisualizerEngine.swift */; };
 		A10001100000000000000001 /* HomeAndBrowseViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002100000000000000001 /* HomeAndBrowseViews.swift */; };
 		A10001110000000000000001 /* NowPlayingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002110000000000000001 /* NowPlayingView.swift */; };
+		A10001180000000000000001 /* StageVisualizerViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002180000000000000001 /* StageVisualizerViews.swift */; };
 		A10001120000000000000001 /* SearchAndLibraryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002120000000000000001 /* SearchAndLibraryViews.swift */; };
 		A10001130000000000000001 /* SettingsAndMainViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002130000000000000001 /* SettingsAndMainViews.swift */; };
 		A10001140000000000000001 /* ThemeAndComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10002140000000000000001 /* ThemeAndComponents.swift */; };
@@ -39,8 +41,10 @@
 		A10002070000000000000001 /* PluginEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginEngine.swift; sourceTree = "<group>"; };
 		A10002080000000000000001 /* PluginInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginInstaller.swift; sourceTree = "<group>"; };
 		A10002090000000000000001 /* StageMath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageMath.swift; sourceTree = "<group>"; };
+		A10002170000000000000001 /* StageVisualizerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualizerEngine.swift; sourceTree = "<group>"; };
 		A10002100000000000000001 /* HomeAndBrowseViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeAndBrowseViews.swift; sourceTree = "<group>"; };
 		A10002110000000000000001 /* NowPlayingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingView.swift; sourceTree = "<group>"; };
+		A10002180000000000000001 /* StageVisualizerViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageVisualizerViews.swift; sourceTree = "<group>"; };
 		A10002120000000000000001 /* SearchAndLibraryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchAndLibraryViews.swift; sourceTree = "<group>"; };
 		A10002130000000000000001 /* SettingsAndMainViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsAndMainViews.swift; sourceTree = "<group>"; };
 		A10002140000000000000001 /* ThemeAndComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeAndComponents.swift; sourceTree = "<group>"; };
@@ -97,6 +101,7 @@
 				A10002070000000000000001 /* PluginEngine.swift */,
 				A10002080000000000000001 /* PluginInstaller.swift */,
 				A10002090000000000000001 /* StageMath.swift */,
+				A10002170000000000000001 /* StageVisualizerEngine.swift */,
 			);
 			path = MyGoMusicCore;
 			sourceTree = "<group>";
@@ -106,6 +111,7 @@
 			children = (
 				A10002100000000000000001 /* HomeAndBrowseViews.swift */,
 				A10002110000000000000001 /* NowPlayingView.swift */,
+				A10002180000000000000001 /* StageVisualizerViews.swift */,
 				A10002120000000000000001 /* SearchAndLibraryViews.swift */,
 				A10002130000000000000001 /* SettingsAndMainViews.swift */,
 				A10002140000000000000001 /* ThemeAndComponents.swift */,
@@ -196,8 +202,10 @@
 				A10001070000000000000001 /* PluginEngine.swift in Sources */,
 				A10001080000000000000001 /* PluginInstaller.swift in Sources */,
 				A10001090000000000000001 /* StageMath.swift in Sources */,
+				A10001170000000000000001 /* StageVisualizerEngine.swift in Sources */,
 				A10001100000000000000001 /* HomeAndBrowseViews.swift in Sources */,
 				A10001110000000000000001 /* NowPlayingView.swift in Sources */,
+				A10001180000000000000001 /* StageVisualizerViews.swift in Sources */,
 				A10001120000000000000001 /* SearchAndLibraryViews.swift in Sources */,
 				A10001130000000000000001 /* SettingsAndMainViews.swift in Sources */,
 				A10001140000000000000001 /* ThemeAndComponents.swift in Sources */,
@@ -231,6 +239,7 @@
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;

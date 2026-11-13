@@ -460,12 +460,29 @@ final class MyGoMusicTests: XCTestCase {
 
     @MainActor
     func testStreamProxyProtocolNegotiationAndDirectRouting() async throws {
-        // 1) 直链分流判定（网易云/直链 MP3/FLAC 不强制走代理，B 站 m4s 与带头流走代理）
-        let neteaseMP3 = StreamInfo(url: "https://m701.music.126.net/demo.mp3", type: "mp3", quality: "320")
+        // 1) 直链分流判定（网易云带 User-Agent/Referer 的 MP3/FLAC 优先直连携头播放；.m4s 与含 Cookie 走代理）
+        let neteaseMP3 = StreamInfo(
+            url: "https://m701.music.126.net/demo.mp3",
+            type: "mp3",
+            quality: "320",
+            headers: ["User-Agent": "MockUA/1.0", "Referer": "https://music.163.com/"]
+        )
         XCTAssertFalse(PlayerEngine.shouldUseStreamProxy(url: URL(string: neteaseMP3.url)!, stream: neteaseMP3))
+        XCTAssertEqual(PlayerEngine.directAssetHTTPHeaders(for: neteaseMP3)["Referer"], "https://music.163.com/")
+
+        let neteaseFLAC = StreamInfo(
+            url: "https://m801.music.126.net/lossless.flac",
+            type: "flac",
+            quality: "lossless",
+            headers: ["User-Agent": "MockUA/1.0", "Referer": "https://music.163.com/"]
+        )
+        XCTAssertFalse(PlayerEngine.shouldUseStreamProxy(url: URL(string: neteaseFLAC.url)!, stream: neteaseFLAC))
 
         let neteaseOuter = StreamInfo(url: "https://music.163.com/song/media/outer/url?id=999", headers: [:])
         XCTAssertFalse(PlayerEngine.shouldUseStreamProxy(url: URL(string: neteaseOuter.url)!, stream: neteaseOuter))
+
+        let cookieMP3 = StreamInfo(url: "https://cdn.example.com/private.mp3", type: "mp3", headers: ["Cookie": "MUSIC_U=mock"])
+        XCTAssertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: cookieMP3.url)!, stream: cookieMP3))
 
         let biliM4S = StreamInfo(url: "https://upos.bilivideo.com/123.m4s", type: "audio/mp4", headers: ["Referer": "https://www.bilibili.com/"])
         XCTAssertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: biliM4S.url)!, stream: biliM4S))
@@ -542,22 +559,55 @@ final class MyGoMusicTests: XCTestCase {
         player200.pause()
         player200.replaceCurrentItem(with: nil as AVPlayerItem?)
         proxy200.invalidate()
+
+        // 2c) 上游未报错但中途截断响应字节时，不得伪报正常 EOF 从而卡死或污染磁盘缓存
+        MockAudioStreamURLProtocol.configure(payload: wavData, supportsByteRange: false, behavior: .truncatedEOF)
+        let configTruncated = URLSessionConfiguration.ephemeral
+        configTruncated.protocolClasses = [MockAudioStreamURLProtocol.self]
+
+        let proxyTruncated = AudioStreamProxy(
+            remoteURL: URL(string: "https://mock.music.126.net/stream?token=trunc")!,
+            headers: [:],
+            streamTypeHint: "wav",
+            cacheKey: "wav-truncated-key",
+            diskCache: diskCache,
+            sessionConfiguration: configTruncated
+        )
+        let assetTruncated = AVURLAsset(url: proxyTruncated.makeProxyAssetURL())
+        assetTruncated.resourceLoader.setDelegate(proxyTruncated, queue: proxyTruncated.delegateQueue)
+        let itemTruncated = AVPlayerItem(asset: assetTruncated)
+        let playerTruncated = AVPlayer(playerItem: itemTruncated)
+        playerTruncated.isMuted = true
+        playerTruncated.play()
+
+        let truncatedStatus = try await Self.waitForItemStatus(item: itemTruncated, timeoutSeconds: 6)
+        XCTAssertEqual(truncatedStatus, .failed, "截断不完整的流应按失败处理并触发上层报错或重连，而非卡死或误认为成功")
+        XCTAssertNil(diskCache.cachedFileURL(forKey: "wav-truncated-key"))
+        playerTruncated.pause()
+        playerTruncated.replaceCurrentItem(with: nil as AVPlayerItem?)
+        proxyTruncated.invalidate()
+    }
+
+    @MainActor
+    private static func waitForItemStatus(item: AVPlayerItem, timeoutSeconds: TimeInterval) async throws -> AVPlayerItem.Status {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if item.status == .readyToPlay || item.status == .failed {
+                return item.status
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return item.status
     }
 
     @MainActor
     private static func waitForReadyToPlay(item: AVPlayerItem, timeoutSeconds: TimeInterval) async throws -> Bool {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if item.status == .readyToPlay {
-                return true
-            }
-            if item.status == .failed {
-                XCTFail("AVPlayerItem 加载失败: \(item.error?.localizedDescription ?? "unknown")")
-                return false
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        let status = try await waitForItemStatus(item: item, timeoutSeconds: timeoutSeconds)
+        if status == .failed {
+            XCTFail("AVPlayerItem 加载失败: \(item.error?.localizedDescription ?? "unknown")")
+            return false
         }
-        return item.status == .readyToPlay
+        return status == .readyToPlay
     }
 
     /// 构造标准 16-bit 单声道 PCM WAV 音频字节，供 AVPlayerItem 内存端到端解码测试使用
@@ -685,23 +735,641 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertFalse(reloadedModel.settings.lockScreenLyrics)
         XCTAssertEqual(reloadedModel.player.lockScreenLyricsProvider?(), false)
     }
+
+    // MARK: - 12. 烟雾进度特效定位与悬浮胶囊主视图基础校验
+
+    @MainActor
+    func testProgressSmokeLayoutAndMainViewConstruction() {
+        XCTAssertEqual(ProgressSmokeView.anchorOffsetFromBottom(scale: 1.0), 10.0)
+        XCTAssertEqual(ProgressSmokeView.anchorOffsetFromBottom(scale: 0.5), 5.0)
+
+        let smoke = ProgressSmokeView(
+            progress: 0.45,
+            level: 0.6,
+            horizontalInset: 6,
+            scale: 1.0,
+            useAdditiveBlend: true
+        )
+        XCTAssertEqual(smoke.horizontalInset, 6)
+        XCTAssertEqual(smoke.scale, 1.0)
+        XCTAssertTrue(smoke.useAdditiveBlend)
+
+        // 验证桌面“小烟囱/火车排气”几何演化：初生贴口纤细非零 -> 随年龄向左上方斜飞散大
+        let nozzleWisp = ProgressSmokeView.wispGeometry(
+            spawnX: 200,
+            anchorY: 118,
+            birth: 100,
+            age: 0.06,
+            strength: 0.8,
+            scale: 1.0,
+            respectQuietGate: false
+        )
+        let driftedWisp = ProgressSmokeView.wispGeometry(
+            spawnX: 200,
+            anchorY: 118,
+            birth: 100,
+            age: 0.90,
+            strength: 0.8,
+            scale: 1.0,
+            respectQuietGate: false
+        )
+        XCTAssertNotNil(nozzleWisp)
+        XCTAssertNotNil(driftedWisp)
+        if let n = nozzleWisp, let d = driftedWisp {
+            XCTAssertLessThan(n.radiusX, 4.0, "刚离开白点喷口时应紧细清晰，不成大糊球")
+            XCTAssertGreaterThan(n.alpha, 0.15, "紧贴喷口不可悬空透明断根")
+            XCTAssertLessThan(d.center.x, 192.0, "蒸汽随时间向左侧斜向飘散")
+            XCTAssertLessThan(d.center.y, 108.0, "蒸汽随时间向正上方升腾")
+            XCTAssertGreaterThan(d.radiusX, n.radiusX * 2.2, "飘远后逐步扩散融为柔雾")
+            XCTAssertLessThan(d.alpha, n.alpha, "尾部透明度随之自然消隐")
+        }
+
+        _ = MyGoTheme.brightenAccentColor(.gray)
+        _ = MyGoTheme.mix(MyGoTheme.accent, with: .white, ratio: 0.35)
+
+        // 验证遵循 Apple HIG 规范的悬浮液态玻璃底部导航栏尺寸（饱满圆润胶囊与同心内衬）
+        XCTAssertGreaterThanOrEqual(FloatingTabBarMetrics.barHeight, 64.0)
+        XCTAssertEqual(
+            FloatingTabBarMetrics.activePillHeight,
+            FloatingTabBarMetrics.barHeight - FloatingTabBarMetrics.outerInset * 2,
+            accuracy: 0.01
+        )
+        XCTAssertGreaterThanOrEqual(FloatingTabBarMetrics.iconSize, 21.0)
+        XCTAssertGreaterThan(FloatingTabBarMetrics.bottomInsetEmptyPlayer, FloatingTabBarMetrics.barHeight)
+        XCTAssertGreaterThan(FloatingTabBarMetrics.bottomInsetWithMiniPlayer, FloatingTabBarMetrics.bottomInsetEmptyPlayer)
+
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-ui-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let model = AppModel(baseDataDir: tmpRoot)
+        _ = MainView().environmentObject(model)
+        _ = MiniPlayerBarView().environmentObject(model)
+    }
+
+    // MARK: - 13. 缓冲超时看门狗、OGG 格式拦截与灰色无权限歌曲队列跳过回归测试
+
+    @MainActor
+    func testPlayerEngineWatchdogTimeoutAndUnavailableQueueSkipping() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-watchdog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let wavData = Self.makeTestPCM16WAVData(durationSeconds: 0.35)
+        let mockConfig = URLSessionConfiguration.ephemeral
+        mockConfig.protocolClasses = [MockAudioStreamURLProtocol.self]
+
+        let source = MockPlaybackSource()
+        let engine = PlayerEngine(cacheDir: tmpDir)
+        engine.directBufferTimeoutSeconds = 0.25
+        engine.proxyBufferTimeoutSeconds = 0.35
+        engine.proxySessionConfiguration = mockConfig
+        engine.sourceResolver = { id in id == source.info().id ? source : nil }
+
+        // 1) 卡死挂起流触发看门狗超时：应退出无限「正在缓冲…」转圈并展示超时提示
+        MockAudioStreamURLProtocol.configure(payload: wavData, supportsByteRange: true, behavior: .stallForever)
+        source.streamHandler = { _, _ in
+            StreamInfo(
+                url: "https://mock.music.126.net/stalled",
+                type: nil,
+                headers: ["Cookie": "MOCK=1"] // 直接进入 AudioStreamProxy 挂起验证看门狗
+            )
+        }
+        let stallTrack = Track(id: "stall-1", source: source.info().id, name: "Stall Track")
+        engine.playTrack([stallTrack], at: 0)
+
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline && (engine.isLoading || engine.errorMessage == nil) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertFalse(engine.isLoading, "长时间卡在缓冲的歌曲必须在看门狗超时后退出转圈状态")
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(engine.errorMessage, I18n.t("Playback timed out while buffering. Please try again."))
+
+        // 2) OGG 格式应提前报错拦截，不得无休止卡在解码阶段
+        source.streamHandler = { _, _ in
+            StreamInfo(url: "https://mock.music.126.net/song.ogg", type: "ogg", headers: ["Referer": "https://music.163.com/"])
+        }
+        let oggTrack = Track(id: "ogg-1", source: source.info().id, name: "OGG Track")
+        engine.playTrack([oggTrack], at: 0)
+        let oggDeadline = Date().addingTimeInterval(2.0)
+        while Date() < oggDeadline && (engine.isLoading || engine.errorMessage == nil) {
+            try await Task.sleep(nanoseconds: 30_000_000)
+        }
+        XCTAssertFalse(engine.isLoading)
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertTrue(engine.errorMessage?.contains("OGG") == true)
+
+        // 3) 灰色无权限（unavailable）歌曲：整单播/上一首/下一首自动跳过；单点灰歌保留明确无权限提示
+        source.streamHandler = { id, _ in
+            if id == "grey-0" || id == "grey-2" {
+                throw SourceError.unavailable("当前账号无完整播放权限，或歌曲在当前地区不可用")
+            }
+            return StreamInfo(
+                url: "https://mock.music.126.net/\(id).wav",
+                type: "wav",
+                headers: ["Cookie": "MOCK=1"]
+            )
+        }
+        MockAudioStreamURLProtocol.configure(payload: wavData, supportsByteRange: true, behavior: .normal)
+        let grey0 = Track(id: "grey-0", source: source.info().id, name: "Grey VIP 0", unavailable: true)
+        let ok1 = Track(id: "ok-1", source: source.info().id, name: "Playable 1", unavailable: false)
+        let grey2 = Track(id: "grey-2", source: source.info().id, name: "Grey VIP 2", unavailable: true)
+        let ok3 = Track(id: "ok-3", source: source.info().id, name: "Playable 3", unavailable: false)
+
+        engine.playQueue([grey0, ok1, grey2, ok3], start: 0)
+        XCTAssertEqual(engine.currentTrack?.id, "ok-1")
+        engine.next()
+        XCTAssertEqual(engine.currentTrack?.id, "ok-3")
+        engine.previous()
+        XCTAssertEqual(engine.currentTrack?.id, "ok-1")
+
+        // 全灰列表直接提示无可用曲目，不再空转加载
+        engine.playQueue([grey0, grey2], start: 0)
+        XCTAssertFalse(engine.isLoading)
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(engine.errorMessage, I18n.t("No playable tracks in this list (VIP or copyright restricted)"))
+
+        // 用户主动点某首灰歌时仍给出明确插件原因
+        engine.playTrack([grey0, ok1], at: 0)
+        let unavailDeadline = Date().addingTimeInterval(2.0)
+        while Date() < unavailDeadline && (engine.isLoading || engine.errorMessage == nil) {
+            try await Task.sleep(nanoseconds: 30_000_000)
+        }
+        XCTAssertFalse(engine.isLoading)
+        XCTAssertTrue(engine.errorMessage?.contains("完整播放权限") == true)
+        engine.pause()
+
+        // 4) 带 Referer 的标准 wav 优先走原生直连；当直连不可达进入 .failed 或超时卡顿时自动静默回退 AudioStreamProxy 重试并成功就绪
+        engine.directBufferTimeoutSeconds = 0.25
+        engine.proxyBufferTimeoutSeconds = 4.0
+        source.streamHandler = { id, _ in
+            StreamInfo(
+                url: "https://mock.music.126.net/\(id).wav",
+                type: "wav",
+                headers: ["User-Agent": "MockUA/1.0", "Referer": "https://music.163.com/"]
+            )
+        }
+        MockAudioStreamURLProtocol.configure(payload: wavData, supportsByteRange: true, behavior: .normal)
+        let fallbackTrack = Track(id: "fallback-1", source: source.info().id, name: "Fallback Track", unavailable: false)
+        engine.playTrack([fallbackTrack], at: 0)
+        let fbDeadline = Date().addingTimeInterval(5.0)
+        while Date() < fbDeadline && (MockAudioStreamURLProtocol.recordedRequestCount() == 0 || engine.isLoading) {
+            if engine.errorMessage != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertGreaterThan(MockAudioStreamURLProtocol.recordedRequestCount(), 0, "直连失败后应自动回退 AudioStreamProxy 并带上 Referer 发起重试")
+        XCTAssertEqual(MockAudioStreamURLProtocol.lastSeenReferer(), "https://music.163.com/")
+        XCTAssertFalse(engine.isLoading)
+        XCTAssertNil(engine.errorMessage)
+        engine.pause()
+    }
+
+    @MainActor
+    func testStageVisualizerUpgradedPhysicsFFTAndRhythmSync() async throws {
+        // 1) 拖动进度预览与播放时钟接管
+        XCTAssertEqual(
+            StageMath.stagePosition(playbackPosition: 12.0, scrubbingPosition: 42.5),
+            42.5,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            StageMath.stagePosition(playbackPosition: 12.0, scrubbingPosition: nil),
+            12.025,
+            accuracy: 0.0001
+        )
+
+        // 2) 旧行 0.40s easeOutCubic 叠化退场斜率 ((1 - 0.5)^3 = 0.125)
+        XCTAssertEqual(StageMath.lineExitOpacity(nextLineStart: 10.0, at: 10.0), 1.0, accuracy: 0.0001)
+        XCTAssertEqual(StageMath.lineExitOpacity(nextLineStart: 10.0, at: 10.2), 0.125, accuracy: 0.0001)
+        XCTAssertEqual(StageMath.lineExitOpacity(nextLineStart: 10.0, at: 10.4), 0.0, accuracy: 0.0001)
+
+        // 3) 构造含逐字时间轴的测试歌词与长短对比
+        let shortWords = [
+            LyricWord(text: "迷", start: 10.0, end: 10.35),
+            LyricWord(text: "子", start: 10.35, end: 10.7),
+            LyricWord(text: "と", start: 10.7, end: 11.0),
+            LyricWord(text: "な", start: 11.0, end: 11.4),
+            LyricWord(text: "る", start: 11.4, end: 11.9)
+        ]
+        let stageLine = LyricLine(at: 10.0, end: 12.2, text: "迷子となる", words: shortWords)
+
+        // Flow 舞台落位（命中桌面三档高度表 [-0.11, 0.0, 0.09]）
+        let flowPlace = StageMath.flowPlacement(for: stageLine, containerWidth: 360)
+        XCTAssertTrue([-0.11, 0.0, 0.09].contains(flowPlace.verticalShiftRatio))
+
+        // 光束火花数：普通词 9 条 / 行末词 16 条 / 超出持续时长清空
+        let midSparks = StageMath.sparkStreaks(size: CGSize(width: 44, height: 48), since: 0.14, seed: 10.0, isLastWord: false)
+        let lastSparks = StageMath.sparkStreaks(size: CGSize(width: 44, height: 48), since: 0.14, seed: 11.4, isLastWord: true)
+        XCTAssertEqual(midSparks.count, 9)
+        XCTAssertEqual(lastSparks.count, 16)
+        XCTAssertTrue(StageMath.sparkStreaks(size: CGSize(width: 44, height: 48), since: 1.5, seed: 10.0, isLastWord: false).isEmpty)
+
+        // Steps 导标状态三阶段流转
+        let pRow = PartitaRow(from: 0, to: shortWords.count, x: -24, y: 12, scale: 1.0, left: true)
+        let upcomingRow = StageMath.partitaRowMotion(words: shortWords[...], row: pRow, pos: 8.5)
+        let singingRow = StageMath.partitaRowMotion(words: shortWords[...], row: pRow, pos: 10.5)
+        let pastRow = StageMath.partitaRowMotion(words: shortWords[...], row: pRow, pos: 12.5)
+        XCTAssertEqual(upcomingRow.guideState, .upcoming)
+        XCTAssertEqual(singingRow.guideState, .singing)
+        XCTAssertEqual(pastRow.guideState, .past)
+        XCTAssertGreaterThan(singingRow.guideProgress, 0.5)
+
+        // Tilt 超宽文本自适应防折行字号压缩 + 斜体上下交错波浪
+        var wideWords: [LyricWord] = []
+        for idx in 0..<24 {
+            let st = 20.0 + Double(idx) * 0.18
+            wideWords.append(LyricWord(text: "響", start: st, end: st + 0.18))
+        }
+        let wideLine = LyricLine(at: 20.0, end: 25.0, text: String(repeating: "響", count: 24), words: wideWords)
+        let fitted = StageMath.fitTiltLayout(for: wideLine, maxWidth: 210, baseFontSize: 38)
+        XCTAssertLessThan(fitted.fontSize, 38.0)
+        XCTAssertGreaterThanOrEqual(fitted.fittedLineRatio, 0.48)
+
+        let leanPart = TiltPart(from: 0, to: 4, lean: true, tail: false)
+        let evenChar = StageMath.tiltCharMotion(partSince: 0.25, charDuration: 0.35, charStart: 10.0, charOrderIndex: 0, part: leanPart, size: 32, pos: 10.12)
+        let oddChar = StageMath.tiltCharMotion(partSince: 0.25, charDuration: 0.35, charStart: 10.35, charOrderIndex: 1, part: leanPart, size: 32, pos: 10.12)
+        XCTAssertLessThan(evenChar.waveOffsetY * oddChar.waveOffsetY, 0, "斜体倾诉句相邻字符应当上下交替波浪错位")
+
+        // 4) Quiet 静音热评调度 (>=8s 且过滤 >140字超长评论)
+        let quietLines = [
+            LyricLine(at: 1.0, end: 4.0, text: "第一句", words: [LyricWord(text: "第一句", start: 1.0, end: 4.0)]),
+            LyricLine(at: 26.0, end: 30.0, text: "副歌开始", words: [LyricWord(text: "副歌", start: 26.0, end: 28.0)])
+        ]
+        let validComment = Comment(id: "c1", author: "燈", text: "一辈子一起组乐队吧", likes: 520)
+        let tooLongComment = Comment(id: "c2", author: "长文", text: String(repeating: "啊", count: 150), likes: 10)
+        XCTAssertNil(
+            StageMath.activeQuietComment(
+                lines: quietLines,
+                trackDuration: 60.0,
+                lyricsLoaded: true,
+                hotCommentsEnabled: true,
+                comments: [validComment, tooLongComment],
+                at: 4.5
+            ),
+            "静音前 1.2s 内不应过早弹出热评"
+        )
+        let midQuiet = StageMath.activeQuietComment(
+            lines: quietLines,
+            trackDuration: 60.0,
+            lyricsLoaded: true,
+            hotCommentsEnabled: true,
+            comments: [tooLongComment, validComment],
+            at: 12.0
+        )
+        XCTAssertEqual(midQuiet?.comment.id, "c1", "应过滤超长评论并精准命中有效热评")
+        let dots = StageMath.interludeDotsState(pos: 25.4, from: 4.0, to: 26.0)
+        XCTAssertGreaterThan(dots.preCuePulse, 0.3, "间奏将尽前 1.2s 应激活起唱预提醒")
+
+        // 5) 音律平滑滤波 + 歌词节拍启发式包络
+        let high = AudioRhythmState(bands: [0.95, 0.70, 0.85, 0.40, 0.25], bass: 0.92, vocal: 0.88, treble: 0.35, energy: 0.85, beatPulse: 0.95, isRealAudio: true)
+        let low = AudioRhythmState.idle
+        let attacked = high.smoothed(from: low, dt: 1.0 / 60.0)
+        let decayed = low.smoothed(from: high, dt: 1.0 / 60.0)
+        XCTAssertGreaterThan(attacked.bass - low.bass, high.bass - decayed.bass, "Attack 响应速率应快于 Decay 回落")
+
+        let fallbackRhythm = StageMath.lyricRhythm(at: 10.35, lines: [stageLine], isPlaying: true)
+        XCTAssertFalse(fallbackRhythm.isRealAudio)
+        XCTAssertGreaterThan(fallbackRhythm.beatPulse, 0.2)
+
+        // 6) 本地重低音 85Hz WAV 真音频 vDSP FFT 扫谱与 PlayerEngine.sampleAudioRhythm 闭环校验
+        let wavURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stage-bass-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: wavURL) }
+
+        let sampleRate = 44_100
+        let totalSamples = sampleRate * 2 // 2秒 85Hz 纯重低音脉冲 WAV
+        var pcm = [Int16](repeating: 0, count: totalSamples)
+        for i in 0..<totalSamples {
+            let t = Double(i) / Double(sampleRate)
+            // 每 0.5 秒一个强低频鼓点包络 + 持续 85Hz 贝斯
+            let beatPhase = t.truncatingRemainder(dividingBy: 0.5)
+            let env = beatPhase < 0.14 ? 0.92 : 0.35
+            let v = sin(2.0 * .pi * 85.0 * t) * env
+            pcm[i] = Int16(max(-32767, min(32767, Int(v * 30000.0))))
+        }
+        var wavBytes = Data()
+        func appendLE16(_ v: UInt16) { var le = v.littleEndian; withUnsafeBytes(of: &le) { wavBytes.append(contentsOf: $0) } }
+        func appendLE32(_ v: UInt32) { var le = v.littleEndian; withUnsafeBytes(of: &le) { wavBytes.append(contentsOf: $0) } }
+        let dataChunkSize = UInt32(totalSamples * 2)
+        wavBytes.append(contentsOf: "RIFF".utf8); appendLE32(36 + dataChunkSize)
+        wavBytes.append(contentsOf: "WAVE".utf8)
+        wavBytes.append(contentsOf: "fmt ".utf8); appendLE32(16)
+        appendLE16(1); appendLE16(1) // PCM, Mono
+        appendLE32(UInt32(sampleRate)); appendLE32(UInt32(sampleRate * 2))
+        appendLE16(2); appendLE16(16)
+        wavBytes.append(contentsOf: "data".utf8); appendLE32(dataChunkSize)
+        pcm.withUnsafeBytes { wavBytes.append(contentsOf: $0) }
+        try wavBytes.write(to: wavURL, options: .atomic)
+
+        let engine = PlayerEngine(cacheDir: FileManager.default.temporaryDirectory.appendingPathComponent("fft-test-cache-\(UUID().uuidString)", isDirectory: true))
+        let mockSource = MockPlaybackSource()
+        mockSource.streamHandler = { _, _ in
+            StreamInfo(url: wavURL.absoluteString, type: "wav")
+        }
+        engine.sourceResolver = { _ in mockSource }
+        let localTrack = Track(
+            id: "fft-bass-test",
+            source: mockSource.info().id,
+            name: "Bass Pulse WAV",
+            duration: 2
+        )
+        engine.playQueue([localTrack], start: 0)
+        var sampled = AudioRhythmState.idle
+        let fftDeadline = Date().addingTimeInterval(5.0)
+        while Date() < fftDeadline {
+            sampled = engine.sampleAudioRhythm(at: 0.06, lines: [stageLine], isScrubbing: true)
+            if sampled.isRealAudio && sampled.bass > 0.25 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        engine.pause()
+
+        XCTAssertTrue(sampled.isRealAudio, "本地 WAV 应当由 vDSP 硬件 FFT 解码出真实音频节拍")
+        XCTAssertGreaterThan(sampled.bass, sampled.treble, "85Hz 重低音测试波的低频能量必须显著高于高频空气感能量")
+        XCTAssertGreaterThan(Double(sampled.bands[0]), Double(sampled.bands[4]))
+    }
+
+    @MainActor
+    func testStageVisualizerMotionSafetyAndPanePersistence() throws {
+        // 1) 验证开启过律动视图（lyricsStage == true）的设置持久化后，启动默认面板自动恢复为 .stage
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stage-pane-persist-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let stageDir = tempRoot.appendingPathComponent("stage-enabled", isDirectory: true)
+        let lyricsDir = tempRoot.appendingPathComponent("lyrics-default", isDirectory: true)
+        try FileManager.default.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: lyricsDir, withIntermediateDirectories: true)
+
+        var stageSettings = AppSettings()
+        stageSettings.lyricsStage = true
+        stageSettings.stageStyle = .partita
+        try JSONEncoder().encode(stageSettings).write(to: stageDir.appendingPathComponent("settings.json"))
+
+        let stageApp = AppModel(baseDataDir: stageDir)
+        XCTAssertEqual(stageApp.activeNowPlayingPane, .stage, "保存了 lyricsStage=true 后启动时应恢复为律动面板")
+
+        var lyricsSettings = AppSettings()
+        lyricsSettings.lyricsStage = false
+        try JSONEncoder().encode(lyricsSettings).write(to: lyricsDir.appendingPathComponent("settings.json"))
+
+        let lyricsApp = AppModel(baseDataDir: lyricsDir)
+        XCTAssertEqual(lyricsApp.activeNowPlayingPane, .lyrics, "未开启律动时默认应处于滚动歌词面板")
+
+        // 2) 验证窄屏 Flow 断行与渲染间距一致，不再提前把「春日影」拆成两行
+        let lrc = """
+        [00:01.00]MyGO!!!!! - 春日影
+        [00:04.00]迷星叫响在暮色街头
+        [00:07.00]穿过清晨微风
+        """
+        let lines = LyricsEngine.build(lrc: lrc, translation: "")
+        XCTAssertEqual(lines.count, 3)
+
+        let stageContentWidth = 345.0 // 393pt iPhone 16 Pro 减去左右各 24pt 安全边距
+        let titleFontSize = min(40.0, 393.0 * 0.078) * 0.88 // 与 StageFlowLineView 13~22字自适应字号一致 (~27pt)
+        let shapes = StageMath.stageShapes(for: lines[0], fontSize: titleFontSize, spreadScale: 0.42)
+        let rows = StageMath.flowRows(
+            for: lines[0],
+            shapes: shapes,
+            fontSize: titleFontSize,
+            availableWidth: stageContentWidth,
+            marginScale: 0.92
+        )
+        XCTAssertEqual(rows.count, 1, "iPhone 16 Pro 可用宽度下『MyGO!!!!! - 春日影』应完整保持在同一行不误劈")
+
+        let nineCharFontSize = min(40.0, 393.0 * 0.078) * 0.94
+        let shapes2 = StageMath.stageShapes(for: lines[1], fontSize: nineCharFontSize, spreadScale: 0.42)
+        let rows2 = StageMath.flowRows(
+            for: lines[1],
+            shapes: shapes2,
+            fontSize: nineCharFontSize,
+            availableWidth: stageContentWidth,
+            marginScale: 0.92
+        )
+        XCTAssertEqual(rows2.count, 1, "9字常规歌词在手机端居中宽度下应整行舒展展示")
+
+        // 3) 验证连续时间采样时行索引、词动态以及旧行叠化退场持续推进
+        XCTAssertEqual(LyricsEngine.index(in: lines, at: 0.5), -1)
+        XCTAssertEqual(LyricsEngine.index(in: lines, at: 3.2), 0)
+        XCTAssertEqual(LyricsEngine.index(in: lines, at: 6.2), 1)
+
+        let targetWord = lines[0].words[1]
+        let targetShape = shapes[1]
+        let stateBefore = StageMath.stageWordState(word: targetWord, shape: targetShape, pos: 0.5)
+        let stateActive = StageMath.stageWordState(word: targetWord, shape: targetShape, pos: targetWord.start + 0.12)
+        XCTAssertGreaterThan(stateActive.opacity, stateBefore.opacity, "进入演唱时刻时单词不透明度必须提升")
+        XCTAssertGreaterThan(stateActive.scale, stateBefore.scale, "进入演唱时刻时单词缩放应弹跳放大")
+        XCTAssertGreaterThan(stateActive.brightness, stateBefore.brightness, "进入演唱时刻时单词亮度应点亮")
+
+        let exitOpacityMid = StageMath.lineExitOpacity(nextLineStart: lines[1].at, at: lines[1].at + 0.15)
+        XCTAssertGreaterThan(exitOpacityMid, 0.0)
+        XCTAssertLessThan(exitOpacityMid, 1.0, "切换至下一句时旧行应在 0.4s 退场窗口内平滑叠化消隐")
+
+        // 4) 验证 Flow 在 3s 整倍时间戳下不再全数共振锁死在同一落位（左上角）
+        let periodicLines = (0..<12).map { idx in
+            LyricLine(
+                at: TimeInterval(idx * 3),
+                end: TimeInterval(idx * 3 + 2),
+                text: "第\(idx)句示例歌词",
+                words: [LyricWord(text: "第\(idx)句示例歌词", start: TimeInterval(idx * 3), end: TimeInterval(idx * 3 + 2))]
+            )
+        }
+        let placements = periodicLines.map { StageMath.flowPlacement(for: $0, containerWidth: 345) }
+        XCTAssertGreaterThan(Set(placements.map(\.alignment)).count, 1, "Flow 横向错落不应在 3s 周期时间戳上全部锁死于左上角")
+        XCTAssertGreaterThan(Set(placements.map(\.verticalShiftRatio)).count, 1, "Flow 纵向浮沉不应全部锁死在顶部")
+    }
+
+    // MARK: - 16. 系统硬件音量双向同步与防回弹拖动锁测试
+
+    @MainActor
+    func testSystemVolumeObserverBidirectionalSyncAndDragLock() async throws {
+        var fakeSystemVolume = 0.35
+        var writtenValues: [Double] = []
+
+        let observer = SystemVolumeObserver(
+            readSystemVolume: { fakeSystemVolume },
+            writeSystemVolume: { newVal in
+                writtenValues.append(newVal)
+                fakeSystemVolume = newVal
+            },
+            autoStart: false
+        )
+
+        // 1) 初始化应与系统音量对齐
+        XCTAssertEqual(observer.volume, 0.35, accuracy: 0.001)
+
+        // 2) 模拟按下实体音量键：外部系统音量升至 0.62，UI 同步跟随
+        fakeSystemVolume = 0.62
+        observer.receiveExternalVolumeUpdate(0.62)
+        XCTAssertEqual(observer.volume, 0.62, accuracy: 0.001)
+
+        // 3) 模拟用户拖动滑块：期间阻止 KVO 旧值回弹，松手后对齐实际步进后的硬件值
+        observer.beginDragging()
+        XCTAssertTrue(observer.isDragging)
+        observer.setUserVolume(0.85)
+        XCTAssertEqual(observer.volume, 0.85, accuracy: 0.001)
+        XCTAssertEqual(writtenValues.last ?? -1, 0.85, accuracy: 0.001)
+
+        observer.receiveExternalVolumeUpdate(0.62)
+        XCTAssertEqual(observer.volume, 0.85, accuracy: 0.001, "拖动过程中应屏蔽系统旧值反向覆盖")
+
+        // 模拟硬件步进（如 iPhone 16 级步长）实际落在 0.8125
+        fakeSystemVolume = 0.8125
+        observer.endDragging(unlockDelayNanoseconds: 20_000_000)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertFalse(observer.isDragging)
+        XCTAssertEqual(observer.volume, 0.8125, accuracy: 0.001, "松手解锁后应回读硬件步进后的实际输出音量")
+
+        // 4) 跳过防抖冷却窗口后，系统外部按键下调再次正常联动
+        try await Task.sleep(nanoseconds: 290_000_000)
+        fakeSystemVolume = 0.25
+        observer.receiveExternalVolumeUpdate(0.25)
+        XCTAssertEqual(observer.volume, 0.25, accuracy: 0.001)
+
+        // 5) 验证静音与恢复静音前非零音量同步写入系统音量
+        observer.toggleMute()
+        XCTAssertEqual(observer.volume, 0.0, accuracy: 0.001)
+        XCTAssertEqual(fakeSystemVolume, 0.0, accuracy: 0.001)
+        observer.toggleMute()
+        XCTAssertEqual(observer.volume, 0.25, accuracy: 0.001)
+        XCTAssertEqual(fakeSystemVolume, 0.25, accuracy: 0.001)
+    }
+
+    // MARK: - 17. iOS 沙盒重装容器 UUID 变动时本地音轨与曲库路径自动迁移测试
+
+    func testLocalSourceRelocatesStaleSandboxContainerPaths() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mygo-migrate-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let oldLocalDir = root
+            .appendingPathComponent("Containers/Data/Application/OLD-UUID-1111/Library/Application Support/MyGoMusic/local", isDirectory: true)
+        let newLocalDir = root
+            .appendingPathComponent("Containers/Data/Application/NEW-UUID-2222/Library/Application Support/MyGoMusic/local", isDirectory: true)
+        let newMusicDir = newLocalDir.appendingPathComponent("MusicFiles", isDirectory: true)
+        try fm.createDirectory(at: newMusicDir, withIntermediateDirectories: true)
+
+        let wavData = Self.makeTestPCM16WAVData(durationSeconds: 0.25)
+        let wavURL = newMusicDir.appendingPathComponent("MyGO - Haruhikage.wav")
+        let lrcURL = newMusicDir.appendingPathComponent("MyGO - Haruhikage.lrc")
+        try wavData.write(to: wavURL)
+        try "[00:01.00]migrated lyrics line\n".data(using: .utf8)?.write(to: lrcURL)
+
+        let staleTrackID = oldLocalDir
+            .appendingPathComponent("MusicFiles/MyGO - Haruhikage.wav")
+            .path
+        let staleFolder = oldLocalDir.appendingPathComponent("MusicFiles").path
+        let rawLibJSON: [String: Any] = [
+            "folders": [staleFolder, newMusicDir.path],
+            "likes": [staleTrackID],
+            "recent": [staleTrackID],
+            "playlists": [
+                ["id": "p1", "name": "TestList", "tracks": [staleTrackID]]
+            ]
+        ]
+        let libData = try JSONSerialization.data(withJSONObject: rawLibJSON)
+        try libData.write(to: newLocalDir.appendingPathComponent("library.json"))
+
+        let source = LocalMusicSource(dataDir: newLocalDir)
+        let stream = try await source.stream(id: staleTrackID, quality: "lossless")
+        XCTAssertEqual(URL(string: stream.url)?.path, wavURL.path, "旧沙盒容器音轨 ID 应自动重定向到当前新容器文件")
+
+        let lyrics = try await source.lyrics(id: staleTrackID)
+        XCTAssertTrue(lyrics.lrc?.contains("migrated lyrics line") == true, "旧沙盒音轨应正确加载新容器同名 LRC")
+
+        let likedMap = try await source.isLiked(ids: [staleTrackID, wavURL.path])
+        XCTAssertEqual(likedMap[staleTrackID], true)
+        XCTAssertEqual(likedMap[wavURL.path], true)
+        XCTAssertEqual(source.folders(), [newMusicDir.path], "应清理失效的历史沙盒容器 MusicFiles 冗余路径")
+    }
 }
 
-/// 内存拦截 URLProtocol，用于在沙盒无真实端口条件下验证 AudioStreamProxy 的 Range / 200 OK 协议协商
+/// 测试用最小内存音源，用于精确返回流信息或无权限错误
+private final class MockPlaybackSource: MusicSource, @unchecked Sendable {
+    var streamHandler: (String, String) async throws -> StreamInfo = { id, _ in
+        StreamInfo(url: "https://mock.music.126.net/\(id).wav", type: "wav")
+    }
+
+    func info() -> SourceInfo {
+        SourceInfo(id: "mock-source", name: "Mock", version: "1.0.0", playback: .stream)
+    }
+    func can(_ capability: String) -> Bool { capability == "stream" }
+    func setting(_ key: String) -> String { "" }
+    func setSetting(_ key: String, value: String) throws {}
+    func signIn() async throws -> Account? { nil }
+    func signOut() async throws {}
+    func account() async throws -> Account? { nil }
+    func search(query: String, kind: SearchKind, offset: Int) async throws -> SearchResult { SearchResult() }
+    func suggest(query: String) async throws -> [String] { [] }
+    func playlists() async throws -> [Playlist] { [] }
+    func playlist(id: String) async throws -> Playlist { Playlist(id: id, name: "") }
+    func album(id: String) async throws -> AlbumPage { AlbumPage(album: Album(id: id, name: "")) }
+    func artist(id: String) async throws -> ArtistPage { ArtistPage(artist: Artist(id: id, name: "")) }
+    func liked(offset: Int) async throws -> TrackPage { TrackPage(tracks: []) }
+    func recent() async throws -> [Track] { [] }
+    func home() async throws -> Browse { Browse(sections: []) }
+    func browse(page: String) async throws -> Browse { Browse(sections: []) }
+    func isLiked(ids: [String]) async throws -> [String: Bool] { [:] }
+    func like(id: String, on: Bool) async throws {}
+    func likeEpisode(id: String, on: Bool) async throws {}
+    func createPlaylist(name: String) async throws -> Playlist { Playlist(id: "1", name: name) }
+    func renamePlaylist(id: String, name: String) async throws {}
+    func deletePlaylist(id: String) async throws {}
+    func addToPlaylist(id: String, trackIds: [String]) async throws {}
+    func removeFromPlaylist(id: String, trackIds: [String]) async throws {}
+    func movePlaylistTrack(id: String, from: Int, to: Int) async throws {}
+    func savePlaylist(id: String, on: Bool) async throws {}
+    func followArtist(id: String, on: Bool) async throws {}
+    func saveAlbum(id: String, on: Bool) async throws {}
+    func savedAlbums(offset: Int) async throws -> AlbumList { AlbumList(albums: []) }
+    func shows() async throws -> [Show] { [] }
+    func show(id: String, offset: Int) async throws -> ShowPage { ShowPage(show: Show(id: id, name: "")) }
+    func subscribeShow(id: String, on: Bool) async throws {}
+    func stations() async throws -> [Station] { [] }
+    func stationNext(id: String) async throws -> [Track] { [] }
+    func comments(trackId: String, offset: Int) async throws -> CommentPage { CommentPage(comments: []) }
+    func likeComment(trackId: String, commentId: String, on: Bool) async throws {}
+    func postComment(trackId: String, text: String) async throws -> Comment {
+        Comment(id: "1", author: "u", text: text)
+    }
+    func lyrics(id: String) async throws -> RawLyrics { RawLyrics() }
+    func stream(id: String, quality: String) async throws -> StreamInfo {
+        try await streamHandler(id, quality)
+    }
+    func played(track: Track) async {}
+    func remotePlay(ids: [String], start: Int, position: Int64) async throws {}
+    func remotePause() async throws {}
+    func remoteResume() async throws {}
+    func remoteSeek(position: Int64) async throws {}
+    func remoteVolume(percent: Int) async throws {}
+    func remoteState() async throws -> RemoteState? { nil }
+    func remoteDevices() async throws -> [RemoteDevice] { [] }
+    func remoteUse(deviceId: String) async throws {}
+}
+
+/// 内存拦截 URLProtocol，用于在沙盒无真实端口条件下验证 AudioStreamProxy 的 Range / 200 OK / 超时 / 截断协议处理
 private final class MockAudioStreamURLProtocol: URLProtocol, @unchecked Sendable {
+    enum Behavior {
+        case normal
+        case stallForever
+        case truncatedEOF
+    }
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var payloadData = Data()
     nonisolated(unsafe) private static var byteRangeEnabled = true
     nonisolated(unsafe) private static var requestCount = 0
     nonisolated(unsafe) private static var lastReferer: String?
+    nonisolated(unsafe) private static var mockBehavior: Behavior = .normal
 
-    static func configure(payload: Data, supportsByteRange: Bool) {
+    static func configure(payload: Data, supportsByteRange: Bool, behavior: Behavior = .normal) {
         lock.lock()
         defer { lock.unlock() }
         payloadData = payload
         byteRangeEnabled = supportsByteRange
         requestCount = 0
         lastReferer = nil
+        mockBehavior = behavior
     }
 
     static func recordedRequestCount() -> Int {
@@ -725,12 +1393,17 @@ private final class MockAudioStreamURLProtocol: URLProtocol, @unchecked Sendable
     }
 
     override func startLoading() {
-        let snapshot: (data: Data, allowRange: Bool) = Self.lock.withLock {
+        let snapshot: (data: Data, allowRange: Bool, behavior: Behavior) = Self.lock.withLock {
             Self.requestCount += 1
             if let ref = request.value(forHTTPHeaderField: "Referer") {
                 Self.lastReferer = ref
             }
-            return (Self.payloadData, Self.byteRangeEnabled)
+            return (Self.payloadData, Self.byteRangeEnabled, Self.mockBehavior)
+        }
+
+        if snapshot.behavior == .stallForever {
+            // 故意挂起不发送任何响应，用于触发 PlayerEngine 看门狗超时检测
+            return
         }
 
         guard let url = request.url else {
@@ -776,6 +1449,14 @@ private final class MockAudioStreamURLProtocol: URLProtocol, @unchecked Sendable
             headerFields: headers
         ) {
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        }
+        if snapshot.behavior == .truncatedEOF {
+            let partial = slice.prefix(min(16, slice.count))
+            if !partial.isEmpty {
+                client?.urlProtocol(self, didLoad: partial)
+            }
+            client?.urlProtocolDidFinishLoading(self)
+            return
         }
         if !slice.isEmpty {
             client?.urlProtocol(self, didLoad: slice)

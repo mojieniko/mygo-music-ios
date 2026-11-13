@@ -149,15 +149,34 @@ public struct SettingsView: View {
                                 let duration = max(app.player.duration, app.player.currentTrack?.durationSeconds ?? 0, 1)
                                 let progress = min(max(app.player.position / duration, 0), 1)
                                 ZStack(alignment: .leading) {
-                                    Capsule().fill(.white.opacity(0.25)).frame(height: 2)
-                                    Capsule().fill(MyGoTheme.accent).frame(width: geometry.size.width * progress, height: 2)
+                                    Capsule().fill(.white.opacity(0.22)).frame(height: 2.5)
+                                    Capsule()
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [
+                                                    .white.opacity(0.32),
+                                                    MyGoTheme.mix(.white, with: MyGoTheme.accent, ratio: 0.30).opacity(0.82),
+                                                    .white.opacity(0.96)
+                                                ],
+                                                startPoint: .leading,
+                                                endPoint: .trailing
+                                            )
+                                        )
+                                        .frame(width: geometry.size.width * progress, height: 2.5)
                                     if app.settings.smoke {
+                                        let previewSmokeHeight: CGFloat = 86
                                         ProgressSmokeView(
                                             progress: CGFloat(progress),
-                                            level: CGFloat(app.player.audioBands.first ?? 0.15)
+                                            level: CGFloat(app.player.audioBands.first ?? 0.25),
+                                            horizontalInset: 0,
+                                            scale: 0.72,
+                                            useAdditiveBlend: true,
+                                            tintColor: MyGoTheme.mix(MyGoTheme.accent, with: .white, ratio: 0.45),
+                                            isActive: true
                                         )
-                                        .frame(height: 24)
-                                        .offset(y: -11)
+                                        .frame(height: previewSmokeHeight)
+                                        .offset(y: -(previewSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.72)))
+                                        .allowsHitTesting(false)
                                     }
                                 }
                                 .frame(height: geometry.size.height)
@@ -779,6 +798,7 @@ private struct PluginSettingFieldRow: View {
 
 public struct MiniPlayerBarView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.colorScheme) private var colorScheme
 
     public init() {}
 
@@ -854,22 +874,47 @@ public struct MiniPlayerBarView: View {
                 // 迷你播放条底部的播放进度细线
                 GeometryReader { geo in
                     let dur = max(app.player.duration, track.durationSeconds, 1)
-                    let ratio = min(max(app.player.position / dur, 0), 1)
+                    let livePos = app.player.isPlaying ? app.player.livePlaybackPosition() : app.player.position
+                    let ratio = min(max(livePos / dur, 0), 1)
+                    let rhythm = app.player.sampleAudioRhythm(at: livePos, lines: app.player.lyrics, isScrubbing: false)
+                    let miniLevel = CGFloat(min(1.0, max(0.15, rhythm.bass * 0.7 + rhythm.beatPulse * 0.4)))
                     ZStack(alignment: .leading) {
                         Rectangle()
                             .fill(Color.primary.opacity(0.08))
                         Rectangle()
-                            .fill(MyGoTheme.accent)
+                            .fill(
+                                LinearGradient(
+                                    colors: colorScheme == .dark
+                                        ? [.white.opacity(0.32), .white.opacity(0.88)]
+                                        : [MyGoTheme.accent.opacity(0.45), MyGoTheme.accent.opacity(0.95)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
                             .frame(width: geo.size.width * ratio)
                     }
                     .overlay(alignment: .leading) {
                         if app.settings.smoke && app.player.isPlaying && !app.player.isLoading {
+                            let miniSmokeHeight: CGFloat = 68
                             ProgressSmokeView(
                                 progress: ratio,
-                                level: CGFloat(app.player.audioBands.first ?? 0.15)
+                                level: miniLevel,
+                                horizontalInset: 0,
+                                scale: 0.52,
+                                useAdditiveBlend: colorScheme == .dark,
+                                tintColor: MyGoTheme.mix(MyGoTheme.accent, with: .white, ratio: 0.35),
+                                isActive: true,
+                                lightSurfaceMode: colorScheme == .light
                             )
-                            .frame(height: 22)
-                            .offset(y: -9.75)
+                            .frame(height: miniSmokeHeight)
+                            .mask {
+                                HStack(spacing: 0) {
+                                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                                        .frame(width: 14)
+                                    Rectangle().fill(.black)
+                                }
+                            }
+                            .offset(y: -(miniSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.52)))
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
                         }
@@ -877,13 +922,42 @@ public struct MiniPlayerBarView: View {
                 }
                 .frame(height: 2.5)
             }
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(.thinMaterial)
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(colorScheme == .dark ? Color(white: 0.15).opacity(0.68) : Color.white.opacity(0.72))
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: colorScheme == .dark
+                                ? [Color.white.opacity(0.24), Color.white.opacity(0.06)]
+                                : [Color.white.opacity(0.92), Color.black.opacity(0.07)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 0.75
+                    )
             )
-            .shadow(color: .black.opacity(0.14), radius: 12, x: 0, y: 4)
-            .padding(.horizontal, 12)
+            .shadow(
+                color: .black.opacity(colorScheme == .dark ? 0.32 : 0.08),
+                radius: 18,
+                x: 0,
+                y: 6
+            )
+            .shadow(
+                color: .black.opacity(colorScheme == .dark ? 0.16 : 0.035),
+                radius: 3,
+                x: 0,
+                y: 1
+            )
+            .frame(maxWidth: FloatingTabBarMetrics.maxWidth)
+            .padding(.horizontal, FloatingTabBarMetrics.horizontalPadding)
             .contentShape(Rectangle())
             .onTapGesture {
                 if app.settings.growFromCover {
@@ -1189,14 +1263,172 @@ private final class WebSignInCoordinator: NSObject, WKUIDelegate {
     }
 }
 
+// MARK: - 悬浮胶囊底部导航栏（对标现代 iOS 悬浮胶囊底栏与同心选中指示器）
+
+/// 遵循 Apple iOS HIG 与 Liquid Glass 悬浮胶囊规范的底部导航栏尺寸常量
+public enum FloatingTabBarMetrics {
+    public static let barHeight: CGFloat = 66
+    public static let outerInset: CGFloat = 5
+    public static let activePillHeight: CGFloat = barHeight - outerInset * 2
+    public static let itemSpacing: CGFloat = 4
+    public static let horizontalPadding: CGFloat = 20
+    public static let maxWidth: CGFloat = 428
+    public static let iconSize: CGFloat = 21.5
+    public static let iconFrameHeight: CGFloat = 24
+    public static let iconLabelSpacing: CGFloat = 3
+    public static let labelFontSize: CGFloat = 10.5
+    public static let overlaySpacing: CGFloat = 10
+    public static let bottomInsetEmptyPlayer: CGFloat = 88
+    public static let bottomInsetWithMiniPlayer: CGFloat = 164
+}
+
+private struct MainTabItem: Identifiable {
+    let id: Int
+    let titleKey: String
+    let icon: String
+    let selectedIcon: String
+}
+
+private struct FloatingCapsuleTabBar: View {
+    @Binding var selectedTab: Int
+    let onSelect: (Int) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+    @Namespace private var highlightNamespace
+
+    private let items: [MainTabItem] = [
+        MainTabItem(id: 0, titleKey: "Home", icon: "house", selectedIcon: "house.fill"),
+        MainTabItem(id: 1, titleKey: "Search", icon: "magnifyingglass", selectedIcon: "magnifyingglass"),
+        MainTabItem(id: 2, titleKey: "Library", icon: "music.note.list", selectedIcon: "music.note.list"),
+        MainTabItem(id: 3, titleKey: "Settings", icon: "gearshape", selectedIcon: "gearshape.fill")
+    ]
+
+    var body: some View {
+        HStack(spacing: FloatingTabBarMetrics.itemSpacing) {
+            ForEach(items) { item in
+                let isSelected = (selectedTab == item.id)
+                Button {
+                    onSelect(item.id)
+                } label: {
+                    VStack(spacing: FloatingTabBarMetrics.iconLabelSpacing) {
+                        Image(systemName: isSelected ? item.selectedIcon : item.icon)
+                            .font(.system(size: FloatingTabBarMetrics.iconSize, weight: isSelected ? .semibold : .medium))
+                            .frame(height: FloatingTabBarMetrics.iconFrameHeight)
+                            .scaleEffect(isSelected ? 1.03 : 1.0)
+
+                        Text(I18n.t(item.titleKey))
+                            .font(.system(size: FloatingTabBarMetrics.labelFontSize, weight: isSelected ? .semibold : .medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                    }
+                    .foregroundStyle(foregroundColor(isSelected: isSelected))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: FloatingTabBarMetrics.activePillHeight)
+                    .background {
+                        if isSelected {
+                            ZStack {
+                                Capsule(style: .continuous)
+                                    .fill(activePillColor)
+                                Capsule(style: .continuous)
+                                    .strokeBorder(activePillBorderGradient, lineWidth: 0.6)
+                            }
+                            .matchedGeometryEffect(id: "ActiveTabCapsule", in: highlightNamespace)
+                        }
+                    }
+                    .contentShape(Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+            }
+        }
+        .padding(FloatingTabBarMetrics.outerInset)
+        .frame(height: FloatingTabBarMetrics.barHeight)
+        .background {
+            ZStack {
+                Capsule(style: .continuous)
+                    .fill(.thinMaterial)
+                Capsule(style: .continuous)
+                    .fill(capsuleSurfaceColor)
+            }
+        }
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(capsuleBorderGradient, lineWidth: 0.85)
+        )
+        .shadow(
+            color: .black.opacity(colorScheme == .dark ? 0.36 : 0.085),
+            radius: 22,
+            x: 0,
+            y: 8
+        )
+        .shadow(
+            color: .black.opacity(colorScheme == .dark ? 0.18 : 0.04),
+            radius: 4,
+            x: 0,
+            y: 1.5
+        )
+        .frame(maxWidth: FloatingTabBarMetrics.maxWidth)
+        .padding(.horizontal, FloatingTabBarMetrics.horizontalPadding)
+    }
+
+    private var capsuleSurfaceColor: Color {
+        colorScheme == .dark
+            ? Color(white: 0.14).opacity(0.68)
+            : Color.white.opacity(0.72)
+    }
+
+    private var activePillColor: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.15)
+            : Color.black.opacity(0.055)
+    }
+
+    private var activePillBorderGradient: LinearGradient {
+        if colorScheme == .dark {
+            return LinearGradient(
+                colors: [Color.white.opacity(0.22), Color.white.opacity(0.04)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        return LinearGradient(
+            colors: [Color.white.opacity(0.80), Color.black.opacity(0.03)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private var capsuleBorderGradient: LinearGradient {
+        if colorScheme == .dark {
+            return LinearGradient(
+                colors: [Color.white.opacity(0.32), Color.white.opacity(0.12), Color.white.opacity(0.05)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        return LinearGradient(
+            colors: [Color.white.opacity(0.96), Color.white.opacity(0.45), Color.black.opacity(0.08)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private func foregroundColor(isSelected: Bool) -> Color {
+        if isSelected {
+            return MyGoTheme.accent
+        }
+        return colorScheme == .dark
+            ? Color.white.opacity(0.72)
+            : Color(white: 0.18)
+    }
+}
+
 // MARK: - iOS 应用根视图（对应 ui_main.go 中的 view）
 
 public struct MainView: View {
     @EnvironmentObject private var app: AppModel
     @State private var selectedTab: Int = 0
-    #if os(iOS)
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    #endif
+    @State private var activatedTabs: Set<Int> = [0]
 
     public init() {}
 
@@ -1208,55 +1440,52 @@ public struct MainView: View {
         }
     }
 
-    private var miniPlayerBottomPadding: CGFloat {
+    private var bottomOverlayPadding: CGFloat {
         #if os(iOS)
-        return horizontalSizeClass == .regular ? 12 : 56
+        return 8
         #else
         return 12
         #endif
     }
 
     @ViewBuilder
-    private func tabWithMiniPlayerInset<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private func tabWithBottomOverlayInset<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         content()
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 Color.clear
-                    .frame(height: app.player.currentTrack == nil ? 0 : 72)
+                    .frame(
+                        height: app.player.currentTrack == nil
+                            ? FloatingTabBarMetrics.bottomInsetEmptyPlayer
+                            : FloatingTabBarMetrics.bottomInsetWithMiniPlayer
+                    )
                     .allowsHitTesting(false)
             }
     }
 
+    @ViewBuilder
+    private func tabViewport<Content: View>(index: Int, @ViewBuilder content: () -> Content) -> some View {
+        let isActive = (selectedTab == index)
+        if activatedTabs.contains(index) || isActive {
+            tabWithBottomOverlayInset(content: content)
+                .opacity(isActive ? 1 : 0)
+                .allowsHitTesting(isActive)
+                .accessibilityHidden(!isActive)
+                .zIndex(isActive ? 1 : 0)
+        }
+    }
+
     public var body: some View {
         ZStack(alignment: .bottom) {
-            TabView(selection: $selectedTab) {
-                tabWithMiniPlayerInset { HomeView() }
-                    .tabItem {
-                        Label(I18n.t("Home"), systemImage: "house.fill")
-                    }
-                    .tag(0)
-
-                tabWithMiniPlayerInset { SearchView() }
-                    .tabItem {
-                        Label(I18n.t("Search"), systemImage: "magnifyingglass")
-                    }
-                    .tag(1)
-
-                tabWithMiniPlayerInset { LibraryView() }
-                    .tabItem {
-                        Label(I18n.t("Library"), systemImage: "music.note.list")
-                    }
-                    .tag(2)
-
-                tabWithMiniPlayerInset { SettingsView() }
-                    .tabItem {
-                        Label(I18n.t("Settings"), systemImage: "gearshape.fill")
-                    }
-                    .tag(3)
+            ZStack {
+                tabViewport(index: 0) { HomeView() }
+                tabViewport(index: 1) { SearchView() }
+                tabViewport(index: 2) { LibraryView() }
+                tabViewport(index: 3) { SettingsView() }
             }
-            .tint(MyGoTheme.accent)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            // 悬浮于底部标签栏上方的提示胶囊与 Mini Player Bar（统一堆栈避免重叠）
-            VStack(spacing: 8) {
+            // 悬浮于安全区上方的提示胶囊、Mini Player Bar 与悬浮胶囊导航栏
+            VStack(spacing: FloatingTabBarMetrics.overlaySpacing) {
                 if let toast = app.toastMessage {
                     Text(toast)
                         .font(.system(size: 13.5, weight: .semibold))
@@ -1268,9 +1497,17 @@ public struct MainView: View {
                 }
 
                 MiniPlayerBarView()
+
+                FloatingCapsuleTabBar(selectedTab: $selectedTab) { targetTab in
+                    activatedTabs.insert(targetTab)
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
+                        selectedTab = targetTab
+                    }
+                }
             }
-            .padding(.bottom, miniPlayerBottomPadding)
+            .padding(.bottom, bottomOverlayPadding)
         }
+        .sensoryFeedback(.selection, trigger: selectedTab)
         .preferredColorScheme(preferredScheme)
         #if os(iOS)
         // iOS 上全屏展示正在播放页（与原生音乐 App 一致）
@@ -1287,24 +1524,7 @@ public struct MainView: View {
         #endif
         #if DEBUG
         .onAppear {
-            // 调试用启动参数：仅在 DEBUG 构建生效，便于在模拟器中截图检查布局
-            if ProcessInfo.processInfo.arguments.contains("-MyGoOpenNowPlaying"), app.player.currentTrack != nil {
-                app.activeNowPlayingPane = .lyrics
-                app.isNowPlayingPresented = true
-                if ProcessInfo.processInfo.arguments.contains("-MyGoAutoPlay") {
-                    app.player.resume()
-                }
-                if let seekArg = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("-MyGoSeek:") }),
-                   let secStr = seekArg.split(separator: ":").last,
-                   let sec = Double(secStr) {
-                    Task {
-                        try? await Task.sleep(nanoseconds: 1_200_000_000)
-                        await MainActor.run {
-                            app.player.seek(to: sec)
-                        }
-                    }
-                }
-            }
+            applyDebugLaunchOptionsIfNeeded()
         }
         #endif
         .sheet(isPresented: $app.isSignInSheetPresented) {
@@ -1316,7 +1536,103 @@ public struct MainView: View {
                 .environmentObject(app)
         }
         .onOpenURL { url in
+            #if DEBUG
+            if handleDebugURL(url) {
+                return
+            }
+            #endif
             app.handleDeepLink(url)
         }
     }
+
+    #if DEBUG
+    /// 根据字符串设置律动与播放器子面板（供 DEBUG 自动化联调使用）。
+    private func applyDebugStageConfig(pane: String?, style: String?) {
+        switch pane?.lowercased() {
+        case "stage": app.activeNowPlayingPane = .stage
+        case "lyrics": app.activeNowPlayingPane = .lyrics
+        case "queue": app.activeNowPlayingPane = .queue
+        case "wall": app.activeNowPlayingPane = .wall
+        default: break
+        }
+        switch style?.lowercased() {
+        case "flow": app.settings.stageStyle = .flow
+        case "partita": app.settings.stageStyle = .partita
+        case "tilt": app.settings.stageStyle = .tilt
+        default: break
+        }
+    }
+
+    /// 冷启动阶段读取环境变量或启动参数（等待首帧窗口就绪后再弹窗）。
+    private func applyDebugLaunchOptionsIfNeeded() {
+        let args = ProcessInfo.processInfo.arguments
+        let env = ProcessInfo.processInfo.environment
+        let shouldOpen = args.contains("-MyGoOpenNowPlaying") || env["MYGO_DEBUG_OPEN"] == "1"
+        guard shouldOpen else { return }
+
+        let paneArg = args.first(where: { $0.hasPrefix("-MyGoPane:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_PANE"]
+        let styleArg = args.first(where: { $0.hasPrefix("-MyGoStageStyle:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_STYLE"]
+        let autoPlay = args.contains("-MyGoAutoPlay") || env["MYGO_DEBUG_PLAY"] == "1"
+        let seekArg = args.first(where: { $0.hasPrefix("-MyGoSeek:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_SEEK"]
+
+        Task { @MainActor in
+            // 延时等待 UIWindowScene 挂载与会话恢复完成，避免 fullScreenCover 被首帧吞掉
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard app.player.currentTrack != nil else { return }
+            applyDebugStageConfig(pane: paneArg ?? (app.settings.lyricsStage ? "stage" : "lyrics"), style: styleArg)
+            app.isNowPlayingPresented = true
+            if autoPlay {
+                app.player.resume()
+            }
+            if let seekStr = seekArg, let sec = Double(seekStr) {
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                app.player.seek(to: sec)
+            }
+        }
+    }
+
+    /// 处理仅在 DEBUG 构建生效的调试深链（mygo-music-dev://debug?...），便于动态切换界面与校验状态。
+    private func handleDebugURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "mygo-music" || scheme == "mygo-music-dev",
+              url.host?.lowercased() == "debug" else {
+            return false
+        }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let query = Dictionary(items.compactMap { item in
+            item.value.map { (item.name.lowercased(), $0) }
+        }, uniquingKeysWith: { _, latest in latest })
+
+        if let tabStr = query["tab"], let tab = Int(tabStr), (0...3).contains(tab) {
+            activatedTabs.insert(tab)
+            selectedTab = tab
+        }
+        switch query["appearance"]?.lowercased() {
+        case "light": app.settings.appearance = .light
+        case "dark": app.settings.appearance = .dark
+        case "system": app.settings.appearance = .system
+        default: break
+        }
+        applyDebugStageConfig(pane: query["pane"], style: query["style"])
+
+        if let open = query["open"]?.lowercased() {
+            if open == "nowplaying" || open == "1" || open == "true" {
+                app.isNowPlayingPresented = true
+            } else if open == "close" || open == "0" || open == "false" {
+                app.isNowPlayingPresented = false
+            }
+        }
+        if let play = query["play"] {
+            if play == "1" || play == "true" {
+                app.player.resume()
+            } else if play == "0" || play == "false" {
+                app.player.pause()
+            }
+        }
+        if let seekStr = query["seek"], let sec = Double(seekStr) {
+            app.player.seek(to: sec)
+        }
+        return true
+    }
+    #endif
 }

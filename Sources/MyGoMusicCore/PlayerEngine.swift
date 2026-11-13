@@ -2,6 +2,7 @@
 // 对应原项目 internal/player/player.go, remote.go, cache.go 的播放队列与音频引擎
 
 import AVFoundation
+import Accelerate
 import Combine
 import CryptoKit
 import Foundation
@@ -12,6 +13,238 @@ import os
 #if canImport(UIKit)
 import UIKit
 #endif
+
+/// 全曲高精度硬件 FFT 频谱时间轴（对照桌面 internal/player/stream.go spectrum）
+/// 支持本地 MP3/M4A/WAV/FLAC 与已缓存云端音频的毫秒级全周期频谱查询、鼓点瞬态检测与渐进式分段发布
+final class AudioSpectrumTimeline: @unchecked Sendable {
+    static let fftSize = 1024
+    static let bandCount = 5
+
+    struct Snapshot: Sendable {
+        let sampleRate: Double
+        /// 紧凑打包帧：bytes[0...4] = 5 个对数频段 (0...255), bytes[5] = 重音瞬态脉冲 (0...255)
+        let chunks: [UInt64]
+    }
+
+    private let lock = OSAllocatedUnfairLock<Snapshot>(
+        initialState: Snapshot(sampleRate: 44_100, chunks: [])
+    )
+
+    /// 从任意播放位置（含拖动预览）无阻塞 O(1) 线性插值读取真实音频频谱与鼓点能量
+    func sample(at seconds: TimeInterval) -> AudioRhythmState? {
+        guard seconds.isFinite, seconds >= 0 else { return nil }
+        let snap = lock.withLock { $0 }
+        guard !snap.chunks.isEmpty, snap.sampleRate > 0 else { return nil }
+
+        let framesPerChunk = Double(Self.fftSize) / snap.sampleRate
+        let exactIdx = seconds / framesPerChunk
+        let i0 = Int(floor(exactIdx))
+        guard i0 >= 0, i0 < snap.chunks.count else { return nil }
+
+        let i1 = min(i0 + 1, snap.chunks.count - 1)
+        let frac = max(0.0, min(1.0, exactIdx - Double(i0)))
+        let p0 = snap.chunks[i0]
+        let p1 = snap.chunks[i1]
+
+        @inline(__always) func interpByte(_ shift: Int) -> Double {
+            let v0 = Double((p0 >> shift) & 0xFF) / 255.0
+            let v1 = Double((p1 >> shift) & 0xFF) / 255.0
+            return v0 + (v1 - v0) * frac
+        }
+
+        let b0 = interpByte(0)
+        let b1 = interpByte(8)
+        let b2 = interpByte(16)
+        let b3 = interpByte(24)
+        let b4 = interpByte(32)
+        // 瞬态脉冲取前后两帧峰值偏重，避免微弱插值把敲击感抹平
+        let onset0 = Double((p0 >> 40) & 0xFF) / 255.0
+        let onset1 = Double((p1 >> 40) & 0xFF) / 255.0
+        let beatPulse = max(onset0, onset1 * 0.92)
+
+        let bass = min(1.0, b0 * 0.62 + b1 * 0.38)
+        let vocal = min(1.0, b2 * 0.68 + b3 * 0.32)
+        let treble = min(1.0, b3 * 0.35 + b4 * 0.65)
+        let energy = min(1.0, b0 * 0.25 + b1 * 0.22 + b2 * 0.28 + b3 * 0.15 + b4 * 0.10)
+
+        return AudioRhythmState(
+            bands: [Float(b0), Float(b1), Float(b2), Float(b3), Float(b4)],
+            bass: bass,
+            vocal: vocal,
+            treble: treble,
+            energy: energy,
+            beatPulse: beatPulse,
+            isRealAudio: true
+        )
+    }
+
+    /// 在后台安全增量解码音频文件并逐段发布硬件 vDSP FFT 频谱表（支持即刻边扫边读）
+    func populate(
+        from fileURL: URL,
+        isCancelled: @escaping @Sendable () -> Bool
+    ) async {
+        await Task.detached(priority: .utility) { [self] in
+            guard !isCancelled() else { return }
+            let asset = AVURLAsset(url: fileURL)
+            guard let tracks = try? await asset.load(.tracks),
+                  let audioTrack = tracks.first(where: { $0.mediaType == .audio }),
+                  !isCancelled() else {
+                return
+            }
+
+            let reader: AVAssetReader
+            do {
+                reader = try AVAssetReader(asset: asset)
+            } catch {
+                return
+            }
+
+            let pcmSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false
+            ]
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: pcmSettings)
+            output.alwaysCopiesSampleData = false
+            guard reader.canAdd(output) else { return }
+            reader.add(output)
+            guard reader.startReading() else { return }
+
+            let log2n = vDSP_Length(10)
+            guard let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
+                reader.cancelReading()
+                return
+            }
+            defer { vDSP_destroy_fftsetup(fftSetup) }
+
+            var window = [Float](repeating: 0, count: Self.fftSize)
+            vDSP_hann_window(&window, vDSP_Length(Self.fftSize), Int32(vDSP_HANN_NORM))
+
+            var detectedRate: Double = 44_100
+            var edges: [Int] = []
+            func updateEdges(rate: Double) {
+                detectedRate = max(8_000, rate)
+                let boundaries: [Double] = [42.0, 140.0, 400.0, 1_400.0, 4_500.0, 14_000.0]
+                var computed = [Int](repeating: 1, count: Self.bandCount + 1)
+                for i in 0...Self.bandCount {
+                    let bin = Int((boundaries[i] * Double(Self.fftSize) / detectedRate).rounded())
+                    computed[i] = max(1, min(Self.fftSize / 2 - 1, bin))
+                }
+                for i in 1...Self.bandCount {
+                    computed[i] = max(computed[i], computed[i - 1] + 1)
+                }
+                edges = computed
+            }
+            updateEdges(rate: detectedRate)
+
+            var monoAcc = [Float]()
+            monoAcc.reserveCapacity(Self.fftSize * 2)
+            var windowed = [Float](repeating: 0, count: Self.fftSize)
+            var realp = [Float](repeating: 0, count: Self.fftSize / 2)
+            var imagp = [Float](repeating: 0, count: Self.fftSize / 2)
+            var magnitudes = [Float](repeating: 0, count: Self.fftSize / 2)
+
+            var chunks: [UInt64] = []
+            chunks.reserveCapacity(4096)
+            var recentBassMean: Double = 0.15
+            var publishCounter = 0
+
+            while let sampleBuffer = output.copyNextSampleBuffer() {
+                if isCancelled() {
+                    reader.cancelReading()
+                    return
+                }
+                if let fmtDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc)?.pointee {
+                    if asbd.mSampleRate > 0 && abs(asbd.mSampleRate - detectedRate) > 1.0 {
+                        updateEdges(rate: asbd.mSampleRate)
+                    }
+                    let channels = max(1, Int(asbd.mChannelsPerFrame))
+                    if let block = CMSampleBufferGetDataBuffer(sampleBuffer) {
+                        let byteLen = CMBlockBufferGetDataLength(block)
+                        if byteLen > 0 {
+                            let floatCount = byteLen / MemoryLayout<Float>.size
+                            var interleaved = [Float](repeating: 0, count: floatCount)
+                            _ = interleaved.withUnsafeMutableBytes { dst in
+                                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: byteLen, destination: dst.baseAddress!)
+                            }
+                            let frameCount = floatCount / channels
+                            for f in 0..<frameCount {
+                                var mono: Float = 0
+                                for c in 0..<channels {
+                                    mono += interleaved[f * channels + c]
+                                }
+                                monoAcc.append(mono / Float(channels))
+
+                                if monoAcc.count == Self.fftSize {
+                                    vDSP_vmul(monoAcc, 1, window, 1, &windowed, 1, vDSP_Length(Self.fftSize))
+                                    realp.withUnsafeMutableBufferPointer { rPtr in
+                                        imagp.withUnsafeMutableBufferPointer { iPtr in
+                                            var split = DSPSplitComplex(realp: rPtr.baseAddress!, imagp: iPtr.baseAddress!)
+                                            windowed.withUnsafeBufferPointer { wPtr in
+                                                wPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: Self.fftSize / 2) { cPtr in
+                                                    vDSP_ctoz(cPtr, 2, &split, 1, vDSP_Length(Self.fftSize / 2))
+                                                }
+                                            }
+                                            vDSP_fft_zrip(fftSetup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
+                                            vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(Self.fftSize / 2))
+                                        }
+                                    }
+
+                                    var bVals = [Double](repeating: 0, count: Self.bandCount)
+                                    let normScale = Double(Self.fftSize / 2)
+                                    for b in 0..<Self.bandCount {
+                                        let lo = edges[b]
+                                        let hi = edges[b + 1]
+                                        var sum: Double = 0
+                                        for k in lo..<hi {
+                                            sum += Double(magnitudes[k])
+                                        }
+                                        var avgMag = sum / Double(max(1, hi - lo)) / normScale
+                                        // 对标桌面 stream.go 高频耳朵等响曲线倾斜增强
+                                        avgMag *= (1.0 + Double(b) * 0.42)
+                                        let db = 20.0 * log10(avgMag + 1e-9)
+                                        bVals[b] = min(1.0, max(0.0, (db + 58.0) / 50.0))
+                                    }
+
+                                    // 计算自适应重低音突增（Beat Spectral Flux）
+                                    let currentBass = bVals[0] * 0.65 + bVals[1] * 0.35
+                                    let flux = max(0.0, currentBass - recentBassMean * 1.12)
+                                    let impulse = min(1.0, flux * 4.4)
+                                    recentBassMean = recentBassMean * 0.88 + currentBass * 0.12
+
+                                    let p0 = UInt64(min(255, max(0, Int(bVals[0] * 255.0))))
+                                    let p1 = UInt64(min(255, max(0, Int(bVals[1] * 255.0))))
+                                    let p2 = UInt64(min(255, max(0, Int(bVals[2] * 255.0))))
+                                    let p3 = UInt64(min(255, max(0, Int(bVals[3] * 255.0))))
+                                    let p4 = UInt64(min(255, max(0, Int(bVals[4] * 255.0))))
+                                    let p5 = UInt64(min(255, max(0, Int(impulse * 255.0))))
+                                    let packed = p0 | (p1 << 8) | (p2 << 16) | (p3 << 24) | (p4 << 32) | (p5 << 40)
+                                    chunks.append(packed)
+
+                                    monoAcc.removeAll(keepingCapacity: true)
+                                    publishCounter += 1
+                                    // 每 ~1.5 秒音乐音频增量发布一次，确保大文件 FLAC 起播零等待即可驱动前段真频谱
+                                    if publishCounter >= 64 {
+                                        publishCounter = 0
+                                        let snapshot = Snapshot(sampleRate: detectedRate, chunks: chunks)
+                                        self.lock.withLock { $0 = snapshot }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            guard !isCancelled(), !chunks.isEmpty else { return }
+            let finalSnapshot = Snapshot(sampleRate: detectedRate, chunks: chunks)
+            self.lock.withLock { $0 = finalSnapshot }
+        }.value
+    }
+}
 
 
 private final class AudioBandMeter: @unchecked Sendable {
@@ -123,7 +356,9 @@ private final class AudioBandMeter: @unchecked Sendable {
 
     private func normalizedPower(_ q1: Double, _ q2: Double, _ coefficient: Double, _ count: Double) -> Double {
         let power = max(0, q1 * q1 + q2 * q2 - coefficient * q1 * q2)
-        return min(1, max(0, sqrt(power) / count * 2 * 2.2))
+        let mag = sqrt(power) / max(1.0, count) * 2.0
+        let db = 20.0 * log10(mag + 1e-9)
+        return min(1.0, max(0.0, (db + 58.0) / 50.0))
     }
 
     private static func pack(_ a: Double, _ b: Double, _ c: Double, _ d: Double, _ e: Double) -> UInt64 {
@@ -463,6 +698,7 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
     public let cacheKey: String?
     public let diskCache: AudioDiskCache?
     public let delegateQueue: DispatchQueue
+    public var onCacheStored: (@Sendable (URL) -> Void)?
 
     private var urlSession: URLSession?
     private let lock = NSLock()
@@ -535,8 +771,8 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 300
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 120
         self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
@@ -552,7 +788,7 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         return URL(string: "\(Self.proxyScheme)://track/\(UUID().uuidString)")!
     }
 
-    private static func knownFileExtension(streamType: String?, url: URL) -> String? {
+    internal static func knownFileExtension(streamType: String?, url: URL) -> String? {
         let hint = streamType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let pathExt = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !hint.isEmpty {
@@ -672,7 +908,7 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         }
         lock.unlock()
 
-        var request = URLRequest(url: remoteURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        var request = URLRequest(url: remoteURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
         request.httpShouldHandleCookies = false
         for (k, v) in headers {
             if k.caseInsensitiveCompare("host") == .orderedSame || k.caseInsensitiveCompare("content-length") == .orderedSame {
@@ -983,12 +1219,28 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
             return
         }
 
-        // 成功读到流 EOF，若缓存文件完整则落盘
+        // 成功读到流 EOF 前，先校验是否被代理或 CDN 半途静默截断，避免将残缺响应误当正常完成卡死 AVPlayer
         var cacheReady: (tmpURL: URL, key: String, diskCache: AudioDiskCache, ext: String, type: String)?
         var shouldNotifySuccess = false
+        var incompleteError: Error?
 
         ctx.lock.lock()
-        if ctx.shouldWriteCache,
+        if !ctx.isInfoOnlyProbe, ctx.loadingRequest.dataRequest != nil {
+            if !ctx.requestsAllToEnd, ctx.requestedLength > 0 {
+                let expectedEnd: Int64 = (ctx.totalContentLength > 0)
+                    ? min(ctx.requestedOffset + ctx.requestedLength, ctx.totalContentLength)
+                    : (ctx.requestedOffset + ctx.requestedLength)
+                if ctx.respondedUpToOffset < expectedEnd {
+                    incompleteError = URLError(.networkConnectionLost)
+                }
+            } else if ctx.totalContentLength > 0,
+                      (ctx.streamStartOffset + ctx.receivedBytesFromStreamStart) < ctx.totalContentLength {
+                incompleteError = URLError(.networkConnectionLost)
+            }
+        }
+
+        if incompleteError == nil,
+           ctx.shouldWriteCache,
            let tmpURL = ctx.cacheTempURL,
            let cacheKey = cacheKey,
            let diskCache = diskCache,
@@ -1004,17 +1256,27 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
 
         if !ctx.finishedLoading && !ctx.loadingRequest.isCancelled {
             ctx.finishedLoading = true
-            shouldNotifySuccess = true
+            shouldNotifySuccess = (incompleteError == nil)
         }
+        let shouldNotifyIncomplete = (incompleteError != nil) && !ctx.loadingRequest.isCancelled
         ctx.lock.unlock()
 
+        if let incompleteError {
+            if shouldNotifyIncomplete {
+                ctx.loadingRequest.finishLoading(with: incompleteError)
+            }
+            return
+        }
+
         if let cacheReady {
-            _ = try? cacheReady.diskCache.store(
+            if let storedURL = try? cacheReady.diskCache.store(
                 tempFileURL: cacheReady.tmpURL,
                 key: cacheReady.key,
                 fileExtension: cacheReady.ext,
                 contentType: cacheReady.type
-            )
+            ), storedURL != cacheReady.tmpURL {
+                onCacheStored?(storedURL)
+            }
             try? FileManager.default.removeItem(at: cacheReady.tmpURL)
         }
 
@@ -1090,6 +1352,12 @@ public final class PlayerEngine: ObservableObject {
     public var lockScreenLyricsProvider: (() -> Bool)?
     public var onSourceFailure: ((String, SourceError) -> Void)?
     public var onSessionChanged: (() -> Void)?
+    /// 原生直连起播/卡顿后自动回退代理的等待秒数
+    public var directBufferTimeoutSeconds: TimeInterval = 7.0
+    /// 代理流或无退路流持续卡顿时的超时秒数（到期后退出缓冲态并报错）
+    public var proxyBufferTimeoutSeconds: TimeInterval = 16.0
+    /// 测试注入代理会话配置（默认 nil 使用标准 ephemeral 会话）
+    public var proxySessionConfiguration: URLSessionConfiguration? = nil
 
     public let diskCache: AudioDiskCache
 
@@ -1103,6 +1371,8 @@ public final class PlayerEngine: ObservableObject {
     private var statusObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
     private var loadGeneration: Int = 0
+    private var bufferWatchdogTask: Task<Void, Never>?
+    private var lastObservedMediaPosition: TimeInterval = -1
     private var currentGainLinear: Float = 1.0
     private var currentFadeMultiplier: Float = 1.0
     private var fadeTask: Task<Void, Never>?
@@ -1113,7 +1383,12 @@ public final class PlayerEngine: ObservableObject {
     private var recordedTrackKey: String? = nil
     private var bandTimer: Timer?
     private var audioBandMeter: AudioBandMeter?
-    private var syntheticBandPhase: Double = 0
+    private var activeSpectrumTimeline: AudioSpectrumTimeline?
+    private var spectrumAnalysisTask: Task<Void, Never>?
+    private var backgroundCacheTask: Task<Void, Never>?
+    private var rhythmSmoothedState: AudioRhythmState = .idle
+    private var lastRhythmSampleTimestamp: TimeInterval = 0
+    private var tapBassMovingMean: Double = 0.15
     private var lockScreenArtwork: MPMediaItemArtwork?
     private var lastPublishedNowPlayingMeta: NowPlayingDisplayMetadata?
 
@@ -1128,8 +1403,17 @@ public final class PlayerEngine: ObservableObject {
 
     // MARK: - 队列与播放控制（对应 PlayQueue / PlayTrack / PlayShuffled）
 
-    /// 按顺序替换播放队列并从 start 开始播放
+    /// 按顺序替换播放队列并从 start 开始播放（整单播放时自动跳过灰显无权限曲目）
     public func playQueue(_ tracks: [Track], start: Int = 0) {
+        startQueuePlayback(tracks, start: start, skipInitialUnavailable: true)
+    }
+
+    /// 播放列表中用户点选的单曲（用户主动点击灰显曲目时保留试探以便呈现明确原因）
+    public func playTrack(_ tracks: [Track], at index: Int) {
+        startQueuePlayback(tracks, start: index, skipInitialUnavailable: false)
+    }
+
+    private func startQueuePlayback(_ tracks: [Track], start: Int, skipInitialUnavailable: Bool) {
         guard !tracks.isEmpty else { return }
         endRadio()
         let clampedStart = min(max(start, 0), tracks.count - 1)
@@ -1137,18 +1421,25 @@ public final class PlayerEngine: ObservableObject {
         self.order = Array(0..<tracks.count)
         if shuffle {
             shuffleOrder(keepingFirstQueueIndex: clampedStart)
-            loadTrack(atOrderIndex: 0, autoPlay: true)
+            if skipInitialUnavailable, let firstPlayable = findPlayableOrderIndex(startingAt: 0, step: 1, wrapAround: false) {
+                loadTrack(atOrderIndex: firstPlayable, autoPlay: true)
+            } else if skipInitialUnavailable && tracks[clampedStart].unavailable == true {
+                markQueueUnavailable(startingAt: 0)
+            } else {
+                loadTrack(atOrderIndex: 0, autoPlay: true)
+            }
+        } else if skipInitialUnavailable && tracks[clampedStart].unavailable == true {
+            if let firstPlayable = findPlayableOrderIndex(startingAt: clampedStart, step: 1, wrapAround: true) {
+                loadTrack(atOrderIndex: firstPlayable, autoPlay: true)
+            } else {
+                markQueueUnavailable(startingAt: clampedStart)
+            }
         } else {
             loadTrack(atOrderIndex: clampedStart, autoPlay: true)
         }
     }
 
-    /// 播放列表中用户点选的单曲
-    public func playTrack(_ tracks: [Track], at index: Int) {
-        playQueue(tracks, start: index)
-    }
-
-    /// 随机打乱并开始播放
+    /// 随机打乱并开始播放（自动跳过灰显无权限曲目）
     public func playShuffled(_ tracks: [Track]) {
         guard !tracks.isEmpty else { return }
         shuffle = true
@@ -1156,7 +1447,11 @@ public final class PlayerEngine: ObservableObject {
         self.queue = tracks
         self.order = Array(0..<tracks.count)
         shuffleOrder(keepingFirstQueueIndex: -1)
-        loadTrack(atOrderIndex: 0, autoPlay: true)
+        if let firstPlayable = findPlayableOrderIndex(startingAt: 0, step: 1, wrapAround: false) {
+            loadTrack(atOrderIndex: firstPlayable, autoPlay: true)
+        } else {
+            markQueueUnavailable(startingAt: 0)
+        }
     }
 
     /// 开启无限电台模式（对应 PlayRadio）
@@ -1193,6 +1488,9 @@ public final class PlayerEngine: ObservableObject {
 
     public func pause() {
         isPlaying = false
+        isLoading = false
+        bufferWatchdogTask?.cancel()
+        bufferWatchdogTask = nil
         fadeTask?.cancel()
         if let player = avPlayer, fadeEnabledProvider?() == true, player.timeControlStatus == .playing {
             let gen = loadGeneration
@@ -1248,34 +1546,69 @@ public final class PlayerEngine: ObservableObject {
         onSessionChanged?()
     }
 
-    /// 下一首（对应 Next）
+    /// 沿播放顺序查找下一首可用（非灰显无权限）曲目索引
+    private func findPlayableOrderIndex(startingAt startIdx: Int, step: Int, wrapAround: Bool) -> Int? {
+        guard !order.isEmpty, step != 0 else { return nil }
+        let count = order.count
+        var cursor = startIdx
+        for _ in 0..<count {
+            if cursor < 0 || cursor >= count {
+                guard wrapAround else { return nil }
+                cursor = ((cursor % count) + count) % count
+            }
+            let queueIdx = order[cursor]
+            if queueIdx >= 0 && queueIdx < queue.count && queue[queueIdx].unavailable != true {
+                return cursor
+            }
+            cursor += step
+        }
+        return nil
+    }
+
+    private func markQueueUnavailable(startingAt orderIndex: Int) {
+        cleanupAVPlayer()
+        let clamped = min(max(orderIndex, 0), max(0, order.count - 1))
+        if clamped < order.count, order[clamped] < queue.count {
+            currentOrderIndex = clamped
+            currentTrack = queue[order[clamped]]
+            duration = currentTrack?.durationSeconds ?? 0
+        }
+        position = 0
+        isLoading = false
+        isPlaying = false
+        errorMessage = I18n.t("No playable tracks in this list (VIP or copyright restricted)")
+        updateNowPlayingCenter()
+        onSessionChanged?()
+    }
+
+    /// 下一首（对应 Next，自动跳过灰显无权限曲目）
     public func next() {
         guard !order.isEmpty else { return }
-        let nextIdx = currentOrderIndex + 1
-        if nextIdx < order.count {
-            loadTrack(atOrderIndex: nextIdx, autoPlay: true)
+        if let nextPlayable = findPlayableOrderIndex(startingAt: currentOrderIndex + 1, step: 1, wrapAround: false) {
+            loadTrack(atOrderIndex: nextPlayable, autoPlay: true)
             maybePrefetchRadio()
         } else if radioFeed != nil {
             Task {
                 await appendRadioTracksAndAdvance()
             }
+        } else if let wrappedPlayable = findPlayableOrderIndex(startingAt: 0, step: 1, wrapAround: false) {
+            loadTrack(atOrderIndex: wrappedPlayable, autoPlay: true)
         } else {
-            loadTrack(atOrderIndex: 0, autoPlay: true)
+            markQueueUnavailable(startingAt: max(0, currentOrderIndex))
         }
     }
 
-    /// 上一首（对应 Prev：超过 3 秒回到开头，否则切上一首）
+    /// 上一首（对应 Prev：超过 3 秒回到开头，否则切上一首并自动跳过灰显无权限曲目）
     public func previous() {
         guard !order.isEmpty else { return }
         if position > 3.0 {
             seek(to: 0)
             return
         }
-        let prevIdx = currentOrderIndex - 1
-        if prevIdx >= 0 {
-            loadTrack(atOrderIndex: prevIdx, autoPlay: true)
+        if let prevPlayable = findPlayableOrderIndex(startingAt: currentOrderIndex - 1, step: -1, wrapAround: repeatMode == .all) {
+            loadTrack(atOrderIndex: prevPlayable, autoPlay: true)
         } else if repeatMode == .all {
-            loadTrack(atOrderIndex: order.count - 1, autoPlay: true)
+            markQueueUnavailable(startingAt: max(0, currentOrderIndex))
         } else {
             seek(to: 0)
         }
@@ -1577,7 +1910,13 @@ public final class PlayerEngine: ObservableObject {
     }
 
     private func applyPlayerVolume() {
-        let effective = Float(volume) * min(currentGainLinear, 1.0) * min(max(currentFadeMultiplier, 0.0), 1.0)
+        #if os(iOS)
+        // iOS 下输出音量由系统硬件与 MPVolumeView 统一接管，播放器仅保留响度均衡与淡入淡出系数，避免双重衰减
+        let baseScale: Float = 1.0
+        #else
+        let baseScale = Float(volume)
+        #endif
+        let effective = baseScale * min(currentGainLinear, 1.0) * min(max(currentFadeMultiplier, 0.0), 1.0)
         avPlayer?.volume = min(max(effective, 0.0), 1.0)
     }
 
@@ -1604,7 +1943,42 @@ public final class PlayerEngine: ObservableObject {
         loadTrack(atOrderIndex: currentOrderIndex, autoPlay: true, initialSeek: position)
     }
 
-    /// 判断是否必须经由 AudioStreamProxy 代理：仅针对 .m4s 容器或携带自定义请求头的流，其余标准 HTTP/HTTPS 直链优先交给原生 AVURLAsset
+    /// 检测 iOS AVPlayer 原生明确不支持解码的音频容器（如 OGG / Vorbis / Opus）
+    nonisolated public static func unsupportedAudioFormat(url: URL, stream: StreamInfo) -> String? {
+        let ext = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let typeMain = stream.type?
+            .split(separator: ";")
+            .first
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
+
+        if ext == "ogg" || ext == "oga" || typeMain == "ogg" || typeMain.contains("audio/ogg") || typeMain.contains("application/ogg") || typeMain.contains("vorbis") {
+            return "OGG"
+        }
+        if ext == "opus" || typeMain == "opus" || typeMain.contains("audio/opus") {
+            return "OPUS"
+        }
+        return nil
+    }
+
+    /// 提取可安全透传给原生 AVURLAsset(AVURLAssetHTTPHeaderFieldsKey) 的非空请求头
+    nonisolated public static func directAssetHTTPHeaders(for stream: StreamInfo) -> [String: String] {
+        guard let headers = stream.headers else { return [:] }
+        var cleaned: [String: String] = [:]
+        for (k, v) in headers {
+            let key = k.trimmingCharacters(in: .whitespacesAndNewlines)
+            let val = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = key.lowercased()
+            if key.isEmpty || val.isEmpty || lower == "host" || lower == "content-length" {
+                continue
+            }
+            cleaned[key] = val
+        }
+        return cleaned
+    }
+
+    /// 判断是否必须首跳即经由 AudioStreamProxy 代理：
+    /// 仅针对 .m4s 容器、含敏感鉴权头（Cookie/Authorization/X-*）或无明确原生扩展/类型的带头流；
+    /// 其余标准 HTTP/HTTPS 直链（如带 User-Agent/Referer 的 MP3/M4A/AAC/FLAC）优先交由原生 AVURLAsset 携带请求头极速流播，失败或超时再自动回退代理
     nonisolated public static func shouldUseStreamProxy(url: URL, stream: StreamInfo) -> Bool {
         guard !url.isFileURL,
               let scheme = url.scheme?.lowercased(),
@@ -1620,16 +1994,26 @@ public final class PlayerEngine: ObservableObject {
             || (stream.type?.lowercased().contains("m4s") == true)
         if isM4S { return true }
 
-        if let headers = stream.headers {
-            for (k, v) in headers {
-                let key = k.trimmingCharacters(in: .whitespacesAndNewlines)
-                let val = v.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !key.isEmpty && !val.isEmpty {
-                    return true
-                }
+        let cleanedHeaders = directAssetHTTPHeaders(for: stream)
+        guard !cleanedHeaders.isEmpty else {
+            return false
+        }
+
+        // Cookie / Authorization / X-* 自定义头在 CoreMedia 跨域重定向时可能被剥离，首跳直接走代理保留请求头
+        for key in cleanedHeaders.keys {
+            let lower = key.lowercased()
+            if lower == "cookie" || lower == "authorization" || lower == "proxy-authorization" || lower.hasPrefix("x-") {
+                return true
             }
         }
-        return false
+
+        // 若流既没有原生支持的扩展名、插件也没声明原生格式类型，但带自定义请求头，走代理探测 Content-Type 并映射 UTI
+        let nativeExts: Set<String> = ["mp3", "m4a", "aac", "mp4", "wav", "flac", "aiff", "caf"]
+        let isKnownNativeExt = nativeExts.contains(url.pathExtension.lowercased())
+        let typeHint = stream.type?.lowercased() ?? ""
+        let nativeTypeTokens = ["mp3", "mpeg", "m4a", "aac", "mp4", "wav", "flac", "aiff", "caf"]
+        let isKnownNativeType = nativeTypeTokens.contains { typeHint.contains($0) }
+        return !isKnownNativeExt && !isKnownNativeType
     }
 
     private func startAVPlayer(
@@ -1667,6 +2051,14 @@ public final class PlayerEngine: ObservableObject {
             return
         }
 
+        if let unsupported = Self.unsupportedAudioFormat(url: url, stream: stream) {
+            isLoading = false
+            isPlaying = false
+            errorMessage = String(format: I18n.t("Current audio format (%@) is not supported on iOS yet"), unsupported)
+            updateNowPlayingCenter()
+            return
+        }
+
         let sourceID = track?.source ?? LocalMusicSource.sourceID
         let cacheKey: String? = (!url.isFileURL && track != nil)
             ? AudioDiskCache.cacheKey(sourceID: sourceID, trackID: track!.id, quality: quality)
@@ -1677,13 +2069,15 @@ public final class PlayerEngine: ObservableObject {
 
         let asset: AVURLAsset
         var usedProxy = false
+        var resolvedLocalFileURL: URL? = url.isFileURL ? url : nil
         if !url.isFileURL, let cacheKey, let cached = diskCache.cachedFileURL(forKey: cacheKey) {
-            // 优先从磁盘缓存秒开，零网络延迟并支持原生高精度 Seek
+            // 优先从磁盘缓存秒开，零网络延迟并支持原生高精度 Seek 与全曲真频谱解码
             asset = AVURLAsset(url: cached.fileURL)
+            resolvedLocalFileURL = cached.fileURL
         } else if !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") && (forceProxy || Self.shouldUseStreamProxy(url: url, stream: stream)) {
-            // 对 .m4s、带自定义请求头或直连回退流使用 AudioStreamProxy（保留跨域头与边播边缓）
+            // 对 .m4s、含 Cookie 等敏感头或直连回退流使用 AudioStreamProxy（保留跨域头与边播边缓）
             usedProxy = true
-            var mergedHeaders = stream.headers ?? [:]
+            var mergedHeaders = Self.directAssetHTTPHeaders(for: stream)
             if !mergedHeaders.keys.contains(where: { $0.lowercased() == "user-agent" }) {
                 mergedHeaders["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) mygo-music/0.1"
             }
@@ -1692,14 +2086,26 @@ public final class PlayerEngine: ObservableObject {
                 headers: mergedHeaders,
                 streamTypeHint: stream.type,
                 cacheKey: cacheKey,
-                diskCache: diskCache
+                diskCache: diskCache,
+                sessionConfiguration: proxySessionConfiguration
             )
+            proxy.onCacheStored = { [weak self] storedFileURL in
+                Task { @MainActor [weak self] in
+                    guard let self, self.loadGeneration == gen else { return }
+                    self.startSpectrumTimelineAnalysis(forFile: storedFileURL, gen: gen)
+                }
+            }
             self.activeStreamProxy = proxy
             let proxyAsset = AVURLAsset(url: proxy.makeProxyAssetURL())
             proxyAsset.resourceLoader.setDelegate(proxy, queue: proxy.delegateQueue)
             asset = proxyAsset
         } else {
-            asset = AVURLAsset(url: url)
+            let directHeaders = Self.directAssetHTTPHeaders(for: stream)
+            if directHeaders.isEmpty {
+                asset = AVURLAsset(url: url)
+            } else {
+                asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": directHeaders])
+            }
         }
 
         let item = AVPlayerItem(asset: asset)
@@ -1714,8 +2120,13 @@ public final class PlayerEngine: ObservableObject {
         }
         applyPlayerVolume()
 
-        // 仅对安全本地非 FLAC 文件挂载 MTAudioProcessingTap，避免远程流媒体/代理流因异步篡改 audioMix 阻塞底层管线
-        let isLocalSafeTapTarget = url.isFileURL && url.pathExtension.lowercased() != "flac"
+        // 任何本地音轨或已缓存本地文件（包含 MP3/M4A/WAV/FLAC），即刻启动非阻塞全曲硬件 FFT 频谱表构建
+        if let localAudioURL = resolvedLocalFileURL {
+            startSpectrumTimelineAnalysis(forFile: localAudioURL, gen: gen)
+        }
+
+        // 同时为安全本地非 FLAC 文件保留实时 Tap 供第 0 秒瞬时起跳衔接（直到全曲表就绪）
+        let isLocalSafeTapTarget = (resolvedLocalFileURL != nil) && (resolvedLocalFileURL!.pathExtension.lowercased() != "flac")
         if isLocalSafeTapTarget {
             let meter = AudioBandMeter()
             Task { [weak self, weak item] in
@@ -1736,6 +2147,21 @@ public final class PlayerEngine: ObservableObject {
 
         guard loadGeneration == gen else { return }
 
+        let armWatchdog: () -> Void = { [weak self] in
+            guard let self, self.loadGeneration == gen else { return }
+            self.scheduleBufferWatchdog(
+                with: stream,
+                track: track,
+                quality: quality,
+                initialSeek: initialSeek,
+                gen: gen,
+                url: url,
+                isHLS: isHLS,
+                usedProxy: usedProxy,
+                forceProxy: forceProxy
+            )
+        }
+
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
             Task { @MainActor in
                 guard let self, self.loadGeneration == gen else { return }
@@ -1748,11 +2174,16 @@ public final class PlayerEngine: ObservableObject {
                     }
                     if !self.isPlaying {
                         self.isLoading = false
+                        self.cancelBufferWatchdog()
                     } else if self.avPlayer?.timeControlStatus == .playing {
                         self.isLoading = false
+                        self.cancelBufferWatchdog()
                     }
                     if self.isPlaying {
                         self.avPlayer?.play()
+                        if self.isLoading {
+                            armWatchdog()
+                        }
                         if self.fadeEnabledProvider?() == true && self.currentFadeMultiplier < 0.99 {
                             self.fadeTask?.cancel()
                             self.fadeTask = Task { [weak self] in
@@ -1762,20 +2193,24 @@ public final class PlayerEngine: ObservableObject {
                     }
                     self.updateNowPlayingCenter()
                 case .failed:
-                    // 若直连 AVURLAsset 失败且尚未回退代理，自动用带桌面 UA 的 AudioStreamProxy 重试一次
-                    if !usedProxy && !forceProxy && !url.isFileURL && !isHLS {
+                    // 若直连 AVURLAsset 失败且尚未回退代理，自动用 AudioStreamProxy 重试一次
+                    if !usedProxy && !forceProxy && !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") {
+                        let keepPlaying = autoPlay || self.isPlaying
                         self.cleanupAVPlayer()
+                        self.isLoading = keepPlaying
+                        self.isPlaying = keepPlaying
                         await self.startAVPlayer(
                             with: stream,
                             track: track,
                             quality: quality,
-                            autoPlay: autoPlay,
+                            autoPlay: keepPlaying,
                             initialSeek: initialSeek,
                             gen: gen,
                             forceProxy: true
                         )
                         return
                     }
+                    self.cleanupAVPlayer()
                     self.isLoading = false
                     self.isPlaying = false
                     let comment = observedItem.errorLog()?.events.last?.errorComment
@@ -1796,13 +2231,25 @@ public final class PlayerEngine: ObservableObject {
                 switch observedPlayer.timeControlStatus {
                 case .playing:
                     self.isLoading = false
+                    self.cancelBufferWatchdog()
+                    if !usedProxy && !url.isFileURL && !isHLS, let cacheKey,
+                       self.activeSpectrumTimeline == nil && self.backgroundCacheTask == nil {
+                        self.scheduleDirectStreamBackgroundCache(
+                            url: url,
+                            stream: stream,
+                            cacheKey: cacheKey,
+                            gen: gen
+                        )
+                    }
                 case .paused:
                     if !self.isPlaying {
                         self.isLoading = false
+                        self.cancelBufferWatchdog()
                     }
                 case .waitingToPlayAtSpecifiedRate:
                     if self.isPlaying {
                         self.isLoading = true
+                        armWatchdog()
                     }
                 @unknown default:
                     break
@@ -1817,6 +2264,12 @@ public final class PlayerEngine: ObservableObject {
                 guard let self, self.loadGeneration == gen, !self.isSeeking else { return }
                 let sec = CMTimeGetSeconds(time)
                 if sec.isFinite && sec >= 0 {
+                    if self.lastObservedMediaPosition < 0 || abs(sec - self.lastObservedMediaPosition) > 0.05 {
+                        self.lastObservedMediaPosition = sec
+                        if self.avPlayer?.timeControlStatus == .playing || sec > 0.05 {
+                            self.cancelBufferWatchdog()
+                        }
+                    }
                     self.position = sec
                     self.syncNowPlayingLyricsIfNeeded(at: sec)
                 }
@@ -1828,6 +2281,7 @@ public final class PlayerEngine: ObservableObject {
                 }
                 if self.isLoading && (sec > 0.05 || self.avPlayer?.timeControlStatus == .playing || !self.isPlaying) {
                     self.isLoading = false
+                    self.cancelBufferWatchdog()
                 }
                 if self.duration > 0 && (self.duration - sec <= 35 || sec >= 5 && self.duration <= 25) {
                     self.maybePrefetchNextTrack()
@@ -1846,6 +2300,7 @@ public final class PlayerEngine: ObservableObject {
                 if self.isPlaying {
                     self.isLoading = true
                     self.avPlayer?.play()
+                    armWatchdog()
                 }
             }
         }
@@ -1867,23 +2322,29 @@ public final class PlayerEngine: ObservableObject {
         ) { [weak self] note in
             Task { @MainActor in
                 guard let self, self.loadGeneration == gen else { return }
-                if !usedProxy && !forceProxy && !url.isFileURL && !isHLS {
+                if !usedProxy && !forceProxy && !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") {
+                    let resumeSeek = self.position > 0.5 ? self.position : initialSeek
+                    let keepPlaying = autoPlay || self.isPlaying
                     self.cleanupAVPlayer()
+                    self.isLoading = keepPlaying
+                    self.isPlaying = keepPlaying
                     await self.startAVPlayer(
                         with: stream,
                         track: track,
                         quality: quality,
-                        autoPlay: autoPlay,
-                        initialSeek: initialSeek,
+                        autoPlay: keepPlaying,
+                        initialSeek: resumeSeek,
                         gen: gen,
                         forceProxy: true
                     )
                     return
                 }
+                self.cleanupAVPlayer()
                 self.isLoading = false
                 self.isPlaying = false
                 let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
                 self.errorMessage = err?.localizedDescription ?? I18n.t("Couldn't play this song")
+                self.updateNowPlayingCenter()
             }
         }
 
@@ -1896,6 +2357,9 @@ public final class PlayerEngine: ObservableObject {
             player.play()
             isPlaying = true
             isLoading = player.timeControlStatus != .playing
+            if isLoading {
+                armWatchdog()
+            }
             if fadeEnabledProvider?() == true && currentFadeMultiplier < 0.99 {
                 fadeTask?.cancel()
                 fadeTask = Task { [weak self] in
@@ -1907,6 +2371,109 @@ public final class PlayerEngine: ObservableObject {
         }
         updateNowPlayingCenter()
         maybePrefetchRadio()
+    }
+
+    private func cancelBufferWatchdog() {
+        bufferWatchdogTask?.cancel()
+        bufferWatchdogTask = nil
+    }
+
+    private func scheduleBufferWatchdog(
+        with stream: StreamInfo,
+        track: Track?,
+        quality: String,
+        initialSeek: TimeInterval,
+        gen: Int,
+        url: URL,
+        isHLS: Bool,
+        usedProxy: Bool,
+        forceProxy: Bool
+    ) {
+        bufferWatchdogTask?.cancel()
+        guard isPlaying, isLoading, loadGeneration == gen else {
+            bufferWatchdogTask = nil
+            return
+        }
+        let canFallbackToProxy = !usedProxy && !forceProxy && !url.isFileURL && !isHLS
+            && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https")
+        let timeoutSec = canFallbackToProxy ? max(0.05, directBufferTimeoutSeconds) : max(0.05, proxyBufferTimeoutSeconds)
+        let baselinePos = max(0, position)
+
+        bufferWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeoutSec * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.handleBufferWatchdogTimeout(
+                baselinePosition: baselinePos,
+                with: stream,
+                track: track,
+                quality: quality,
+                initialSeek: initialSeek,
+                gen: gen,
+                url: url,
+                isHLS: isHLS,
+                usedProxy: usedProxy,
+                forceProxy: forceProxy
+            )
+        }
+    }
+
+    private func handleBufferWatchdogTimeout(
+        baselinePosition: TimeInterval,
+        with stream: StreamInfo,
+        track: Track?,
+        quality: String,
+        initialSeek: TimeInterval,
+        gen: Int,
+        url: URL,
+        isHLS: Bool,
+        usedProxy: Bool,
+        forceProxy: Bool
+    ) async {
+        guard loadGeneration == gen, isPlaying, isLoading else { return }
+        if avPlayer?.timeControlStatus == .playing && (position - baselinePosition) > 0.15 {
+            isLoading = false
+            return
+        }
+        if (position - baselinePosition) > 0.25 {
+            scheduleBufferWatchdog(
+                with: stream,
+                track: track,
+                quality: quality,
+                initialSeek: initialSeek,
+                gen: gen,
+                url: url,
+                isHLS: isHLS,
+                usedProxy: usedProxy,
+                forceProxy: forceProxy
+            )
+            return
+        }
+
+        let canFallbackToProxy = !usedProxy && !forceProxy && !url.isFileURL && !isHLS
+            && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https")
+        if canFallbackToProxy {
+            let resumeSeek = position > 0.5 ? position : initialSeek
+            cleanupAVPlayer()
+            isLoading = true
+            isPlaying = true
+            errorMessage = nil
+            await startAVPlayer(
+                with: stream,
+                track: track,
+                quality: quality,
+                autoPlay: true,
+                initialSeek: resumeSeek,
+                gen: gen,
+                forceProxy: true
+            )
+            return
+        }
+
+        cleanupAVPlayer()
+        isLoading = false
+        isPlaying = false
+        errorMessage = I18n.t("Playback timed out while buffering. Please try again.")
+        updateNowPlayingCenter()
     }
 
     /// 当当前曲目即将结束时提前解析下一首流地址，实现无缝切歌
@@ -1946,13 +2513,14 @@ public final class PlayerEngine: ObservableObject {
             resume()
             return
         }
-        if currentOrderIndex + 1 >= order.count {
+        if findPlayableOrderIndex(startingAt: currentOrderIndex + 1, step: 1, wrapAround: false) == nil {
             if radioFeed != nil {
                 Task { await appendRadioTracksAndAdvance() }
                 return
             }
             if repeatMode == .off {
                 isPlaying = false
+                isLoading = false
                 updateNowPlayingCenter()
                 return
             }
@@ -1998,15 +2566,19 @@ public final class PlayerEngine: ObservableObject {
             return
         }
         let startIdx = queue.count
+        let oldOrderCount = order.count
         queue.append(contentsOf: more)
         for i in 0..<more.count {
             order.append(startIdx + i)
         }
-        loadTrack(atOrderIndex: currentOrderIndex + 1, autoPlay: true)
+        let targetIdx = findPlayableOrderIndex(startingAt: oldOrderCount, step: 1, wrapAround: false) ?? oldOrderCount
+        loadTrack(atOrderIndex: targetIdx, autoPlay: true)
     }
 
     private func cleanupAVPlayer() {
         isSeeking = false
+        lastObservedMediaPosition = -1
+        cancelBufferWatchdog()
         fadeTask?.cancel()
         fadeTask = nil
         currentFadeMultiplier = 1.0
@@ -2039,6 +2611,14 @@ public final class PlayerEngine: ObservableObject {
         activeStreamProxy?.invalidate()
         activeStreamProxy = nil
         audioBandMeter = nil
+        spectrumAnalysisTask?.cancel()
+        spectrumAnalysisTask = nil
+        backgroundCacheTask?.cancel()
+        backgroundCacheTask = nil
+        activeSpectrumTimeline = nil
+        rhythmSmoothedState = .idle
+        lastRhythmSampleTimestamp = 0
+        tapBassMovingMean = 0.15
         audioBands = [0.12, 0.12, 0.12, 0.12, 0.12]
     }
 
@@ -2258,8 +2838,148 @@ public final class PlayerEngine: ObservableObject {
     }
     #endif
 
+    /// 返回当前最高精度的媒体播放时间点（播放态直接采样 AVPlayer 硬件音频时钟，消除 30fps 定时器的阶梯延迟）
+    public func livePlaybackPosition() -> TimeInterval {
+        guard !isSeeking,
+              isPlaying,
+              !isLoading,
+              let player = avPlayer,
+              player.timeControlStatus == .playing else {
+            return position
+        }
+        let sec = CMTimeGetSeconds(player.currentTime())
+        guard sec.isFinite, sec >= 0 else { return position }
+        if duration > 0 {
+            return min(sec, duration)
+        }
+        return sec
+    }
+
+    /// 60fps 零阻塞采样本时刻的音乐频谱与重低音脉冲状态
+    /// 优先级：1. 全曲预扫描真实 FFT 频谱表；2. 实时音频 Tap；3. 基于歌词起音与拍速的智能节拍兜底
+    public func sampleAudioRhythm(
+        at pos: TimeInterval,
+        lines: [LyricLine]? = nil,
+        isScrubbing: Bool = false
+    ) -> AudioRhythmState {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastRhythmSampleTimestamp > 0 ? max(1.0 / 240.0, now - lastRhythmSampleTimestamp) : (1.0 / 60.0)
+        lastRhythmSampleTimestamp = now
+
+        let active = (isPlaying && !isLoading) || isScrubbing
+        guard active else {
+            rhythmSmoothedState = AudioRhythmState.idle.smoothed(from: rhythmSmoothedState, dt: dt)
+            return rhythmSmoothedState
+        }
+
+        let target: AudioRhythmState
+        if let timelineSample = activeSpectrumTimeline?.sample(at: pos) {
+            target = timelineSample
+        } else if !isScrubbing, let meter = audioBandMeter {
+            let b = meter.readBands()
+            let b0 = b.count > 0 ? Double(b[0]) : 0.12
+            let b1 = b.count > 1 ? Double(b[1]) : 0.12
+            let b2 = b.count > 2 ? Double(b[2]) : 0.12
+            let b3 = b.count > 3 ? Double(b[3]) : 0.12
+            let b4 = b.count > 4 ? Double(b[4]) : 0.12
+            let bass = min(1.0, b0 * 0.62 + b1 * 0.38)
+            let flux = max(0.0, bass - tapBassMovingMean * 1.12)
+            let beatPulse = min(1.0, flux * 4.2)
+            tapBassMovingMean = tapBassMovingMean * 0.86 + bass * 0.14
+            target = AudioRhythmState(
+                bands: b,
+                bass: bass,
+                vocal: min(1.0, b2 * 0.68 + b3 * 0.32),
+                treble: min(1.0, b3 * 0.35 + b4 * 0.65),
+                energy: min(1.0, b0 * 0.25 + b1 * 0.22 + b2 * 0.28 + b3 * 0.15 + b4 * 0.10),
+                beatPulse: beatPulse,
+                isRealAudio: true
+            )
+        } else {
+            target = StageMath.lyricRhythm(at: pos, lines: lines ?? lyrics, isPlaying: active)
+        }
+
+        if isScrubbing {
+            // 拖动预览时跳过慢衰减直接锁死瞬间节拍，让音画与拖动丝滑贴合
+            rhythmSmoothedState = target
+        } else {
+            rhythmSmoothedState = target.smoothed(from: rhythmSmoothedState, dt: dt)
+        }
+        return rhythmSmoothedState
+    }
+
+    private func startSpectrumTimelineAnalysis(forFile fileURL: URL, gen: Int) {
+        spectrumAnalysisTask?.cancel()
+        let timeline = AudioSpectrumTimeline()
+        self.activeSpectrumTimeline = timeline
+        spectrumAnalysisTask = Task { [weak self] in
+            await timeline.populate(from: fileURL) {
+                Task.isCancelled
+            }
+            guard !Task.isCancelled else { return }
+            _ = self?.loadGeneration == gen
+        }
+    }
+
+    /// 对直连首播的在线曲目，后台轻量预存磁盘缓存以热解锁全曲真实 FFT 频谱与离线二次秒开（限 38MB 内单曲，零阻塞播放器）
+    private func scheduleDirectStreamBackgroundCache(
+        url: URL,
+        stream: StreamInfo,
+        cacheKey: String,
+        gen: Int
+    ) {
+        guard diskCache.limitMB > 0, backgroundCacheTask == nil else { return }
+        let headers = Self.directAssetHTTPHeaders(for: stream)
+        let ext = AudioStreamProxy.knownFileExtension(streamType: stream.type, url: url) ?? "mp3"
+        let hintType = stream.type
+        let maxBytes: Int64 = 38 * 1024 * 1024
+        let cfg = proxySessionConfiguration
+
+        backgroundCacheTask = Task.detached(priority: .background) { [weak self] in
+            // 稍让出首播 0.8s 的网络带宽给 AVPlayer 缓冲首块内容
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 45)
+            for (k, v) in headers {
+                request.setValue(v, forHTTPHeaderField: k)
+            }
+            let sessionCfg = cfg ?? URLSessionConfiguration.ephemeral
+            let session = URLSession(configuration: sessionCfg)
+            defer { session.invalidateAndCancel() }
+
+            do {
+                let (tmpLocalURL, response) = try await session.download(for: request)
+                defer { try? FileManager.default.removeItem(at: tmpLocalURL) }
+                guard !Task.isCancelled,
+                      let http = response as? HTTPURLResponse,
+                      (200..<300).contains(http.statusCode) else {
+                    return
+                }
+                let attrs = try FileManager.default.attributesOfItem(atPath: tmpLocalURL.path)
+                let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+                guard size > 8192, size <= maxBytes else { return }
+
+                guard let self else { return }
+                let storedURL = try self.diskCache.store(
+                    tempFileURL: tmpLocalURL,
+                    key: cacheKey,
+                    fileExtension: ext,
+                    contentType: hintType ?? http.mimeType
+                )
+                guard storedURL != tmpLocalURL, !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.loadGeneration == gen else { return }
+                    self.startSpectrumTimelineAnalysis(forFile: storedURL, gen: gen)
+                }
+            } catch {
+                // 静默忽略后台增强缓存失败，不影响正常播放
+            }
+        }
+    }
+
     private func startBandUpdateTimer() {
-        bandTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] _ in
+        bandTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.tickAudioBands()
             }
@@ -2272,24 +2992,7 @@ public final class PlayerEngine: ObservableObject {
             if audioBands != idleBands { audioBands = idleBands }
             return
         }
-        let target: [Float]
-        if let meter = audioBandMeter {
-            target = meter.readBands()
-        } else {
-            // 在线流未挂载 MTAudioProcessingTap 时使用平滑律动估计，避免阻塞 CoreMedia 音频管线
-            syntheticBandPhase += 0.35
-            let p = syntheticBandPhase
-            var synthetic: [Float] = []
-            synthetic.reserveCapacity(Self.bandCount)
-            for idx in 0..<Self.bandCount {
-                let freq = 1.0 + Double(idx) * 0.27
-                let wave = 0.5 + 0.5 * sin(p * freq + Double(idx) * 1.1)
-                synthetic.append(Float(0.18 + 0.55 * wave))
-            }
-            target = synthetic
-        }
-        audioBands = zip(audioBands, target).map { current, next in
-            current + (next - current) * 0.42
-        }
+        let rhythm = sampleAudioRhythm(at: livePlaybackPosition())
+        audioBands = rhythm.bands
     }
 }

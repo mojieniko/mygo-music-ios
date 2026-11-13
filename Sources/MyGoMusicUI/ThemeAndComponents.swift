@@ -4,10 +4,16 @@
 #if canImport(MyGoMusicCore)
 import MyGoMusicCore
 #endif
+#if canImport(AVFoundation)
+import AVFoundation
+#endif
 import AVKit
 import CoreImage
 import CryptoKit
 import ImageIO
+#if canImport(MediaPlayer)
+import MediaPlayer
+#endif
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -257,6 +263,53 @@ public enum MyGoTheme {
         guard seconds.isFinite && seconds > 0 else { return "0:00" }
         let total = Int(seconds.rounded())
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    /// 跨平台线性混合两种颜色（对应 Go ui.Color.Mix）
+    public static func mix(_ base: Color, with other: Color, ratio: CGFloat) -> Color {
+        let t = min(max(ratio, 0), 1)
+        let a = rgbaComponents(of: base)
+        let b = rgbaComponents(of: other)
+        return Color(
+            red: Double(a.r + (b.r - a.r) * t),
+            green: Double(a.g + (b.g - a.g) * t),
+            blue: Double(a.b + (b.b - a.b) * t),
+            opacity: Double(a.a + (b.a - a.a) * t)
+        )
+    }
+
+    /// 提取并在深雾背景下提亮专辑主色，极低饱和度封面自动转为清透银暖高光
+    public static func brightenAccentColor(_ base: Color) -> Color {
+        #if canImport(UIKit)
+        let ui = UIColor(base)
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        if ui.getHue(&h, saturation: &s, brightness: &b, alpha: &a) {
+            let targetSat: CGFloat = s < 0.14 ? 0.10 : min(max(s * 1.15, 0.50), 0.88)
+            let targetBri: CGFloat = min(max(b * 1.25, 0.84), 0.98)
+            return Color(hue: Double(h), saturation: Double(targetSat), brightness: Double(targetBri))
+        }
+        #elseif canImport(AppKit)
+        if let ns = NSColor(base).usingColorSpace(.deviceRGB) {
+            var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            ns.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+            let targetSat: CGFloat = s < 0.14 ? 0.10 : min(max(s * 1.15, 0.50), 0.88)
+            let targetBri: CGFloat = min(max(b * 1.25, 0.84), 0.98)
+            return Color(hue: Double(h), saturation: Double(targetSat), brightness: Double(targetBri))
+        }
+        #endif
+        return base
+    }
+
+    private static func rgbaComponents(of color: Color) -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) {
+        var r: CGFloat = 1, g: CGFloat = 1, b: CGFloat = 1, a: CGFloat = 1
+        #if canImport(UIKit)
+        UIColor(color).getRed(&r, green: &g, blue: &b, alpha: &a)
+        #elseif canImport(AppKit)
+        if let rgb = NSColor(color).usingColorSpace(.deviceRGB) {
+            rgb.getRed(&r, green: &g, blue: &b, alpha: &a)
+        }
+        #endif
+        return (r, g, b, a)
     }
 }
 
@@ -528,10 +581,25 @@ public struct TrackRowView: View {
             .onTapGesture(perform: onPlay)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(track.name)
-                    .font(.system(size: 15, weight: isCurrent ? .bold : .medium))
-                    .foregroundStyle(isCurrent ? MyGoTheme.accent : .primary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(track.name)
+                        .font(.system(size: 15, weight: isCurrent ? .bold : .medium))
+                        .foregroundStyle(isCurrent ? MyGoTheme.accent : .primary)
+                        .lineLimit(1)
+
+                    if track.unavailable == true {
+                        Text(I18n.t("VIP / No Rights"))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(.primary.opacity(0.08))
+                            )
+                            .fixedSize()
+                    }
+                }
 
                 HStack(spacing: 4) {
                     if !track.artistNames.isEmpty {
@@ -733,5 +801,264 @@ private struct AppKitRoutePickerRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
+}
+#endif
+
+// MARK: - iOS 系统硬件音量双向实时同步
+
+/// 监听并同步 iOS 系统硬件音量（实体音量键、控制中心、蓝牙路由切换）与播放器底部滑块
+@MainActor
+public final class SystemVolumeObserver: ObservableObject {
+    @Published public private(set) var volume: Double
+    @Published public private(set) var isDragging: Bool = false
+
+    private let readSystemVolumeImpl: (() -> Double)?
+    private let writeSystemVolumeImpl: ((Double) -> Void)?
+    private var hardwareWriter: ((Double) -> Void)?
+    private var lastNonZeroVolume: Double
+    private var lastUserWriteAt: Date = .distantPast
+    private var dragUnlockTask: Task<Void, Never>?
+    private var isObserving: Bool = false
+    private let observationBag = ObservationBag()
+
+    /// 脱离 MainActor 隔离的观察令牌持有器，便于 deinit 安全释放
+    private final class ObservationBag: @unchecked Sendable {
+        var volumeObservation: NSKeyValueObservation?
+        var notificationTokens: [NSObjectProtocol] = []
+
+        func clear() {
+            volumeObservation?.invalidate()
+            volumeObservation = nil
+            for token in notificationTokens {
+                NotificationCenter.default.removeObserver(token)
+            }
+            notificationTokens.removeAll()
+        }
+
+        deinit {
+            clear()
+        }
+    }
+
+    public init(
+        initialVolume: Double? = nil,
+        readSystemVolume: (() -> Double)? = nil,
+        writeSystemVolume: ((Double) -> Void)? = nil,
+        autoStart: Bool = true
+    ) {
+        self.readSystemVolumeImpl = readSystemVolume
+        self.writeSystemVolumeImpl = writeSystemVolume
+
+        let initial = Self.clamp(initialVolume ?? readSystemVolume?() ?? Self.readDeviceOutputVolume() ?? 0.8)
+        self.volume = initial
+        self.lastNonZeroVolume = initial > 0.01 ? initial : 0.5
+
+        if autoStart {
+            startObserving()
+        }
+    }
+
+    /// 开始监听系统音频会话音量及音频路由变化
+    public func startObserving() {
+        refreshFromSystem(force: true)
+        guard !isObserving else { return }
+        isObserving = true
+
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        if !session.isOtherAudioPlaying {
+            if session.category != .playback {
+                try? session.setCategory(.playback, mode: .default, options: [])
+            }
+            // 提前激活音频会话，确保尚未点击播放前按硬件音量键也能触发 outputVolume KVO
+            try? session.setActive(true)
+        }
+        observationBag.volumeObservation = session.observe(\.outputVolume, options: [.initial, .new]) { [weak self] session, change in
+            let latest = Double(change.newValue ?? session.outputVolume)
+            Task { @MainActor [weak self] in
+                self?.receiveExternalVolumeUpdate(latest)
+            }
+        }
+
+        let routeToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] _ in
+            let latest = Double(AVAudioSession.sharedInstance().outputVolume)
+            Task { @MainActor [weak self] in
+                self?.receiveExternalVolumeUpdate(latest)
+            }
+        }
+        observationBag.notificationTokens.append(routeToken)
+        #endif
+
+        #if canImport(UIKit)
+        let activeToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshFromSystem(force: false)
+            }
+        }
+        observationBag.notificationTokens.append(activeToken)
+        #endif
+    }
+
+    /// 停止监听系统音量与异步对齐任务
+    public func stopObserving() {
+        dragUnlockTask?.cancel()
+        dragUnlockTask = nil
+        observationBag.clear()
+        isObserving = false
+    }
+
+    /// 绑定底层硬件音量写入句柄（由隐藏挂载的 MPVolumeView 注入）
+    public func registerHardwareWriter(_ writer: @escaping (Double) -> Void) {
+        self.hardwareWriter = writer
+    }
+
+    /// 标记用户开始拖动音量滑块，暂停外部 KVO 反向覆盖
+    public func beginDragging() {
+        dragUnlockTask?.cancel()
+        dragUnlockTask = nil
+        isDragging = true
+    }
+
+    /// 由 App 内滑块写入新音量并实时下发到系统硬件
+    public func setUserVolume(_ rawValue: Double) {
+        let clamped = Self.clamp(rawValue)
+        if clamped > 0.01 {
+            lastNonZeroVolume = clamped
+        }
+        volume = clamped
+        lastUserWriteAt = Date()
+
+        if let writeSystemVolumeImpl {
+            writeSystemVolumeImpl(clamped)
+        } else {
+            hardwareWriter?(clamped)
+        }
+    }
+
+    /// 用户松手后延迟一小段时间再解除拖动锁并与硬件步进结果对齐，避免回弹抖动
+    public func endDragging(unlockDelayNanoseconds: UInt64 = 280_000_000) {
+        dragUnlockTask?.cancel()
+        dragUnlockTask = Task { @MainActor [weak self] in
+            if unlockDelayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: unlockDelayNanoseconds)
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.isDragging = false
+            self.refreshFromSystem(force: true)
+        }
+    }
+
+    /// 一键静音或恢复静音前音量，并同步到系统音量
+    public func toggleMute() {
+        beginDragging()
+        if volume <= 0.005 {
+            let restoreTarget = lastNonZeroVolume > 0.05 ? lastNonZeroVolume : 0.5
+            setUserVolume(restoreTarget)
+        } else {
+            lastNonZeroVolume = volume
+            setUserVolume(0)
+        }
+        endDragging()
+    }
+
+    /// 主动从系统读取当前真实输出音量；force 为 true 时在非拖动态直接对齐
+    public func refreshFromSystem(force: Bool = false) {
+        guard let current = readSystemVolumeImpl?() ?? Self.readDeviceOutputVolume() else { return }
+        if force {
+            guard !isDragging else { return }
+            let clamped = Self.clamp(current)
+            if abs(clamped - volume) > 0.002 {
+                volume = clamped
+                if clamped > 0.01 {
+                    lastNonZeroVolume = clamped
+                }
+            }
+        } else {
+            receiveExternalVolumeUpdate(current)
+        }
+    }
+
+    /// 处理由硬件按键、控制中心或输出路由切换推送来的系统音量变更
+    public func receiveExternalVolumeUpdate(_ rawValue: Double) {
+        let clamped = Self.clamp(rawValue)
+        guard !isDragging else { return }
+        // 刚刚主动拖动或点静音后的短窗口内忽略自身产生的 KVO 回波，避免滑块来回跳动
+        guard Date().timeIntervalSince(lastUserWriteAt) >= 0.28 else { return }
+        if abs(clamped - volume) > 0.002 {
+            volume = clamped
+            if clamped > 0.01 {
+                lastNonZeroVolume = clamped
+            }
+        }
+    }
+
+    private static func clamp(_ value: Double) -> Double {
+        guard value.isFinite else { return 0.5 }
+        return min(max(value, 0.0), 1.0)
+    }
+
+    private static func readDeviceOutputVolume() -> Double? {
+        #if os(iOS)
+        return Double(AVAudioSession.sharedInstance().outputVolume)
+        #else
+        return nil
+        #endif
+    }
+}
+
+#if os(iOS) && canImport(UIKit) && canImport(MediaPlayer)
+/// 隐蔽挂载原生态 MPVolumeView（必须可见且在窗口层级中，才能合法驱动真机硬件音量）
+public struct SystemVolumeHardwareHostView: UIViewRepresentable {
+    @ObservedObject var observer: SystemVolumeObserver
+
+    public init(observer: SystemVolumeObserver) {
+        self.observer = observer
+    }
+
+    public func makeUIView(context: Context) -> MPVolumeView {
+        let volumeView = MPVolumeView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        volumeView.showsVolumeSlider = true
+        volumeView.clipsToBounds = true
+        volumeView.isUserInteractionEnabled = false
+        bindHardwareWriter(on: volumeView)
+        return volumeView
+    }
+
+    public func updateUIView(_ uiView: MPVolumeView, context: Context) {
+        bindHardwareWriter(on: uiView)
+    }
+
+    private func bindHardwareWriter(on volumeView: MPVolumeView) {
+        observer.registerHardwareWriter { [weak volumeView] target in
+            guard let volumeView,
+                  let slider = Self.findVolumeSlider(in: volumeView)
+            else { return }
+            let clamped = Float(min(max(target, 0.0), 1.0))
+            if abs(slider.value - clamped) > 0.001 || clamped == 0 || clamped == 1 {
+                slider.setValue(clamped, animated: false)
+                slider.sendActions(for: .valueChanged)
+            }
+        }
+    }
+
+    private static func findVolumeSlider(in view: UIView) -> UISlider? {
+        if let slider = view as? UISlider {
+            return slider
+        }
+        for subview in view.subviews {
+            if let found = findVolumeSlider(in: subview) {
+                return found
+            }
+        }
+        return nil
+    }
 }
 #endif

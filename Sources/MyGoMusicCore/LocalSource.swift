@@ -62,15 +62,28 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         try? FileManager.default.createDirectory(at: defaultMusicFolder, withIntermediateDirectories: true)
 
         let libFile = dataDir.appendingPathComponent("library.json")
+        var didMigrate = false
         if let data = try? Data(contentsOf: libFile),
            let decoded = try? JSONDecoder().decode(LocalLibraryPersistence.self, from: data) {
-            self.lib = decoded
+            let (normalized, changed) = Self.normalizePersistence(
+                decoded,
+                defaultMusicFolder: defaultMusicFolder,
+                dataDir: dataDir
+            )
+            self.lib = normalized
+            didMigrate = changed
         } else {
             self.lib = LocalLibraryPersistence(folders: [defaultMusicFolder.path])
         }
 
         if !self.lib.folders.contains(defaultMusicFolder.path) {
             self.lib.folders.insert(defaultMusicFolder.path, at: 0)
+            didMigrate = true
+        }
+        if didMigrate {
+            lock.lock()
+            saveLibraryLocked()
+            lock.unlock()
         }
         rebuildCatalogSynchronously()
         let task = Task.detached(priority: .utility) { [weak self] in
@@ -727,19 +740,21 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         let likedSet = withLock { Set(lib.likes) }
         var out: [String: Bool] = [:]
         for id in ids {
-            out[id] = likedSet.contains(id)
+            let relocated = Self.relocateSandboxPath(id, to: dataDir)
+            out[id] = likedSet.contains(id) || likedSet.contains(relocated)
         }
         return out
     }
 
     public func like(id: String, on: Bool) async throws {
+        let canonical = Self.relocateSandboxPath(id, to: dataDir)
         withLock {
             if on {
-                if !lib.likes.contains(id) {
-                    lib.likes.insert(id, at: 0)
+                if !lib.likes.contains(canonical) {
+                    lib.likes.insert(canonical, at: 0)
                 }
             } else {
-                lib.likes.removeAll { $0 == id }
+                lib.likes.removeAll { $0 == canonical || $0 == id }
             }
             saveLibraryLocked()
         }
@@ -879,10 +894,11 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     }
 
     public func lyrics(id: String) async throws -> RawLyrics {
-        let exists = withLock { tracksByID[id] != nil }
-        guard exists else { throw SourceError.unavailable("no track \(id)") }
+        guard let resolvedID = withLock({ resolveTrackIDLocked(id) }) else {
+            throw SourceError.unavailable("no track \(id)")
+        }
 
-        let audioURL = URL(fileURLWithPath: id)
+        let audioURL = URL(fileURLWithPath: resolvedID)
         // 1. 优先同名 .lrc（支持 GBK/GB18030/UTF-8/UTF-16 自动编码识别）
         let lrcURL = audioURL.deletingPathExtension().appendingPathExtension("lrc")
         if let lrcData = try? Data(contentsOf: lrcURL),
@@ -925,11 +941,10 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     }
 
     public func stream(id: String, quality: String) async throws -> StreamInfo {
-        let exists = withLock { tracksByID[id] != nil }
-        guard exists, FileManager.default.fileExists(atPath: id) else {
+        guard let resolvedID = withLock({ resolveTrackIDLocked(id) }) else {
             throw SourceError.unavailable("no track \(id)")
         }
-        let fileURL = URL(fileURLWithPath: id)
+        let fileURL = URL(fileURLWithPath: resolvedID)
         let ext = fileURL.pathExtension.lowercased()
         let q = (ext == "flac" || ext == "wav") ? "lossless" : ""
         return StreamInfo(url: fileURL.absoluteString, type: ext, quality: q)
@@ -938,14 +953,99 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     public func played(track: Track) async {
         guard !track.id.isEmpty else { return }
         withLock {
-            lib.recent.removeAll { $0 == track.id }
-            lib.recent.insert(track.id, at: 0)
+            let canonicalID = resolveTrackIDLocked(track.id) ?? Self.relocateSandboxPath(track.id, to: dataDir)
+            lib.recent.removeAll { $0 == canonicalID || $0 == track.id }
+            lib.recent.insert(canonicalID, at: 0)
             if lib.recent.count > Self.keepRecent {
                 lib.recent = Array(lib.recent.prefix(Self.keepRecent))
             }
             saveLibraryLocked()
         }
         onChange?()
+    }
+
+    // MARK: - iOS 沙盒容器重装/更新路径迁移适配
+
+    private static let sandboxLocalMarker = "/Library/Application Support/MyGoMusic/local/"
+    private static let sandboxMusicFilesMarker = "/local/MusicFiles/"
+
+    /// 将历史 iOS 容器 UUID 下的本地音频/目录路径自动重写到当前有效沙盒目录
+    private static func relocateSandboxPath(_ rawPath: String, to currentDataDir: URL) -> String {
+        if let range = rawPath.range(of: sandboxLocalMarker) {
+            let tail = String(rawPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return tail.isEmpty ? currentDataDir.path : currentDataDir.appendingPathComponent(tail).path
+        }
+        if !FileManager.default.fileExists(atPath: rawPath),
+           let range = rawPath.range(of: sandboxMusicFilesMarker) {
+            let tail = String(rawPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let base = currentDataDir.appendingPathComponent("MusicFiles", isDirectory: true)
+            return tail.isEmpty ? base.path : base.appendingPathComponent(tail).path
+        }
+        return rawPath
+    }
+
+    private static func deduplicatedPreservingOrder(_ items: [String]) -> [String] {
+        var seen: Set<String> = []
+        var out: [String] = []
+        out.reserveCapacity(items.count)
+        for item in items where !item.isEmpty && seen.insert(item).inserted {
+            out.append(item)
+        }
+        return out
+    }
+
+    private static func normalizePersistence(
+        _ raw: LocalLibraryPersistence,
+        defaultMusicFolder: URL,
+        dataDir: URL
+    ) -> (LocalLibraryPersistence, Bool) {
+        let fm = FileManager.default
+        let migratedFolders = raw.folders.compactMap { folder -> String? in
+            let relocated = relocateSandboxPath(folder, to: dataDir)
+            // 清理因老版本重装累加且已失效的历史沙盒 MusicFiles 路径，保留用户自选外置目录
+            if relocated != defaultMusicFolder.path,
+               relocated.contains("/MusicFiles"),
+               !fm.fileExists(atPath: relocated) {
+                return nil
+            }
+            return relocated
+        }
+        let folders = deduplicatedPreservingOrder(migratedFolders)
+        let likes = deduplicatedPreservingOrder(raw.likes.map { relocateSandboxPath($0, to: dataDir) })
+        let recent = deduplicatedPreservingOrder(raw.recent.map { relocateSandboxPath($0, to: dataDir) })
+        let playlists = raw.playlists.map { pl in
+            StoredPlaylist(
+                id: pl.id,
+                name: pl.name,
+                tracks: deduplicatedPreservingOrder(pl.tracks.map { relocateSandboxPath($0, to: dataDir) })
+            )
+        }
+        let changed = folders != raw.folders
+            || likes != raw.likes
+            || recent != raw.recent
+            || playlists.map(\.tracks) != raw.playlists.map(\.tracks)
+        return (
+            LocalLibraryPersistence(folders: folders, likes: likes, recent: recent, playlists: playlists),
+            changed
+        )
+    }
+
+    private func resolveTrackIDLocked(_ rawID: String) -> String? {
+        let fm = FileManager.default
+        if tracksByID[rawID] != nil && fm.fileExists(atPath: rawID) {
+            return rawID
+        }
+        let relocated = Self.relocateSandboxPath(rawID, to: dataDir)
+        if tracksByID[relocated] != nil && fm.fileExists(atPath: relocated) {
+            return relocated
+        }
+        if fm.fileExists(atPath: relocated) {
+            let ext = URL(fileURLWithPath: relocated).pathExtension.lowercased()
+            if Self.supportedExtensions.contains(ext) {
+                return relocated
+            }
+        }
+        return nil
     }
 
     public func remotePlay(ids: [String], start: Int, position: Int64) async throws { throw SourceError.unsupported("remotePlay") }
