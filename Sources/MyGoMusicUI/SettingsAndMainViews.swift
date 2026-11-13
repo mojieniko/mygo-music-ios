@@ -62,6 +62,15 @@ public struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+
+                    Toggle(isOn: $app.settings.lockScreenLyrics) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(I18n.t("Lock Screen Lyrics"))
+                            Text(I18n.t("Show the active lyric line in the Lock Screen media title while playing"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 // 3. 律动舞台与视觉实验（对应 Experiments / Stage）
@@ -473,11 +482,17 @@ private struct PluginSourceRowView: View {
                             .font(.system(size: 11.5, weight: .medium))
                             .foregroundStyle(.orange)
                         Spacer()
-                        Button(I18n.t("Grant Permission")) {
+                        Button {
                             app.grantProcessPermission(for: info.id)
+                        } label: {
+                            Text(I18n.t("Grant Permission"))
+                                .font(.system(size: 11.5, weight: .bold))
+                                .foregroundStyle(MyGoTheme.accent)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(MyGoTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                         }
-                        .font(.system(size: 11.5, weight: .bold))
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderless)
                     }
                 }
             }
@@ -509,11 +524,17 @@ private struct PluginSourceRowView: View {
                         }
                         Spacer()
                         if source.can("signOut") {
-                            Button(I18n.t("Sign Out"), role: .destructive) {
+                            Button(role: .destructive) {
                                 Task { await app.signOut(ofSourceID: info.id) }
+                            } label: {
+                                Text(I18n.t("Sign Out"))
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(.red)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                             }
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .buttonStyle(.bordered)
+                            .buttonStyle(.borderless)
                         }
                     } else {
                         Image(systemName: "person.crop.circle")
@@ -710,18 +731,29 @@ private struct PluginSettingFieldRow: View {
 
             if value != savedValue {
                 HStack(spacing: 8) {
-                    Button(I18n.t("Save changes")) {
+                    Button {
                         saveValue(value)
+                    } label: {
+                        Text(I18n.t("Save changes"))
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(MyGoTheme.accent, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
-                    .font(.system(size: 12, weight: .bold))
-                    .buttonStyle(.borderedProminent)
-                    .tint(MyGoTheme.accent)
+                    .buttonStyle(.borderless)
 
-                    Button(I18n.t("Discard changes")) {
+                    Button {
                         value = savedValue
+                    } label: {
+                        Text(I18n.t("Discard changes"))
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
-                    .font(.system(size: 12, weight: .medium))
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.borderless)
                 }
             }
         }

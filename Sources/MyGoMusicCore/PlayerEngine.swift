@@ -470,10 +470,12 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
     private var isInvalidated = false
 
     private final class TransferContext {
+        let lock = NSLock()
         let loadingRequest: AVAssetResourceLoadingRequest
         let requestedOffset: Int64
         let requestedLength: Int64
         let requestsAllToEnd: Bool
+        let isInfoOnlyProbe: Bool
 
         var statusCode: Int = 200
         var streamStartOffset: Int64 = 0
@@ -492,13 +494,24 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
 
         init(loadingRequest: AVAssetResourceLoadingRequest, canCache: Bool) {
             self.loadingRequest = loadingRequest
-            let reqOffset = loadingRequest.dataRequest?.requestedOffset ?? 0
-            let curOffset = loadingRequest.dataRequest?.currentOffset ?? reqOffset
-            self.requestedOffset = max(reqOffset, curOffset)
-            self.requestedLength = Int64(loadingRequest.dataRequest?.requestedLength ?? 0)
-            self.requestsAllToEnd = loadingRequest.dataRequest?.requestsAllDataToEndOfResource ?? false
-            self.respondedUpToOffset = self.requestedOffset
-            self.shouldWriteCache = canCache && self.requestedOffset == 0 && (self.requestsAllToEnd || self.requestedLength > 65536)
+            if let dataReq = loadingRequest.dataRequest {
+                let reqOffset = dataReq.requestedOffset
+                let curOffset = max(reqOffset, dataReq.currentOffset)
+                let reqEnd = reqOffset + Int64(max(0, dataReq.requestedLength))
+                self.requestedOffset = curOffset
+                self.requestedLength = max(0, reqEnd - curOffset)
+                self.requestsAllToEnd = dataReq.requestsAllDataToEndOfResource
+                self.isInfoOnlyProbe = false
+                self.respondedUpToOffset = curOffset
+                self.shouldWriteCache = canCache && curOffset == 0 && (self.requestsAllToEnd || self.requestedLength > 65536)
+            } else {
+                self.requestedOffset = 0
+                self.requestedLength = 0
+                self.requestsAllToEnd = false
+                self.isInfoOnlyProbe = (loadingRequest.contentInformationRequest != nil)
+                self.respondedUpToOffset = 0
+                self.shouldWriteCache = false
+            }
         }
     }
 
@@ -507,7 +520,8 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         headers: [String: String],
         streamTypeHint: String?,
         cacheKey: String?,
-        diskCache: AudioDiskCache?
+        diskCache: AudioDiskCache?,
+        sessionConfiguration: URLSessionConfiguration? = nil
     ) {
         self.remoteURL = remoteURL
         self.headers = headers
@@ -517,12 +531,12 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         self.delegateQueue = DispatchQueue(label: "mygo.audio.stream.proxy", qos: .userInitiated)
         super.init()
 
-        let config = URLSessionConfiguration.ephemeral
+        let config = sessionConfiguration ?? URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 600
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 300
         self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
@@ -530,18 +544,44 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         invalidate()
     }
 
-    /// 构造带推荐扩展名的代理 Asset URL（双保险避免 AVFoundation 因无后缀或 .m4s 后缀报错）
+    /// 构造带推荐扩展名的代理 Asset URL（仅在明确已知音频格式时附带扩展名，避免无后缀 MP3/FLAC 被提前错判为 .mp4）
     public func makeProxyAssetURL() -> URL {
-        let ext = Self.preferredFileExtension(streamType: streamTypeHint, responseMIMEType: nil, url: remoteURL)
-        return URL(string: "\(Self.proxyScheme)://track/\(UUID().uuidString).\(ext)")!
+        if let ext = Self.knownFileExtension(streamType: streamTypeHint, url: remoteURL) {
+            return URL(string: "\(Self.proxyScheme)://track/\(UUID().uuidString).\(ext)")!
+        }
+        return URL(string: "\(Self.proxyScheme)://track/\(UUID().uuidString)")!
+    }
+
+    private static func knownFileExtension(streamType: String?, url: URL) -> String? {
+        let hint = streamType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let pathExt = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !hint.isEmpty {
+            if hint.contains("flac") { return "flac" }
+            if hint.contains("mpeg") || hint.contains("mp3") { return "mp3" }
+            if hint.contains("wav") { return "wav" }
+            if hint.contains("aacp") || hint.contains("m4a") { return "m4a" }
+            if hint.contains("aac") { return "aac" }
+            if hint.contains("m4s") || hint.contains("mp4") { return "mp4" }
+        }
+        switch pathExt {
+        case "flac", "mp3", "wav", "aac", "m4a", "mp4":
+            return pathExt
+        case "m4s":
+            return "mp4"
+        default:
+            return nil
+        }
     }
 
     /// 根据插件声明 type、HTTP 响应 Content-Type 与 URL 后缀精准映射到 Apple UTI（解决 B 站 .m4s 与无后缀 CDN）
     public static func resolveAudioUTType(streamType: String?, responseMIMEType: String?, url: URL) -> String {
         let candidates = [
-            streamType?.lowercased(),
+            streamType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             responseMIMEType?.split(separator: ";").first.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-        ].compactMap { $0 }
+        ].compactMap { s -> String? in
+            guard let s, !s.isEmpty else { return nil }
+            return s
+        }
 
         let pathExt = url.pathExtension.lowercased()
 
@@ -604,9 +644,15 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         lock.unlock()
 
         for ctx in contexts {
-            cleanupCacheHandle(ctx, removeTemp: true)
+            var shouldFinish = false
+            ctx.lock.lock()
+            cleanupCacheHandleLocked(ctx, removeTemp: true)
             if !ctx.finishedLoading && !ctx.loadingRequest.isFinished && !ctx.loadingRequest.isCancelled {
                 ctx.finishedLoading = true
+                shouldFinish = true
+            }
+            ctx.lock.unlock()
+            if shouldFinish {
                 ctx.loadingRequest.finishLoading(with: CancellationError())
             }
         }
@@ -626,7 +672,7 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         }
         lock.unlock()
 
-        var request = URLRequest(url: remoteURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        var request = URLRequest(url: remoteURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.httpShouldHandleCookies = false
         for (k, v) in headers {
             if k.caseInsensitiveCompare("host") == .orderedSame || k.caseInsensitiveCompare("content-length") == .orderedSame {
@@ -646,12 +692,15 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
 
         if let dataRequest = loadingRequest.dataRequest {
             let offset = max(0, ctx.requestedOffset)
-            if dataRequest.requestsAllDataToEndOfResource || dataRequest.requestedLength <= 0 || dataRequest.requestedLength > 20_000_000 {
+            if dataRequest.requestsAllDataToEndOfResource || ctx.requestedLength <= 0 || ctx.requestedLength > 20_000_000 {
                 request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
             } else {
-                let end = offset + Int64(dataRequest.requestedLength) - 1
+                let end = offset + ctx.requestedLength - 1
                 request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
             }
+        } else if ctx.isInfoOnlyProbe {
+            // 纯元数据探测请求：只拉 2 字节探测响应头后立即结束，避免下载完整歌曲
+            request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
         }
 
         let task = session.dataTask(with: request)
@@ -684,7 +733,10 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
             }
         }
         if let removedCtx {
-            cleanupCacheHandle(removedCtx, removeTemp: true)
+            removedCtx.lock.lock()
+            removedCtx.finishedLoading = true
+            cleanupCacheHandleLocked(removedCtx, removeTemp: true)
+            removedCtx.lock.unlock()
         }
     }
 
@@ -739,43 +791,87 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
             return
         }
 
-        ctx.statusCode = http.statusCode
+        let contentRangeInfo = Self.parseContentRange(http.value(forHTTPHeaderField: "Content-Range"))
+
+        // 若探测流尾返回 416 且偏移 >= 总长度，视作合法 EOF
+        if http.statusCode == 416, let cr = contentRangeInfo, cr.total > 0, ctx.requestedOffset >= cr.total {
+            completionHandler(.cancel)
+            finish(taskID: dataTask.taskIdentifier, error: nil)
+            return
+        }
+
         guard (200...299).contains(http.statusCode) else {
             completionHandler(.cancel)
             finish(taskID: dataTask.taskIdentifier, error: SourceError.message("Audio HTTP \(http.statusCode)"))
             return
         }
 
-        let contentRangeInfo = Self.parseContentRange(http.value(forHTTPHeaderField: "Content-Range"))
+        let mime = http.value(forHTTPHeaderField: "Content-Type") ?? http.mimeType
+        let resolvedType = Self.resolveAudioUTType(streamType: streamTypeHint, responseMIMEType: mime, url: remoteURL)
+        let resolvedExt = Self.preferredFileExtension(streamType: streamTypeHint, responseMIMEType: mime, url: remoteURL)
+
+        var streamStart: Int64 = 0
+        var totalLen: Int64 = -1
         if http.statusCode == 206, let cr = contentRangeInfo {
-            ctx.streamStartOffset = cr.start
-            ctx.totalContentLength = cr.total
+            streamStart = cr.start
+            totalLen = cr.total
         } else {
-            ctx.streamStartOffset = 0
+            streamStart = 0
             if let lenStr = http.value(forHTTPHeaderField: "Content-Length"), let len = Int64(lenStr), len > 0 {
-                ctx.totalContentLength = len
+                totalLen = len
             } else if response.expectedContentLength > 0 {
-                ctx.totalContentLength = response.expectedContentLength
+                totalLen = response.expectedContentLength
             }
         }
 
-        let mime = http.value(forHTTPHeaderField: "Content-Type") ?? http.mimeType
-        ctx.resolvedContentType = Self.resolveAudioUTType(streamType: streamTypeHint, responseMIMEType: mime, url: remoteURL)
-        ctx.resolvedExtension = Self.preferredFileExtension(streamType: streamTypeHint, responseMIMEType: mime, url: remoteURL)
+        let acceptRanges = http.value(forHTTPHeaderField: "Accept-Ranges")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let sentRangeHeader = dataTask.originalRequest?.value(forHTTPHeaderField: "Range") != nil
+        let rangeSupported: Bool
+        if http.statusCode == 206 {
+            rangeSupported = true
+        } else if sentRangeHeader && http.statusCode == 200 {
+            // 发送了 Range 仍收到 200，说明上游忽略分片，切勿谎报支持 Range 避免 AVPlayer 反复跳尾重传卡死
+            rangeSupported = false
+        } else {
+            rangeSupported = (acceptRanges == "bytes")
+        }
+
+        ctx.lock.lock()
+        if ctx.finishedLoading || ctx.loadingRequest.isCancelled {
+            ctx.lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        ctx.statusCode = http.statusCode
+        ctx.streamStartOffset = streamStart
+        ctx.totalContentLength = totalLen
+        ctx.resolvedContentType = resolvedType
+        ctx.resolvedExtension = resolvedExt
 
         if let infoReq = ctx.loadingRequest.contentInformationRequest {
-            infoReq.contentType = ctx.resolvedContentType
-            let acceptRanges = http.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased()
-            infoReq.isByteRangeAccessSupported = (http.statusCode == 206) || (acceptRanges == "bytes") || (ctx.totalContentLength > 0)
-            if ctx.totalContentLength > 0 {
-                infoReq.contentLength = ctx.totalContentLength
+            infoReq.contentType = resolvedType
+            infoReq.isByteRangeAccessSupported = rangeSupported
+            if totalLen > 0 {
+                infoReq.contentLength = totalLen
             }
+        }
+
+        // 纯信息探测请求拿到响应头后立刻完成并取消后续字节下载
+        if ctx.isInfoOnlyProbe {
+            ctx.finishedLoading = true
+            ctx.lock.unlock()
+            lock.lock()
+            activeTasks.removeValue(forKey: dataTask.taskIdentifier)
+            lock.unlock()
+            ctx.loadingRequest.finishLoading()
+            completionHandler(.cancel)
+            return
         }
 
         // 若从 offset 0 开始读取全量流且允许缓存，则准备临时写入句柄
-        if ctx.shouldWriteCache && ctx.streamStartOffset == 0 {
+        if ctx.shouldWriteCache && streamStart == 0 {
             let tmp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("mygo-stream-cache-\(UUID().uuidString).\(ctx.resolvedExtension)")
+                .appendingPathComponent("mygo-stream-cache-\(UUID().uuidString).\(resolvedExt)")
             FileManager.default.createFile(atPath: tmp.path, contents: nil)
             if let handle = try? FileHandle(forWritingTo: tmp) {
                 ctx.cacheTempURL = tmp
@@ -784,6 +880,7 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         } else {
             ctx.shouldWriteCache = false
         }
+        ctx.lock.unlock()
 
         completionHandler(.allow)
     }
@@ -797,7 +894,9 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         }
         lock.unlock()
 
+        ctx.lock.lock()
         guard !ctx.finishedLoading, !ctx.loadingRequest.isCancelled else {
+            ctx.lock.unlock()
             dataTask.cancel()
             return
         }
@@ -811,7 +910,10 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
             ctx.cacheWrittenBytes += Int64(data.count)
         }
 
-        if let dataRequest = ctx.loadingRequest.dataRequest {
+        var sliceToRespond: Data?
+        var shouldFinishNow = false
+
+        if ctx.loadingRequest.dataRequest != nil {
             let reqLower = ctx.respondedUpToOffset
             let reqUpper: Int64 = (!ctx.requestsAllToEnd && ctx.requestedLength > 0)
                 ? (ctx.requestedOffset + ctx.requestedLength)
@@ -822,25 +924,33 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
             if overlapEnd > overlapStart {
                 let startInChunk = Int(overlapStart - chunkStartOffset)
                 let endInChunk = Int(overlapEnd - chunkStartOffset)
-                let slice = data.subdata(in: startInChunk..<endInChunk)
-                dataRequest.respond(with: slice)
+                sliceToRespond = data.subdata(in: startInChunk..<endInChunk)
                 ctx.respondedUpToOffset = overlapEnd
             }
 
             if !ctx.requestsAllToEnd && ctx.requestedLength > 0 && ctx.respondedUpToOffset >= reqUpper {
                 ctx.finishedLoading = true
-                cleanupCacheHandle(ctx, removeTemp: true)
-                lock.lock()
-                activeTasks.removeValue(forKey: dataTask.taskIdentifier)
-                lock.unlock()
-                ctx.loadingRequest.finishLoading()
-                dataTask.cancel()
+                cleanupCacheHandleLocked(ctx, removeTemp: true)
+                shouldFinishNow = true
             }
+        }
+        ctx.lock.unlock()
+
+        if let slice = sliceToRespond, let dataRequest = ctx.loadingRequest.dataRequest {
+            dataRequest.respond(with: slice)
+        }
+
+        if shouldFinishNow {
+            lock.lock()
+            activeTasks.removeValue(forKey: dataTask.taskIdentifier)
+            lock.unlock()
+            ctx.loadingRequest.finishLoading()
+            dataTask.cancel()
         }
     }
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        // 如果已在 didReceive data 阶段作为有界分块完成，则忽略由主动 cancel 引起的回调
+        // 如果已在 didReceive data 阶段作为有界分块或探测请求完成，则忽略由主动 cancel 引起的回调
         if let nsErr = error as NSError?, nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
             lock.lock()
             let stillActive = activeTasks[task.taskIdentifier] != nil
@@ -859,15 +969,25 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         lock.unlock()
 
         if let error {
-            cleanupCacheHandle(ctx, removeTemp: true)
+            var shouldNotify = false
+            ctx.lock.lock()
+            cleanupCacheHandleLocked(ctx, removeTemp: true)
             if !ctx.finishedLoading && !ctx.loadingRequest.isCancelled {
                 ctx.finishedLoading = true
+                shouldNotify = true
+            }
+            ctx.lock.unlock()
+            if shouldNotify {
                 ctx.loadingRequest.finishLoading(with: error)
             }
             return
         }
 
         // 成功读到流 EOF，若缓存文件完整则落盘
+        var cacheReady: (tmpURL: URL, key: String, diskCache: AudioDiskCache, ext: String, type: String)?
+        var shouldNotifySuccess = false
+
+        ctx.lock.lock()
         if ctx.shouldWriteCache,
            let tmpURL = ctx.cacheTempURL,
            let cacheKey = cacheKey,
@@ -877,24 +997,33 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
             try? ctx.cacheFileHandle?.close()
             ctx.cacheFileHandle = nil
             ctx.cacheTempURL = nil
-            _ = try? diskCache.store(
-                tempFileURL: tmpURL,
-                key: cacheKey,
-                fileExtension: ctx.resolvedExtension,
-                contentType: ctx.resolvedContentType
-            )
-            try? FileManager.default.removeItem(at: tmpURL)
+            cacheReady = (tmpURL, cacheKey, diskCache, ctx.resolvedExtension, ctx.resolvedContentType)
         } else {
-            cleanupCacheHandle(ctx, removeTemp: true)
+            cleanupCacheHandleLocked(ctx, removeTemp: true)
         }
 
         if !ctx.finishedLoading && !ctx.loadingRequest.isCancelled {
             ctx.finishedLoading = true
+            shouldNotifySuccess = true
+        }
+        ctx.lock.unlock()
+
+        if let cacheReady {
+            _ = try? cacheReady.diskCache.store(
+                tempFileURL: cacheReady.tmpURL,
+                key: cacheReady.key,
+                fileExtension: cacheReady.ext,
+                contentType: cacheReady.type
+            )
+            try? FileManager.default.removeItem(at: cacheReady.tmpURL)
+        }
+
+        if shouldNotifySuccess {
             ctx.loadingRequest.finishLoading()
         }
     }
 
-    private func cleanupCacheHandle(_ ctx: TransferContext, removeTemp: Bool) {
+    private func cleanupCacheHandleLocked(_ ctx: TransferContext, removeTemp: Bool) {
         try? ctx.cacheFileHandle?.close()
         ctx.cacheFileHandle = nil
         if removeTemp, let tmp = ctx.cacheTempURL {
@@ -947,10 +1076,18 @@ public final class PlayerEngine: ObservableObject {
     @Published public private(set) var isSeeking: Bool = false
     @Published public private(set) var seekRevision: Int = 0
 
+    public struct NowPlayingDisplayMetadata: Equatable, Sendable {
+        public let title: String
+        public let artist: String
+        public let albumTitle: String
+        public let lyricIndex: Int?
+    }
+
     public var sourceResolver: ((String) -> MusicSource?)?
     public var qualityProvider: (() -> String)?
     public var normalizeProvider: (() -> Bool)?
     public var fadeEnabledProvider: (() -> Bool)?
+    public var lockScreenLyricsProvider: (() -> Bool)?
     public var onSourceFailure: ((String, SourceError) -> Void)?
     public var onSessionChanged: (() -> Void)?
 
@@ -959,9 +1096,12 @@ public final class PlayerEngine: ObservableObject {
     private var avPlayer: AVPlayer?
     private var activeStreamProxy: AudioStreamProxy?
     private var timeObserver: Any?
+    private var boundaryTimeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var failObserver: NSObjectProtocol?
+    private var stalledObserver: NSObjectProtocol?
     private var statusObservation: NSKeyValueObservation?
+    private var timeControlObservation: NSKeyValueObservation?
     private var loadGeneration: Int = 0
     private var currentGainLinear: Float = 1.0
     private var currentFadeMultiplier: Float = 1.0
@@ -973,7 +1113,9 @@ public final class PlayerEngine: ObservableObject {
     private var recordedTrackKey: String? = nil
     private var bandTimer: Timer?
     private var audioBandMeter: AudioBandMeter?
+    private var syntheticBandPhase: Double = 0
     private var lockScreenArtwork: MPMediaItemArtwork?
+    private var lastPublishedNowPlayingMeta: NowPlayingDisplayMetadata?
 
     public init(cacheDir: URL? = nil) {
         let dir = cacheDir ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -1077,6 +1219,7 @@ public final class PlayerEngine: ObservableObject {
 
     public func resume() {
         guard currentTrack != nil else { return }
+        ensureAudioSessionActive()
         isPlaying = true
         fadeTask?.cancel()
         if let player = avPlayer {
@@ -1156,6 +1299,7 @@ public final class PlayerEngine: ObservableObject {
                     }
                     self.isSeeking = false
                     self.seekRevision &+= 1
+                    self.updateNowPlayingCenter()
                 }
             }
         } else {
@@ -1242,6 +1386,7 @@ public final class PlayerEngine: ObservableObject {
         duration = 0
         lyrics = []
         lyricsLoaded = false
+        lastPublishedNowPlayingMeta = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
@@ -1309,6 +1454,7 @@ public final class PlayerEngine: ObservableObject {
         errorMessage = nil
         lyrics = []
         lyricsLoaded = false
+        lastPublishedNowPlayingMeta = nil
         currentGainLinear = 1.0
 
         updateNowPlayingCenter()
@@ -1330,6 +1476,8 @@ public final class PlayerEngine: ObservableObject {
                     if self.loadGeneration == gen {
                         self.lyrics = parsed
                         self.lyricsLoaded = true
+                        self.rebuildLyricBoundaryObserver()
+                        self.updateNowPlayingCenter()
                     }
                 } else if self.loadGeneration == gen {
                     self.lyricsLoaded = true
@@ -1456,14 +1604,45 @@ public final class PlayerEngine: ObservableObject {
         loadTrack(atOrderIndex: currentOrderIndex, autoPlay: true, initialSeek: position)
     }
 
+    /// 判断是否必须经由 AudioStreamProxy 代理：仅针对 .m4s 容器或携带自定义请求头的流，其余标准 HTTP/HTTPS 直链优先交给原生 AVURLAsset
+    nonisolated public static func shouldUseStreamProxy(url: URL, stream: StreamInfo) -> Bool {
+        guard !url.isFileURL,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return false
+        }
+        let isHLS = url.pathExtension.lowercased() == "m3u8"
+            || (stream.type?.lowercased().contains("mpegurl") == true)
+            || url.absoluteString.lowercased().contains(".m3u8")
+        if isHLS { return false }
+
+        let isM4S = url.pathExtension.lowercased() == "m4s"
+            || (stream.type?.lowercased().contains("m4s") == true)
+        if isM4S { return true }
+
+        if let headers = stream.headers {
+            for (k, v) in headers {
+                let key = k.trimmingCharacters(in: .whitespacesAndNewlines)
+                let val = v.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !key.isEmpty && !val.isEmpty {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     private func startAVPlayer(
         with stream: StreamInfo,
         track: Track?,
         quality: String,
         autoPlay: Bool,
         initialSeek: TimeInterval,
-        gen: Int
+        gen: Int,
+        forceProxy: Bool = false
     ) async {
+        ensureAudioSessionActive()
+
         let assetURL: URL?
         let rawURL = stream.url.trimmingCharacters(in: .whitespacesAndNewlines)
         if rawURL.hasPrefix("file://") {
@@ -1497,11 +1676,13 @@ public final class PlayerEngine: ObservableObject {
             || url.absoluteString.lowercased().contains(".m3u8")
 
         let asset: AVURLAsset
+        var usedProxy = false
         if !url.isFileURL, let cacheKey, let cached = diskCache.cachedFileURL(forKey: cacheKey) {
             // 优先从磁盘缓存秒开，零网络延迟并支持原生高精度 Seek
             asset = AVURLAsset(url: cached.fileURL)
-        } else if !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") {
-            // 使用 AVAssetResourceLoaderDelegate 代理：解决 B 站 .m4s 容器格式识别、防盗链头跨域保留与边播边缓
+        } else if !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") && (forceProxy || Self.shouldUseStreamProxy(url: url, stream: stream)) {
+            // 对 .m4s、带自定义请求头或直连回退流使用 AudioStreamProxy（保留跨域头与边播边缓）
+            usedProxy = true
             var mergedHeaders = stream.headers ?? [:]
             if !mergedHeaders.keys.contains(where: { $0.lowercased() == "user-agent" }) {
                 mergedHeaders["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) mygo-music/0.1"
@@ -1518,18 +1699,11 @@ public final class PlayerEngine: ObservableObject {
             proxyAsset.resourceLoader.setDelegate(proxy, queue: proxy.delegateQueue)
             asset = proxyAsset
         } else {
-            var options: [String: Any] = [:]
-            if !url.isFileURL {
-                var mergedHeaders = stream.headers ?? [:]
-                if !mergedHeaders.keys.contains(where: { $0.lowercased() == "user-agent" }) {
-                    mergedHeaders["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) mygo-music/0.1"
-                }
-                options["AVURLAssetHTTPHeaderFieldsKey"] = mergedHeaders
-            }
-            asset = AVURLAsset(url: url, options: options.isEmpty ? nil : options)
+            asset = AVURLAsset(url: url)
         }
 
         let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 10
         let player = AVPlayer(playerItem: item)
         self.avPlayer = player
 
@@ -1540,27 +1714,26 @@ public final class PlayerEngine: ObservableObject {
         }
         applyPlayerVolume()
 
-        // 异步加载频谱分析 AudioTap，不阻塞主流程建播放器与首帧起播
-        let meter = AudioBandMeter()
-        Task { [weak self, weak item] in
-            guard let item, let tracks = try? await asset.load(.tracks),
-                  let audioTrack = tracks.first(where: { $0.mediaType == .audio }),
-                  let self, self.loadGeneration == gen,
-                  let tap = self.makeAudioTap(for: meter) else {
-                return
+        // 仅对安全本地非 FLAC 文件挂载 MTAudioProcessingTap，避免远程流媒体/代理流因异步篡改 audioMix 阻塞底层管线
+        let isLocalSafeTapTarget = url.isFileURL && url.pathExtension.lowercased() != "flac"
+        if isLocalSafeTapTarget {
+            let meter = AudioBandMeter()
+            Task { [weak self, weak item] in
+                guard let item, let tracks = try? await asset.load(.tracks),
+                      let audioTrack = tracks.first(where: { $0.mediaType == .audio }),
+                      let self, self.loadGeneration == gen,
+                      let tap = self.makeAudioTap(for: meter) else {
+                    return
+                }
+                let parameters = AVMutableAudioMixInputParameters(track: audioTrack)
+                parameters.audioTapProcessor = tap
+                let mix = AVMutableAudioMix()
+                mix.inputParameters = [parameters]
+                item.audioMix = mix
+                self.audioBandMeter = meter
             }
-            let parameters = AVMutableAudioMixInputParameters(track: audioTrack)
-            parameters.audioTapProcessor = tap
-            let mix = AVMutableAudioMix()
-            mix.inputParameters = [parameters]
-            item.audioMix = mix
-            self.audioBandMeter = meter
         }
 
-        if initialSeek > 0 {
-            let cm = CMTime(seconds: initialSeek, preferredTimescale: 600)
-            _ = await player.seek(to: cm, toleranceBefore: .zero, toleranceAfter: .zero)
-        }
         guard loadGeneration == gen else { return }
 
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
@@ -1568,11 +1741,15 @@ public final class PlayerEngine: ObservableObject {
                 guard let self, self.loadGeneration == gen else { return }
                 switch observedItem.status {
                 case .readyToPlay:
-                    self.isLoading = false
                     self.errorMessage = nil
                     let durSec = CMTimeGetSeconds(observedItem.duration)
                     if durSec.isFinite && durSec > 0 {
                         self.duration = durSec
+                    }
+                    if !self.isPlaying {
+                        self.isLoading = false
+                    } else if self.avPlayer?.timeControlStatus == .playing {
+                        self.isLoading = false
                     }
                     if self.isPlaying {
                         self.avPlayer?.play()
@@ -1585,11 +1762,49 @@ public final class PlayerEngine: ObservableObject {
                     }
                     self.updateNowPlayingCenter()
                 case .failed:
+                    // 若直连 AVURLAsset 失败且尚未回退代理，自动用带桌面 UA 的 AudioStreamProxy 重试一次
+                    if !usedProxy && !forceProxy && !url.isFileURL && !isHLS {
+                        self.cleanupAVPlayer()
+                        await self.startAVPlayer(
+                            with: stream,
+                            track: track,
+                            quality: quality,
+                            autoPlay: autoPlay,
+                            initialSeek: initialSeek,
+                            gen: gen,
+                            forceProxy: true
+                        )
+                        return
+                    }
                     self.isLoading = false
                     self.isPlaying = false
-                    self.errorMessage = observedItem.error?.localizedDescription ?? I18n.t("Couldn't play this song")
+                    let comment = observedItem.errorLog()?.events.last?.errorComment
+                    let baseMsg = observedItem.error?.localizedDescription ?? I18n.t("Couldn't play this song")
+                    self.errorMessage = (comment?.isEmpty == false && !baseMsg.contains(comment!))
+                        ? "\(baseMsg) (\(comment!))"
+                        : baseMsg
                     self.updateNowPlayingCenter()
                 default:
+                    break
+                }
+            }
+        }
+
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] observedPlayer, _ in
+            Task { @MainActor in
+                guard let self, self.loadGeneration == gen else { return }
+                switch observedPlayer.timeControlStatus {
+                case .playing:
+                    self.isLoading = false
+                case .paused:
+                    if !self.isPlaying {
+                        self.isLoading = false
+                    }
+                case .waitingToPlayAtSpecifiedRate:
+                    if self.isPlaying {
+                        self.isLoading = true
+                    }
+                @unknown default:
                     break
                 }
             }
@@ -1603,6 +1818,7 @@ public final class PlayerEngine: ObservableObject {
                 let sec = CMTimeGetSeconds(time)
                 if sec.isFinite && sec >= 0 {
                     self.position = sec
+                    self.syncNowPlayingLyricsIfNeeded(at: sec)
                 }
                 if let itemDur = self.avPlayer?.currentItem?.duration {
                     let durSec = CMTimeGetSeconds(itemDur)
@@ -1610,11 +1826,26 @@ public final class PlayerEngine: ObservableObject {
                         self.duration = durSec
                     }
                 }
-                if self.isLoading && (self.avPlayer?.timeControlStatus == .playing || !autoPlay) {
+                if self.isLoading && (sec > 0.05 || self.avPlayer?.timeControlStatus == .playing || !self.isPlaying) {
                     self.isLoading = false
                 }
                 if self.duration > 0 && (self.duration - sec <= 35 || sec >= 5 && self.duration <= 25) {
                     self.maybePrefetchNextTrack()
+                }
+            }
+        }
+        rebuildLyricBoundaryObserver()
+
+        stalledObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.loadGeneration == gen else { return }
+                if self.isPlaying {
+                    self.isLoading = true
+                    self.avPlayer?.play()
                 }
             }
         }
@@ -1636,6 +1867,19 @@ public final class PlayerEngine: ObservableObject {
         ) { [weak self] note in
             Task { @MainActor in
                 guard let self, self.loadGeneration == gen else { return }
+                if !usedProxy && !forceProxy && !url.isFileURL && !isHLS {
+                    self.cleanupAVPlayer()
+                    await self.startAVPlayer(
+                        with: stream,
+                        track: track,
+                        quality: quality,
+                        autoPlay: autoPlay,
+                        initialSeek: initialSeek,
+                        gen: gen,
+                        forceProxy: true
+                    )
+                    return
+                }
                 self.isLoading = false
                 self.isPlaying = false
                 let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
@@ -1643,16 +1887,23 @@ public final class PlayerEngine: ObservableObject {
             }
         }
 
-        isLoading = false
+        if initialSeek > 0 {
+            let cm = CMTime(seconds: initialSeek, preferredTimescale: 600)
+            player.seek(to: cm, toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
+        }
+
         if autoPlay || isPlaying {
             player.play()
             isPlaying = true
+            isLoading = player.timeControlStatus != .playing
             if fadeEnabledProvider?() == true && currentFadeMultiplier < 0.99 {
                 fadeTask?.cancel()
                 fadeTask = Task { [weak self] in
                     await self?.animateFade(from: self?.currentFadeMultiplier ?? 0.0, to: 1.0, durationMs: 220, gen: gen)
                 }
             }
+        } else {
+            isLoading = false
         }
         updateNowPlayingCenter()
         maybePrefetchRadio()
@@ -1761,9 +2012,19 @@ public final class PlayerEngine: ObservableObject {
         currentFadeMultiplier = 1.0
         statusObservation?.invalidate()
         statusObservation = nil
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
         if let obs = timeObserver {
             avPlayer?.removeTimeObserver(obs)
             timeObserver = nil
+        }
+        if let bObs = boundaryTimeObserver {
+            avPlayer?.removeTimeObserver(bObs)
+            boundaryTimeObserver = nil
+        }
+        if let stalledObs = stalledObserver {
+            NotificationCenter.default.removeObserver(stalledObs)
+            stalledObserver = nil
         }
         if let endObs = endObserver {
             NotificationCenter.default.removeObserver(endObs)
@@ -1809,6 +2070,10 @@ public final class PlayerEngine: ObservableObject {
     // MARK: - iOS 系统音频会话与锁屏控制中心
 
     private func configureAudioSession() {
+        ensureAudioSessionActive()
+    }
+
+    private func ensureAudioSessionActive() {
         #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
@@ -1849,16 +2114,127 @@ public final class PlayerEngine: ObservableObject {
         }
     }
 
+    /// 供设置切换后外部主动刷新锁屏媒体栏信息
+    public func refreshNowPlayingInfo() {
+        updateNowPlayingCenter()
+    }
+
+    /// 生成锁屏 / 控制中心展示元数据：开启锁屏歌词且命中非空歌词行时，将主标题替换为当前歌词并保留歌名
+    nonisolated public static func buildNowPlayingDisplayMetadata(
+        track: Track,
+        lyrics: [LyricLine],
+        position: Double,
+        lockScreenLyricsEnabled: Bool
+    ) -> NowPlayingDisplayMetadata {
+        let fallback = NowPlayingDisplayMetadata(
+            title: track.name,
+            artist: track.artistNames,
+            albumTitle: track.album.name,
+            lyricIndex: nil
+        )
+        guard lockScreenLyricsEnabled, !lyrics.isEmpty else {
+            return fallback
+        }
+        let idx = LyricsEngine.index(in: lyrics, at: position)
+        guard idx >= 0, idx < lyrics.count else {
+            return fallback
+        }
+        let line = lyrics[idx]
+        let lyricText = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !lyricText.isEmpty else {
+            return fallback
+        }
+        let translation = line.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle: String
+        if !translation.isEmpty {
+            subtitle = "\(translation) · \(track.name)"
+        } else if track.artistNames.isEmpty {
+            subtitle = track.name
+        } else {
+            subtitle = "\(track.name) - \(track.artistNames)"
+        }
+        return NowPlayingDisplayMetadata(
+            title: lyricText,
+            artist: subtitle,
+            albumTitle: track.album.name,
+            lyricIndex: idx
+        )
+    }
+
+    /// 为每句歌词时间点注册 CoreMedia 边界观察者，保证后台锁屏休眠期间切句也能及时触发刷新
+    private func rebuildLyricBoundaryObserver() {
+        if let existing = boundaryTimeObserver {
+            avPlayer?.removeTimeObserver(existing)
+            boundaryTimeObserver = nil
+        }
+        guard let player = avPlayer, !lyrics.isEmpty else { return }
+
+        var boundaryTimes: [NSValue] = []
+        boundaryTimes.reserveCapacity(min(lyrics.count, 1500))
+        var lastTimestamp = -1.0
+        for line in lyrics {
+            // 延后 20ms 踩点，确保 CoreMedia 读取 currentTime() 稳定跨越该句边界
+            let triggerTime = max(0.02, line.at + 0.02)
+            if triggerTime - lastTimestamp >= 0.05 {
+                let cm = CMTime(seconds: triggerTime, preferredTimescale: 600)
+                boundaryTimes.append(NSValue(time: cm))
+                lastTimestamp = triggerTime
+                if boundaryTimes.count >= 1500 { break }
+            }
+        }
+        guard !boundaryTimes.isEmpty else { return }
+
+        let gen = loadGeneration
+        boundaryTimeObserver = player.addBoundaryTimeObserver(forTimes: boundaryTimes, queue: .main) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.loadGeneration == gen,
+                      !self.isSeeking,
+                      let currentPlayer = self.avPlayer else { return }
+                let sec = CMTimeGetSeconds(currentPlayer.currentTime())
+                if sec.isFinite && sec >= 0 {
+                    self.position = sec
+                    self.syncNowPlayingLyricsIfNeeded(at: sec)
+                }
+            }
+        }
+    }
+
+    /// 仅当锁屏歌词行或曲目展示元数据确实变化时刷新 MPNowPlayingInfoCenter，避免高频写入被系统限流
+    private func syncNowPlayingLyricsIfNeeded(at sec: TimeInterval) {
+        guard let tr = currentTrack else { return }
+        let enabled = lockScreenLyricsProvider?() ?? true
+        let nextMeta = Self.buildNowPlayingDisplayMetadata(
+            track: tr,
+            lyrics: lyrics,
+            position: sec,
+            lockScreenLyricsEnabled: enabled
+        )
+        if nextMeta != lastPublishedNowPlayingMeta {
+            updateNowPlayingCenter()
+        }
+    }
+
     private func updateNowPlayingCenter() {
         guard let tr = currentTrack else {
             lockScreenArtwork = nil
+            lastPublishedNowPlayingMeta = nil
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
             return
         }
+        let enabled = lockScreenLyricsProvider?() ?? true
+        let meta = Self.buildNowPlayingDisplayMetadata(
+            track: tr,
+            lyrics: lyrics,
+            position: position,
+            lockScreenLyricsEnabled: enabled
+        )
+        lastPublishedNowPlayingMeta = meta
+
         var info: [String: Any] = [
-            MPMediaItemPropertyTitle: tr.name,
-            MPMediaItemPropertyArtist: tr.artistNames,
-            MPMediaItemPropertyAlbumTitle: tr.album.name,
+            MPMediaItemPropertyTitle: meta.title,
+            MPMediaItemPropertyArtist: meta.artist,
+            MPMediaItemPropertyAlbumTitle: meta.albumTitle,
             MPMediaItemPropertyMediaType: MPMediaType.music.rawValue,
             MPMediaItemPropertyPlaybackDuration: duration > 0 ? duration : tr.durationSeconds,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
@@ -1883,19 +2259,37 @@ public final class PlayerEngine: ObservableObject {
     #endif
 
     private func startBandUpdateTimer() {
-        let idleBands: [Float] = [0.12, 0.12, 0.12, 0.12, 0.12]
         bandTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                guard self.isPlaying, !self.isLoading, let meter = self.audioBandMeter else {
-                    if self.audioBands != idleBands { self.audioBands = idleBands }
-                    return
-                }
-                let target = meter.readBands()
-                self.audioBands = zip(self.audioBands, target).map { current, next in
-                    current + (next - current) * 0.42
-                }
+                self?.tickAudioBands()
             }
+        }
+    }
+
+    private func tickAudioBands() {
+        let idleBands: [Float] = [0.12, 0.12, 0.12, 0.12, 0.12]
+        guard isPlaying, !isLoading else {
+            if audioBands != idleBands { audioBands = idleBands }
+            return
+        }
+        let target: [Float]
+        if let meter = audioBandMeter {
+            target = meter.readBands()
+        } else {
+            // 在线流未挂载 MTAudioProcessingTap 时使用平滑律动估计，避免阻塞 CoreMedia 音频管线
+            syntheticBandPhase += 0.35
+            let p = syntheticBandPhase
+            var synthetic: [Float] = []
+            synthetic.reserveCapacity(Self.bandCount)
+            for idx in 0..<Self.bandCount {
+                let freq = 1.0 + Double(idx) * 0.27
+                let wave = 0.5 + 0.5 * sin(p * freq + Double(idx) * 1.1)
+                synthetic.append(Float(0.18 + 0.55 * wave))
+            }
+            target = synthetic
+        }
+        audioBands = zip(audioBands, target).map { current, next in
+            current + (next - current) * 0.42
         }
     }
 }

@@ -350,8 +350,8 @@ private final class PluginHTTPClient: NSObject, URLSessionTaskDelegate, @uncheck
         cfg.httpShouldSetCookies = false
         cfg.httpCookieAcceptPolicy = .never
         cfg.httpCookieStorage = nil
-        cfg.timeoutIntervalForRequest = 600
-        cfg.timeoutIntervalForResource = 600
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 60
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }()
@@ -383,7 +383,7 @@ private final class PluginHTTPClient: NSObject, URLSessionTaskDelegate, @uncheck
         let origin = Self.originKey(for: request.url)
         var req = request
         req.httpShouldHandleCookies = false
-        req.timeoutInterval = 600
+        req.timeoutInterval = 15
 
         let taskIDBox = OSAllocatedUnfairLock<Int?>(initialState: nil)
         let task = session.dataTask(with: req) { [weak self] data, response, error in
@@ -1712,9 +1712,38 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
         return obj
     }
 
-    private func saveJSON(_ obj: Any, fileName: String) throws {
+    /// 将任意 JSON 兼容值（含顶层 Bool / Number / String / NSNull 及容器）安全编码为 UTF-8 数据，避免触发 ObjC 异常
+    public static func encodeAnyJSON(_ obj: Any, pretty: Bool = false) -> Data? {
+        if JSONSerialization.isValidJSONObject(obj) {
+            let options: JSONSerialization.WritingOptions = pretty ? [.prettyPrinted, .sortedKeys] : []
+            return try? JSONSerialization.data(withJSONObject: obj, options: options)
+        }
+        // 非容器顶层值先包装为单元素数组，借 isValidJSONObject 安全校验并提取内部 JSON 文本，避免顶层类型引发 NSInvalidArgumentException
+        let wrapped = [obj]
+        guard JSONSerialization.isValidJSONObject(wrapped),
+              let arrData = try? JSONSerialization.data(withJSONObject: wrapped, options: []),
+              arrData.count >= 2,
+              arrData.first == UInt8(ascii: "["),
+              arrData.last == UInt8(ascii: "]") else {
+            return nil
+        }
+        return Data(arrData.dropFirst().dropLast())
+    }
+
+    private func saveEncodableJSON<T: Encodable>(_ value: T, fileName: String) throws {
         try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
-        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(value)
+        let target = dataDir.appendingPathComponent(fileName)
+        try data.write(to: target, options: .atomic)
+    }
+
+    private func saveAnyJSON(_ obj: Any, fileName: String) throws {
+        guard let data = Self.encodeAnyJSON(obj, pretty: true) else {
+            throw SourceError.message("Invalid JSON payload for \(fileName)")
+        }
+        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
         let target = dataDir.appendingPathComponent(fileName)
         try data.write(to: target, options: .atomic)
     }
@@ -1747,9 +1776,9 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
 
     public func setProcessGranted(_ value: Bool) throws {
         lock.lock()
+        defer { lock.unlock() }
         granted = value
-        try saveJSON(value, fileName: "granted.json")
-        lock.unlock()
+        try saveEncodableJSON(value, fileName: "granted.json")
     }
 
     // MARK: - 请求头插值（对应 Plugin.HeadersFor）
@@ -1829,7 +1858,7 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
                     if let str = val as? String {
                         replacement = str
                     } else if !(val is NSNull),
-                              let data = try? JSONSerialization.data(withJSONObject: val),
+                              let data = Self.encodeAnyJSON(val),
                               let jsonStr = String(data: data, encoding: .utf8) {
                         replacement = jsonStr
                     }
@@ -2723,7 +2752,7 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
             let val = self.storageMap[key]
             self.lock.unlock()
             guard let val else { return JSValue(undefinedIn: ctx) }
-            if let data = try? JSONSerialization.data(withJSONObject: val, options: [.fragmentsAllowed]),
+            if let data = Self.encodeAnyJSON(val),
                let jsonStr = String(data: data, encoding: .utf8) {
                 return ctx.objectForKeyedSubscript("JSON").objectForKeyedSubscript("parse").call(withArguments: [jsonStr])
             }
@@ -2739,16 +2768,16 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
                 return
             }
             self.lock.lock()
+            defer { self.lock.unlock() }
             self.storageMap[key] = obj
-            try? self.saveJSON(self.storageMap, fileName: "storage.json")
-            self.lock.unlock()
+            try? self.saveAnyJSON(self.storageMap, fileName: "storage.json")
         }
         let storageRemove: @convention(block) (String) -> Void = { [weak self] key in
             guard let self else { return }
             self.lock.lock()
+            defer { self.lock.unlock() }
             self.storageMap.removeValue(forKey: key)
-            try? self.saveJSON(self.storageMap, fileName: "storage.json")
-            self.lock.unlock()
+            try? self.saveAnyJSON(self.storageMap, fileName: "storage.json")
         }
         storageObj.setObject(storageGet, forKeyedSubscript: "get" as NSString)
         storageObj.setObject(storageSet, forKeyedSubscript: "set" as NSString)
@@ -3250,15 +3279,17 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
     }
 
     public func setSetting(_ key: String, value: String) throws {
-        lock.lock()
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            settingsMap.removeValue(forKey: key)
-        } else {
-            settingsMap[key] = trimmed
+        do {
+            lock.lock()
+            defer { lock.unlock() }
+            if trimmed.isEmpty {
+                settingsMap.removeValue(forKey: key)
+            } else {
+                settingsMap[key] = trimmed
+            }
+            try saveEncodableJSON(settingsMap, fileName: "settings.json")
         }
-        try saveJSON(settingsMap, fileName: "settings.json")
-        lock.unlock()
 
         if can("setSetting") {
             Task {

@@ -505,6 +505,8 @@ public final class I18n: @unchecked Sendable {
         "Needs Process Permission": "需要本地进程权限",
         "Grant Permission": "授予权限",
         "Process permission granted": "已授予进程权限",
-        "Update": "更新"
+        "Update": "更新",
+        "Lock Screen Lyrics": "锁屏歌词",
+        "Show the active lyric line in the Lock Screen media title while playing": "播放时在系统锁屏和蓝牙媒体卡片实时显示当前歌词"
     ]
 }

@@ -64,6 +64,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var fade: Bool = true
     public var hotComments: Bool = true
     public var fog: Bool = true
+    public var lockScreenLyrics: Bool = true
     public var cacheMB: Int = 2048
     public var searchHistory: [String] = []
     public var githubToken: String = ""
@@ -73,7 +74,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case language, source, captions, disabledPlugins, quality, appearance
         case growFromCover, smoke, lyricsStage, stageStyle, stageSparks, volume
-        case normalize, fade, hotComments, fog, cacheMB, searchHistory
+        case normalize, fade, hotComments, fog, lockScreenLyrics, cacheMB, searchHistory
         case githubToken, pluginUpdates, pluginsCheckedAt
     }
 
@@ -97,6 +98,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         fade = try values.decodeIfPresent(Bool.self, forKey: .fade) ?? true
         hotComments = try values.decodeIfPresent(Bool.self, forKey: .hotComments) ?? true
         fog = try values.decodeIfPresent(Bool.self, forKey: .fog) ?? true
+        lockScreenLyrics = try values.decodeIfPresent(Bool.self, forKey: .lockScreenLyrics) ?? true
         cacheMB = try values.decodeIfPresent(Int.self, forKey: .cacheMB) ?? 2048
         searchHistory = try values.decodeIfPresent([String].self, forKey: .searchHistory) ?? []
         githubToken = try values.decodeIfPresent(String.self, forKey: .githubToken) ?? ""
@@ -153,6 +155,9 @@ public final class AppModel: ObservableObject {
                     timedCaptions = []
                     liveCaptionsStatus = ""
                 }
+            }
+            if oldValue.lockScreenLyrics != settings.lockScreenLyrics {
+                player.refreshNowPlayingInfo()
             }
         }
     }
@@ -277,6 +282,9 @@ public final class AppModel: ObservableObject {
         }
         self.player.fadeEnabledProvider = { [weak self] in
             self?.settings.fade ?? true
+        }
+        self.player.lockScreenLyricsProvider = { [weak self] in
+            self?.settings.lockScreenLyrics ?? true
         }
         self.player.onSourceFailure = { [weak self] sourceID, err in
             Task { @MainActor in
@@ -1270,8 +1278,13 @@ public final class AppModel: ObservableObject {
 
     public func grantProcessPermission(for pluginID: String) {
         guard let target = pluginSources.first(where: { $0.manifest.id == pluginID }) else { return }
-        try? target.setProcessGranted(true)
-        objectWillChange.send()
+        do {
+            try target.setProcessGranted(true)
+            objectWillChange.send()
+            showToast(I18n.t("Process permission granted"))
+        } catch {
+            showToast(error.localizedDescription)
+        }
     }
 
     public func removePlugin(id: String) {

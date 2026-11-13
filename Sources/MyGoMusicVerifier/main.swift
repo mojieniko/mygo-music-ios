@@ -93,6 +93,33 @@ struct MyGoMusicVerifier {
         try assertTrue(!quiets.isEmpty)
         try assertEqual(quiets.last?.from, 16.0)
         try assertEqual(quiets.last?.to, 20.0)
+
+        // 验证锁屏媒体栏实时歌词元数据结构生成
+        let track = Track(
+            id: "tr-lyric",
+            name: "春日影",
+            artists: [Artist(id: "a1", name: "MyGO!!!!!")],
+            album: Album(id: "al1", name: "迷星叫")
+        )
+        let metaDisabled = PlayerEngine.buildNowPlayingDisplayMetadata(
+            track: track,
+            lyrics: lines,
+            position: 2.0,
+            lockScreenLyricsEnabled: false
+        )
+        try assertEqual(metaDisabled.title, "春日影")
+        try assertEqual(metaDisabled.artist, "MyGO!!!!!")
+        try assertTrue(metaDisabled.lyricIndex == nil)
+
+        let metaActive = PlayerEngine.buildNowPlayingDisplayMetadata(
+            track: track,
+            lyrics: lines,
+            position: 2.0,
+            lockScreenLyricsEnabled: true
+        )
+        try assertEqual(metaActive.title, "Hello 世界")
+        try assertEqual(metaActive.artist, "你好世界 · 春日影")
+        try assertEqual(metaActive.lyricIndex, 1)
     }
 
     static func verifyPluginRuntime() async throws {
@@ -146,7 +173,18 @@ struct MyGoMusicVerifier {
             "minAppVersion": "0.1.21",
             "main": "index.ts",
             "playback": "stream",
-            "permissions": ["network": ["*.bilibili.com", "*.music.163.com"]],
+            "permissions": [
+                "network": ["*.bilibili.com", "*.music.163.com"],
+                "process": ["ffmpeg"]
+            ],
+            "requestHeaders": [[
+                "hosts": ["*.bilivideo.com"],
+                "kinds": ["audio"],
+                "headers": [
+                    "X-Num": "{storage:num}",
+                    "X-Flag": "{storage:flag}"
+                ]
+            ]],
             "settings": [
                 ["key": "cookie", "label": "Cookie", "type": "password"],
                 ["key": "lossless", "label": "Lossless", "type": "boolean"],
@@ -204,6 +242,11 @@ struct MyGoMusicVerifier {
 
             const sig = signWbi({ bvid: "BV1xx", cid: 9527 });
             const enc = host.crypto.aesEcbEncrypt("0123456789abcdef", "netease");
+            host.storage.set("num", 123);
+            host.storage.set("flag", true);
+            if (host.storage.get("num") !== 123 || host.storage.get("flag") !== true) {
+                throw new Error("storage primitive roundtrip failed");
+            }
             const t: InternalTrack = { id: "BV1xx:9527", name: sig + "|" + enc + "|" + timerMsg };
             return {
                 title: "Sim Home",
@@ -262,6 +305,21 @@ struct MyGoMusicVerifier {
 
         try biliPlugin.setSetting("quality", value: "flac")
         try assertEqual(biliPlugin.setting("quality"), "flac")
+
+        // 验证进程权限持久化（此前顶层 Bool 写入曾引发 NSInvalidArgumentException 闪退）
+        try assertTrue(biliPlugin.hasProcessPermissionDeclaration)
+        try assertEqual(biliPlugin.isProcessGranted(), false)
+        try biliPlugin.setProcessGranted(true)
+        try assertEqual(biliPlugin.isProcessGranted(), true)
+
+        let reloadedBili = try JSPluginSource(pluginDir: biliDir, dataRootDir: dataDir)
+        try assertEqual(reloadedBili.isProcessGranted(), true)
+
+        // 验证顶层基础类型 storage 占位符插值与非法 JSON 值安全防护
+        let reqHeaders = biliPlugin.headersFor(url: URL(string: "https://upos.bilivideo.com/test.m4s")!, kind: "audio")
+        try assertEqual(reqHeaders?["X-Num"], "123")
+        try assertEqual(reqHeaders?["X-Flag"], "true")
+        try assertTrue(JSPluginSource.encodeAnyJSON(Double.nan) == nil, "非有限浮点数不应导致原生异常崩溃")
     }
 
     static func verifyPluginCryptoAndModels() throws {
@@ -444,6 +502,44 @@ struct MyGoMusicVerifier {
             AudioStreamProxy.resolveAudioUTType(streamType: nil, responseMIMEType: nil, url: m4aURL),
             AVFileType.m4a.rawValue
         )
+
+        // 直链分流判断：标准 HTTP 直链优先原生 AVURLAsset，仅 .m4s 或带自定义 headers 才走代理
+        let directMP3 = StreamInfo(url: "https://m701.music.126.net/song.mp3", type: "mp3", headers: nil)
+        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directMP3.url)!, stream: directMP3))
+
+        let directOuterNoExt = StreamInfo(url: "https://music.163.com/song/media/outer/url?id=123", headers: [:])
+        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directOuterNoExt.url)!, stream: directOuterNoExt))
+
+        let directFLAC = StreamInfo(url: "https://m8.music.126.net/track.flac", type: "flac")
+        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: directFLAC.url)!, stream: directFLAC))
+
+        let hlsWithHeaders = StreamInfo(url: "https://cdn.example.com/live.m3u8", type: "application/vnd.apple.mpegurl", headers: ["Referer": "https://music.163.com"])
+        try assertTrue(!PlayerEngine.shouldUseStreamProxy(url: URL(string: hlsWithHeaders.url)!, stream: hlsWithHeaders))
+
+        let biliM4S = StreamInfo(url: "https://upos.bilivideo.com/audio.m4s")
+        try assertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: biliM4S.url)!, stream: biliM4S))
+
+        let customHeaderMP3 = StreamInfo(url: "https://cdn.example.com/track.mp3", type: "mp3", headers: ["Referer": "https://www.bilibili.com/"])
+        try assertTrue(PlayerEngine.shouldUseStreamProxy(url: URL(string: customHeaderMP3.url)!, stream: customHeaderMP3))
+
+        // makeProxyAssetURL 不应对未知无后缀直链强行伪造 .mp4 扩展名
+        let unknownProxy = AudioStreamProxy(
+            remoteURL: URL(string: "https://cdn.example.com/track?id=1")!,
+            headers: [:],
+            streamTypeHint: nil,
+            cacheKey: nil,
+            diskCache: nil
+        )
+        try assertEqual(unknownProxy.makeProxyAssetURL().pathExtension, "")
+
+        let mp3HintProxy = AudioStreamProxy(
+            remoteURL: URL(string: "https://cdn.example.com/track?id=2")!,
+            headers: [:],
+            streamTypeHint: "audio/mpeg",
+            cacheKey: nil,
+            diskCache: nil
+        )
+        try assertEqual(mp3HintProxy.makeProxyAssetURL().pathExtension, "mp3")
     }
 
     static func verifySourceNavigationCustomization() throws {
