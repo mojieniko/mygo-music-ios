@@ -12,8 +12,21 @@ import UniformTypeIdentifiers
 public struct SearchView: View {
     @EnvironmentObject private var app: AppModel
     @State private var navPath = NavigationPath()
+    @FocusState private var isSearchFieldFocused: Bool
 
     public init() {}
+
+    /// 统一收敛焦点与系统/第三方输入法键盘，防止结果页和底部弹窗被遮挡
+    private func dismissSearchKeyboard() {
+        isSearchFieldFocused = false
+        MyGoKeyboard.dismiss()
+    }
+
+    /// 执行搜索并立即自动退回键盘
+    private func submitSearch() {
+        dismissSearchKeyboard()
+        Task { await app.performSearch() }
+    }
 
     public var body: some View {
         NavigationStack(path: $navPath) {
@@ -24,9 +37,10 @@ public struct SearchView: View {
                         Image(systemName: "magnifyingglass")
                             .foregroundStyle(.secondary)
                         TextField(I18n.t("Search for something to play."), text: $app.searchQuery)
+                            .focused($isSearchFieldFocused)
                             .submitLabel(.search)
                             .onSubmit {
-                                Task { await app.performSearch() }
+                                submitSearch()
                             }
                             .onChange(of: app.searchQuery) { _, newValue in
                                 Task { await app.updateSuggestions(for: newValue) }
@@ -40,6 +54,17 @@ public struct SearchView: View {
                             }
                             .buttonStyle(.plain)
                         }
+                        if isSearchFieldFocused {
+                            Button {
+                                dismissSearchKeyboard()
+                            } label: {
+                                Image(systemName: "keyboard.chevron.compact.down")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(I18n.t("Done"))
+                        }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
@@ -47,6 +72,7 @@ public struct SearchView: View {
 
                     searchKindChips
                         .onChange(of: app.searchKind) { _, _ in
+                            dismissSearchKeyboard()
                             if !app.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
                                 Task { await app.performSearch() }
                             }
@@ -69,6 +95,7 @@ public struct SearchView: View {
                             searchResultsSection
                             if app.searchResult.more == true {
                                 LoadMoreButton(isLoading: app.isLoadingMoreSearch) {
+                                    dismissSearchKeyboard()
                                     Task { await app.loadMoreSearch() }
                                 }
                             }
@@ -76,6 +103,13 @@ public struct SearchView: View {
                     }
                     .padding(.vertical, 10)
                 }
+                .scrollDismissesKeyboard(.interactively)
+            }
+            .onChange(of: app.activeSourceID) { _, _ in
+                dismissSearchKeyboard()
+            }
+            .onDisappear {
+                dismissSearchKeyboard()
             }
             .navigationTitle(I18n.t("Search"))
             #if os(iOS)
@@ -90,9 +124,7 @@ public struct SearchView: View {
                 HomeView.buildDestination(for: target)
             }
             .environment(\.mygoNavigate) { target in
-                navPath.append(target)
-            }
-            .environment(\.mygoNavigate) { target in
+                dismissSearchKeyboard()
                 navPath.append(target)
             }
         }
@@ -111,6 +143,7 @@ public struct SearchView: View {
                 ForEach(items, id: \.0) { kind, label in
                     let isSelected = app.searchKind == kind
                     Button {
+                        dismissSearchKeyboard()
                         app.searchKind = kind
                     } label: {
                         Text(label)
@@ -129,6 +162,11 @@ public struct SearchView: View {
         }
     }
 
+    private func openSearchTarget(_ target: NavigationTarget) {
+        dismissSearchKeyboard()
+        navPath.append(target)
+    }
+
     private var recentSearchHistorySection: some View {
         VStack(alignment: .leading, spacing: 12) {
             if !app.settings.searchHistory.isEmpty {
@@ -137,6 +175,7 @@ public struct SearchView: View {
                         .font(.system(size: 17, weight: .bold))
                     Spacer()
                     Button(I18n.t("Clear")) {
+                        dismissSearchKeyboard()
                         app.settings.searchHistory = []
                     }
                     .font(.system(size: 13, weight: .medium))
@@ -149,7 +188,7 @@ public struct SearchView: View {
                         ForEach(app.settings.searchHistory, id: \.self) { item in
                             Button {
                                 app.searchQuery = item
-                                Task { await app.performSearch() }
+                                submitSearch()
                             } label: {
                                 Text(item)
                                     .font(.system(size: 13.5, weight: .medium))
@@ -172,6 +211,10 @@ public struct SearchView: View {
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, minHeight: 240)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    dismissSearchKeyboard()
+                }
             }
         }
     }
@@ -186,7 +229,7 @@ public struct SearchView: View {
             ForEach(app.searchSuggestions, id: \.self) { suggestion in
                 Button {
                     app.searchQuery = suggestion
-                    Task { await app.performSearch() }
+                    submitSearch()
                 } label: {
                     HStack {
                         Image(systemName: "magnifyingglass")
@@ -215,6 +258,7 @@ public struct SearchView: View {
                 VStack(spacing: 2) {
                     ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
                         TrackRowView(track: tr, index: idx) {
+                            dismissSearchKeyboard()
                             app.player.playTrack(tracks, at: idx)
                         }
                         .padding(.horizontal, 8)
@@ -229,7 +273,7 @@ public struct SearchView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 20) {
                     ForEach(albums) { album in
                         Button {
-                            navPath.append(NavigationTarget.album(id: album.id, name: album.name))
+                            openSearchTarget(.album(id: album.id, name: album.name))
                         } label: {
                             CoverCardView(
                                 title: album.name,
@@ -251,7 +295,7 @@ public struct SearchView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 16)], spacing: 20) {
                     ForEach(artists) { artist in
                         Button {
-                            navPath.append(NavigationTarget.artist(id: artist.id, name: artist.name))
+                            openSearchTarget(.artist(id: artist.id, name: artist.name))
                         } label: {
                             CoverCardView(
                                 title: artist.name,
@@ -274,7 +318,7 @@ public struct SearchView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 20) {
                     ForEach(playlists) { pl in
                         Button {
-                            navPath.append(NavigationTarget.playlist(id: pl.id, name: pl.name))
+                            openSearchTarget(.playlist(id: pl.id, name: pl.name))
                         } label: {
                             CoverCardView(
                                 title: pl.name,
@@ -296,7 +340,7 @@ public struct SearchView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 20) {
                     ForEach(shows) { show in
                         Button {
-                            navPath.append(NavigationTarget.show(id: show.id, name: show.name))
+                            openSearchTarget(.show(id: show.id, name: show.name))
                         } label: {
                             CoverCardView(
                                 title: show.name,
@@ -318,6 +362,10 @@ public struct SearchView: View {
             .font(.system(size: 14))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, minHeight: 180)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                dismissSearchKeyboard()
+            }
     }
 }
 

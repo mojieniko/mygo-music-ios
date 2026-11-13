@@ -247,12 +247,12 @@ public extension StageMath {
         )
     }
 
-    /// Flow（流光）行级对齐与垂直层次偏移（对标桌面 ui_stage.go，混洗消除整数秒节拍锁死同角的问题）
+    /// Flow（流光）行级对齐与垂直层次偏移（对标桌面 ui_stage.go 3×3 九宫格随机落位，混洗消除整数秒节拍锁死同角）
     static func flowPlacement(for line: LyricLine, containerWidth: Double) -> StageFlowPlacement {
         let ms = UInt64(max(0, Int((line.at * 1000.0).rounded())))
         let charCount = wordsLength(line.words[...])
 
-        // SplitMix 混洗时间戳与字数，避免每 3 秒一句时 (at*1000)%3 恒为 0 锁死在左上角
+        // SplitMix 混洗时间戳与字数，确保每一句在左/中/右与上/中/下之间灵动随机切换
         var h1 = ms &* 0x9E3779B97F4A7C15
         h1 ^= UInt64(max(1, charCount)) &* 0xBF58476D1CE4E5B9
         h1 = (h1 ^ (h1 >> 30)) &* 0xBF58476D1CE4E5B9
@@ -263,13 +263,13 @@ public extension StageMath {
 
         let rawAlign = Int(h1 % 3)
         let align: StageFlowPlacement.HorizontalAlignment
-        if containerWidth < 360 && charCount > 16 {
+        if containerWidth < 340 && charCount > 28 {
             align = .center
         } else {
             align = StageFlowPlacement.HorizontalAlignment(rawValue: rawAlign) ?? .center
         }
 
-        let verticalOptions = [-0.11, 0.0, 0.09]
+        let verticalOptions = [-0.31, -0.02, 0.24]
         let vIdx = Int(h2 % UInt64(verticalOptions.count))
         return StageFlowPlacement(alignment: align, verticalShiftRatio: verticalOptions[vIdx])
     }
@@ -281,14 +281,13 @@ public extension StageMath {
         return max(0, 1.0 - easeOutCubic(gone))
     }
 
-    /// 升级版 Flow/Steps 单字物理渲染状态（完全还原桌面散落/旋转/缩放/余韵，且融入音律能量脉冲）
-    /// 注：保留未唱字微弱预显（opacity >= 0.24），确保手机竖屏下整句可预先辨认而不缺字
+    /// 升级版 Flow/Steps 单字物理渲染状态（1:1 还原桌面“未唱先隐、到拍从虚化/侧方弹簧凭空蹦出”的灵魂，且融入音律能量脉冲）
     static func stageWordState(
         word: LyricWord,
         shape: WordShape,
         pos: TimeInterval,
         rhythm: AudioRhythmState = .idle,
-        horizontalSpreadScale: Double = 0.65
+        horizontalSpreadScale: Double = 0.68
     ) -> WordRenderState {
         let start = word.start - wordLookahead
         let end = max(word.end, word.start + 0.15)
@@ -296,45 +295,45 @@ public extension StageMath {
         let after = pos - end
         let singing = max(0.08, end - word.start)
 
-        // 待唱初始偏移（对标桌面 ui_stage.go:237-238 的 sin/cos 散落，再适配竖屏安全幅度）
+        // 待唱：完全隐身于侧方 (opacity = 0)，小尺度/斜旋/虚焦，静待拍点凭空弹射飞入
         let spread = max(0.35, horizontalSpreadScale)
-        let waitX = shape.x * spread + sin(shape.y) * 46.0 * spread
-        let waitY = shape.y * spread + cos(shape.x) * 24.0 * spread
+        let waitX = shape.x * spread + sin(shape.y) * 56.0 * spread
+        let waitY = shape.y * spread + cos(shape.x) * 32.0 * spread
 
         var x = waitX
         var y = waitY
-        var scale = 0.72
-        var rotate = shape.rotate + 14.0
-        var opacity = 0.24
-        var blur = 3.0
-        var brightness = 0.56
+        var scale = 0.50
+        var rotate = shape.rotate + 20.0
+        var opacity = 0.0
+        var blur = 10.0
+        var brightness = 0.50
         var glow = 0.0
 
-        // 实时音律增益（低频踩拍与中频人声协同调制，节制峰值放大倍率防相邻汉字互相挤压碰撞）
+        // 实时音律增益（低频踩拍与中频人声协同调制弹性过冲与光芒）
         let vocalBoost = rhythm.vocal
         let pulseBoost = rhythm.beatPulse
         let bassBoost = rhythm.bass
-        let peakScale = shape.scale * (1.18 + 0.06 * vocalBoost + 0.05 * pulseBoost)
+        let peakScale = shape.scale * (1.28 + 0.08 * vocalBoost + 0.06 * pulseBoost)
 
         if since > 0 {
             let e = springStep(since)
             x = lerp(waitX, shape.x * spread, e)
             y = lerp(waitY, shape.y * spread, e)
-            scale = lerp(0.72, peakScale, e)
-            rotate = lerp(shape.rotate + 14.0, shape.rotate, e)
-            opacity = lerp(0.24, 1.0, clamp01(since / 0.09))
-            blur = 3.0 * (1.0 - clamp01(since / 0.16))
-            brightness = lerp(0.56, 1.0, clamp01(since / singing))
-            glow = clamp01(since / max(0.08, 0.28 * singing)) * (0.72 + 0.34 * vocalBoost + 0.24 * bassBoost)
+            scale = lerp(0.50, peakScale, e)
+            rotate = lerp(shape.rotate + 20.0, shape.rotate, e)
+            opacity = clamp01(since / 0.10)
+            blur = 10.0 * (1.0 - clamp01(since / 0.20))
+            brightness = lerp(0.55, 1.0, clamp01(since / singing))
+            glow = clamp01(since / max(0.08, 0.30 * singing)) * (0.76 + 0.32 * vocalBoost + 0.22 * bassBoost)
         }
 
         if after > 0 {
             let q = easeOutCubic(after / 0.5)
             scale = lerp(peakScale, shape.scale, q)
-            opacity = lerp(1.0, 0.80, q)
+            opacity = lerp(1.0, 0.82, q)
             rotate = shape.rotate + shape.drift * clamp01(after / 5.0)
-            brightness = lerp(1.0, 0.54, easeOutCubic(after / 0.8))
-            glow = max(0, (1.0 - clamp01(after / 0.9)) * (0.72 + 0.28 * bassBoost))
+            brightness = lerp(1.0, 0.52, easeOutCubic(after / 0.8))
+            glow = max(0, (1.0 - clamp01(after / 0.9)) * (0.74 + 0.26 * bassBoost))
         }
 
         return WordRenderState(
@@ -372,17 +371,19 @@ public extension StageMath {
         let since = pos - (first.start - wordLookahead)
         let lastEnd = max(last.end, last.start + 0.15)
         let endAfter = pos - lastEnd
+        let baseX = row.x * 0.62
         let side = row.left ? -36.0 : 36.0
 
-        var x = row.x * 0.45 + side
-        var scale = 0.86
-        var opacity = 0.16
+        // 1:1 还原桌面 ui_stage_styles.go:212：未轮到该排前彻底隐身(opacity=0)，到拍再随导标从两侧弹簧冲入
+        var x = baseX + side
+        var scale = 0.85
+        var opacity = 0.0
 
         if since > 0 {
             let e = springStep(since)
-            x = lerp(row.x * 0.45 + side, row.x * 0.45, e)
-            scale = lerp(0.86, 1.0, e)
-            opacity = lerp(0.16, 1.0, clamp01(since / 0.10))
+            x = lerp(baseX + side, baseX, e)
+            scale = lerp(0.85, 1.0, e)
+            opacity = clamp01(since / 0.10)
         }
 
         let guideProgress = since > 0 ? easeOutCubic(since / 0.40) : 0.0
@@ -390,16 +391,16 @@ public extension StageMath {
         let guideAlpha: Double
         if endAfter > 0 {
             guideState = .past
-            guideAlpha = 0.24
+            guideAlpha = 0.22
         } else if since > 0 {
             guideState = .singing
-            guideAlpha = min(1.0, 0.85 + 0.15 * rhythm.vocal + 0.15 * rhythm.beatPulse)
+            guideAlpha = min(1.0, 0.90 + 0.10 * rhythm.vocal + 0.10 * rhythm.beatPulse)
         } else {
             guideState = .upcoming
-            guideAlpha = 0.14
+            guideAlpha = 0.0
         }
 
-        let bassLift = (guideState == .singing) ? (-3.0 * rhythm.beatPulse) : 0.0
+        let bassLift = (guideState == .singing) ? (-2.5 * rhythm.beatPulse) : 0.0
         return StagePartitaRowMotion(
             offsetX: x,
             offsetY: row.y + bassLift,
@@ -438,7 +439,7 @@ public extension StageMath {
             guard part.from < part.to, part.to <= line.words.count else { return 0 }
             let joined = line.words[part.from..<part.to].map(\.text).joined().trimmingCharacters(in: .whitespaces)
             let runeCount = Double(joined.count)
-            let spacing = part.lean ? 0.13 : 0.06
+            let spacing = part.lean ? 0.15 : 0.08
             let tailMul = part.tail ? 1.18 : 1.0
             let effectiveSize = size * tailMul
             return wordWidth(joined, fontSize: effectiveSize) + runeCount * effectiveSize * spacing + effectiveSize * 0.4
@@ -506,8 +507,8 @@ public extension StageMath {
                 fontSize: size,
                 isLightWeight: part.lean,
                 isItalic: part.lean,
-                tracking: size * (part.lean ? 0.13 : 0.06),
-                spaceWidth: size * (part.lean ? 0.34 : 0.25),
+                tracking: size * (part.lean ? 0.15 : 0.08),
+                spaceWidth: size * (part.lean ? 0.35 : 0.25),
                 useAccentColor: part.lean
             )
         }
@@ -519,12 +520,12 @@ public extension StageMath {
         }
 
         let duration = part.lean ? 0.60 : 0.55
-        let progress = easeQuadOut(since / duration)
-        // 保持微弱未唱预见性，但临近前 0.25s 时丝滑升入
-        let opacity = since < 0 ? 0.18 : lerp(0.18, 1.0, progress)
+        let progress = since < 0 ? 0.0 : easeQuadOut(since / duration)
+        // 1:1 还原桌面 ui_stage_styles.go:405-414：每段在开唱前 250ms 才从下方 20~24pt 处渐显升起
+        let opacity = progress
         let rise = (part.lean ? 24.0 : 20.0) * (1.0 - progress)
         let baseScale = part.lean ? (0.92 + 0.08 * progress) : 1.0
-        let beatScale = (part.tail && since > 0) ? (1.0 + 0.03 * rhythm.beatPulse) : 1.0
+        let beatScale = (part.tail && since > 0) ? (1.0 + 0.02 * rhythm.beatPulse) : 1.0
         let effectiveFont = (!part.lean && part.tail) ? (size * 1.18) : size
 
         return StageTiltPartMotion(
@@ -534,8 +535,8 @@ public extension StageMath {
             fontSize: effectiveFont,
             isLightWeight: part.lean,
             isItalic: part.lean,
-            tracking: effectiveFont * (part.lean ? 0.13 : 0.06),
-            spaceWidth: effectiveFont * (part.lean ? 0.34 : 0.25),
+            tracking: effectiveFont * (part.lean ? 0.15 : 0.08),
+            spaceWidth: effectiveFont * (part.lean ? 0.35 : 0.25),
             useAccentColor: part.lean
         )
     }
@@ -571,14 +572,14 @@ public extension StageMath {
         }
 
         let basePulse = part.lean ? 0.18 : 0.15
-        let audioMod = 1.0 + 0.40 * rhythm.vocal + 0.28 * rhythm.beatPulse
+        let audioMod = 1.0 + 0.20 * rhythm.vocal + 0.16 * rhythm.beatPulse
         let scale = 1.0 + swell * basePulse * audioMod
 
-        // 斜体倾诉句逐字一高一低交替浮动
+        // 斜体倾诉句逐字一高一低交替波浪（幅度随渐显由 size/3 收敛停稳在 ±size/6）
         let waveOffsetY: Double
         if part.lean {
-            let amp = (size / 6.5) * (2.0 - shown)
-            let audioRipple = size * 0.04 * rhythm.vocal * sin(pos * 6.0 + Double(charOrderIndex) * 0.8)
+            let amp = (size / 6.0) * (2.0 - shown)
+            let audioRipple = size * 0.015 * rhythm.vocal * sin(pos * 5.0 + Double(charOrderIndex) * 0.8)
             waveOffsetY = (charOrderIndex % 2 == 0 ? -amp : amp) + audioRipple
         } else {
             waveOffsetY = 0
@@ -586,7 +587,7 @@ public extension StageMath {
 
         let highlight = t >= 0 && t <= d ? sin((t / d) * .pi) : 0.0
         return StageTiltCharMotion(
-            opacity: lerp(0.18, 1.0, shown),
+            opacity: shown,
             scale: scale,
             waveOffsetY: waveOffsetY,
             highlightStrength: highlight
@@ -761,5 +762,248 @@ public extension StageMath {
         }
         parts.append(TiltPart(from: units[from].0, to: units[units.count - 1].1))
         return parts
+    }
+}
+
+// MARK: - 正在播放烟雾背景引擎（1:1 移植桌面端 backdrop.go 与 artwork.go 取色/物理步进）
+
+/// 线性浮点 RGB 颜色值（各分量范围 0...1），对应 Go ui.Color
+public struct BackdropRGBColor: Equatable, Sendable {
+    public var r: Double
+    public var g: Double
+    public var b: Double
+
+    /// 桌面端未命中封面时的默认中性烟雾底色（对应 ui_nowplaying.go RGB(120, 120, 130)）
+    public static let defaultTint = BackdropRGBColor(
+        r: 120.0 / 255.0,
+        g: 120.0 / 255.0,
+        b: 130.0 / 255.0
+    )
+
+    public init(r: Double, g: Double, b: Double) {
+        self.r = min(max(r, 0), 1)
+        self.g = min(max(g, 0), 1)
+        self.b = min(max(b, 0), 1)
+    }
+}
+
+/// 烟雾背景色彩提取、HSV 双色调配比与切歌缓出计算（对应 internal/app/backdrop.go & artwork.go）
+public enum BackdropFogMath {
+    /// 切歌时旧背景淡出时长（700ms，对应 backdrop.go backdropFade）
+    public static let backdropFadeDuration: TimeInterval = 0.70
+
+    /// RGB(0...1) 转 HSV（h: 0..<360, s: 0...1, v: 0...1），对应 artwork.go hsv()
+    public static func rgbToHSV(r: Double, g: Double, b: Double) -> (h: Double, s: Double, v: Double) {
+        let cr = min(max(r, 0), 1)
+        let cg = min(max(g, 0), 1)
+        let cb = min(max(b, 0), 1)
+        let mx = max(cr, max(cg, cb))
+        let mn = min(cr, min(cg, cb))
+        let v = mx
+        if mx == 0 {
+            return (0, 0, 0)
+        }
+        let d = mx - mn
+        let s = d / mx
+        var h: Double
+        if d == 0 {
+            h = 0
+        } else if mx == cr {
+            h = ((cg - cb) / d).truncatingRemainder(dividingBy: 6) * 60
+        } else if mx == cg {
+            h = ((cb - cr) / d + 2) * 60
+        } else {
+            h = ((cr - cg) / d + 4) * 60
+        }
+        if h < 0 {
+            h += 360
+        }
+        return (h, s, v)
+    }
+
+    /// HSV 转 RGB(0...1)，对应 backdrop.go hsvColor()
+    public static func hsvToRGB(h: Double, s: Double, v: Double) -> BackdropRGBColor {
+        let clampedS = min(max(s, 0), 1)
+        let clampedV = min(max(v, 0), 1)
+        var hue = h.truncatingRemainder(dividingBy: 360)
+        if hue < 0 { hue += 360 }
+
+        let c = clampedV * clampedS
+        let modPart = (hue / 60.0).truncatingRemainder(dividingBy: 2.0)
+        let x = c * (1.0 - abs(modPart - 1.0))
+
+        let r: Double
+        let g: Double
+        let b: Double
+        switch hue {
+        case ..<60:
+            (r, g, b) = (c, x, 0)
+        case ..<120:
+            (r, g, b) = (x, c, 0)
+        case ..<180:
+            (r, g, b) = (0, c, x)
+        case ..<240:
+            (r, g, b) = (0, x, c)
+        case ..<300:
+            (r, g, b) = (x, 0, c)
+        default:
+            (r, g, b) = (c, 0, x)
+        }
+        let m = clampedV - c
+        return BackdropRGBColor(r: r + m, g: g + m, b: b + m)
+    }
+
+    /// 计算烟雾开启时的深底色 Deep(v=0.30) 与浓雾亮色 Fog(v=0.72)，保持灰度封面不串色（对应 fogColors）
+    public static func fogColors(from tint: BackdropRGBColor) -> (deep: BackdropRGBColor, fog: BackdropRGBColor) {
+        let (h, rawS, _) = rgbToHSV(r: tint.r, g: tint.g, b: tint.b)
+        let s = rawS > 0.12 ? min(max(rawS * 1.3, 0.60), 0.85) : rawS
+        let deep = hsvToRGB(h: h, s: s, v: 0.30)
+        let fog = hsvToRGB(h: h, s: s * 0.60, v: 0.72)
+        return (deep, fog)
+    }
+
+    /// 计算关闭烟雾开关时的静态双色渐变顶/底色（对应 backdropColors）
+    public static func backdropColors(from tint: BackdropRGBColor) -> (top: BackdropRGBColor, foot: BackdropRGBColor) {
+        let (h, rawS, _) = rgbToHSV(r: tint.r, g: tint.g, b: tint.b)
+        let s = rawS > 0.12 ? min(max(rawS * 1.3, 0.45), 0.66) : rawS
+        let top = hsvToRGB(h: h, s: s, v: 0.35)
+        let foot = hsvToRGB(h: h, s: min(s * 1.05, 0.70), v: 0.24)
+        return (top, foot)
+    }
+
+    /// 从缩放后的 RGBA8 像素缓冲区按 18 色相桶加权 (s*s*v) 提取封面最具代表性的主色调（对应 artwork.go dominantColor）
+    public static func dominantColorFromRGBA(bytes: [UInt8], width: Int, height: Int) -> BackdropRGBColor? {
+        let pixelCount = width * height
+        guard width > 0, height > 0, bytes.count >= pixelCount * 4 else { return nil }
+
+        let buckets = 18
+        var weight = [Double](repeating: 0, count: buckets)
+        var sumR = [Double](repeating: 0, count: buckets)
+        var sumG = [Double](repeating: 0, count: buckets)
+        var sumB = [Double](repeating: 0, count: buckets)
+        var grayR = 0.0
+        var grayG = 0.0
+        var grayB = 0.0
+        var opaqueSamples = 0.0
+
+        for idx in 0..<pixelCount {
+            let offset = idx * 4
+            let a = Double(bytes[offset + 3]) / 255.0
+            guard a > 0.05 else { continue }
+            // 反除预乘 Alpha 还原真实色度
+            let invA = 1.0 / a
+            let r = min(max((Double(bytes[offset]) / 255.0) * invA, 0), 1)
+            let g = min(max((Double(bytes[offset + 1]) / 255.0) * invA, 0), 1)
+            let b = min(max((Double(bytes[offset + 2]) / 255.0) * invA, 0), 1)
+
+            grayR += r
+            grayG += g
+            grayB += b
+            opaqueSamples += 1
+
+            let (h, s, v) = rgbToHSV(r: r, g: g, b: b)
+            guard s >= 0.15, v >= 0.15 else { continue }
+            let w = s * s * v
+            let bucket = min(buckets - 1, max(0, Int(h / 360.0 * Double(buckets)) % buckets))
+            weight[bucket] += w
+            sumR[bucket] += r * w
+            sumG[bucket] += g * w
+            sumB[bucket] += b * w
+        }
+
+        guard opaqueSamples > 0 else { return nil }
+        var best = 0
+        for bucket in 1..<buckets where weight[bucket] > weight[best] {
+            best = bucket
+        }
+        if weight[best] < 2.0 {
+            return BackdropRGBColor(
+                r: grayR / opaqueSamples,
+                g: grayG / opaqueSamples,
+                b: grayB / opaqueSamples
+            )
+        }
+        let w = weight[best]
+        return BackdropRGBColor(
+            r: sumR[best] / w,
+            g: sumG[best] / w,
+            b: sumB[best] / w
+        )
+    }
+
+    /// 切歌时旧烟雾残余透明度 ((1 - k)^3)，对应 backdrop.go backdropFade
+    public static func beforeLayerOpacity(elapsedSinceFadeStart elapsed: TimeInterval) -> Double {
+        guard elapsed > 0 else { return 1.0 }
+        let k = min(max(elapsed / backdropFadeDuration, 0.0), 1.0)
+        if k >= 1.0 { return 0.0 }
+        let inv = 1.0 - k
+        return inv * inv * inv
+    }
+}
+
+/// 烟雾背景平滑漂移时钟与低频脉冲滤波器（对应 backdrop.go backdropCache.step & ui_kit.go barState）
+public struct BackdropMotionState: Sendable {
+    public static let bandCount = 24
+
+    public private(set) var drift: Double = 0
+    public private(set) var speed: Double = 0
+    public private(set) var bands: [Double] = Array(repeating: 0, count: bandCount)
+    private var lastTime: TimeInterval? = nil
+
+    public init() {}
+
+    /// 步进一帧时间并平滑频谱能量；返回当前背景是否仍在运动或脉冲衰减（静止时返回 false 停止无谓渲染）
+    @discardableResult
+    public mutating func step(
+        now: TimeInterval,
+        playing: Bool,
+        levels: [Float],
+        live: Bool
+    ) -> Bool {
+        let rawDt: Double
+        if let prev = lastTime {
+            let delta = now - prev
+            rawDt = (delta <= 0 || delta > 0.2) ? (1.0 / 30.0) : delta
+        } else {
+            rawDt = 1.0 / 30.0
+        }
+        lastTime = now
+
+        let targetSpeed = playing ? 1.0 : 0.0
+        speed += (targetSpeed - speed) * min(1.0, 2.5 * rawDt)
+        if abs(targetSpeed - speed) < 0.005 {
+            speed = targetSpeed
+        }
+        drift += speed * rawDt
+
+        for i in 0..<Self.bandCount {
+            let tg: Double
+            if live && !levels.isEmpty {
+                let mappedIdx = min(levels.count - 1, (i * levels.count) / Self.bandCount)
+                tg = min(max(Double(levels[mappedIdx]), 0.0), 1.0)
+            } else {
+                tg = 0.0
+            }
+            let rate = tg < bands[i] ? 6.0 : 18.0
+            bands[i] += (tg - bands[i]) * min(1.0, rate * rawDt)
+        }
+
+        return speed > 0 || bassLevel > 0.004
+    }
+
+    /// 取前 6 格低频均值为桌面端一致的 Bass 亮度与密度推动信号（0...1）
+    public var bassLevel: Double {
+        let count = min(6, bands.count)
+        guard count > 0 else { return 0 }
+        var sum = 0.0
+        for i in 0..<count {
+            sum += bands[i]
+        }
+        return min(max(sum / Double(count), 0.0), 1.0)
+    }
+
+    /// 供测试或外部校准时重置时间锚点而不丢弃累积相位
+    public mutating func resetClockAnchor() {
+        lastTime = nil
     }
 }

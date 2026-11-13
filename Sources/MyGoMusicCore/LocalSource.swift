@@ -55,7 +55,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
 
     public var onChange: (@Sendable () -> Void)?
 
-    public init(dataDir: URL) {
+    public init(dataDir: URL, eagerSyncScan: Bool = true) {
         self.dataDir = dataDir
         self.defaultMusicFolder = dataDir.appendingPathComponent("MusicFiles", isDirectory: true)
         try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
@@ -85,8 +85,14 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
             saveLibraryLocked()
             lock.unlock()
         }
-        rebuildCatalogSynchronously()
-        let task = Task.detached(priority: .utility) { [weak self] in
+        if eagerSyncScan {
+            rebuildCatalogSynchronously()
+        } else {
+            lock.lock()
+            self.isScanningFlag = true
+            lock.unlock()
+        }
+        let task = Task.detached(priority: eagerSyncScan ? .utility : .userInitiated) { [weak self] in
             guard let self else { return }
             await self.rescanAsync()
         }

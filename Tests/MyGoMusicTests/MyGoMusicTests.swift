@@ -252,7 +252,15 @@ final class MyGoMusicTests: XCTestCase {
             shape: shapes[shapes.count - 1],
             pos: upcomingWord.start - 0.5
         )
-        XCTAssertGreaterThan(upcomingState.opacity, 0, "未唱到的字仍应可辨认，整句不应缺字")
+        XCTAssertEqual(upcomingState.opacity, 0.0, "未唱到的字应先完全隐身，到拍时再凭空蹦出")
+
+        let activeState = StageMath.wordState(
+            word: upcomingWord,
+            shape: shapes[shapes.count - 1],
+            pos: upcomingWord.start + 0.05
+        )
+        XCTAssertGreaterThan(activeState.opacity, 0.8, "进入演唱时刻应在瞬间显形弹出")
+        XCTAssertGreaterThan(activeState.scale, upcomingState.scale, "弹入瞬间应触发弹簧放大")
 
         let flowRows = StageMath.flowRows(for: line, shapes: shapes, fontSize: 36, availableWidth: 180)
         XCTAssertGreaterThan(flowRows.count, 1)
@@ -804,6 +812,124 @@ final class MyGoMusicTests: XCTestCase {
         let model = AppModel(baseDataDir: tmpRoot)
         _ = MainView().environmentObject(model)
         _ = MiniPlayerBarView().environmentObject(model)
+        _ = SearchView().environmentObject(model)
+    }
+
+    @MainActor
+    func testSearchKeyboardDismissHelperAndCommentControls() async {
+        MyGoKeyboard.dismiss()
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-kbd-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let model = AppModel(baseDataDir: tmpRoot, deferHeavyStartup: true)
+        await model.waitUntilStartupReady()
+        _ = SearchView().environmentObject(model)
+        _ = NowPlayingView().environmentObject(model)
+    }
+
+    @MainActor
+    func testLyricArtistNavigationResolutionCrossSourceAndSearchFallback() async throws {
+        // 1) Track 歌手解析：保留有效 ID、过滤空名称
+        let structuredTrack = Track(
+            id: "tr-1",
+            source: "jay-plugin",
+            name: "红尘客栈",
+            artists: [Artist(id: "ar-jay", name: "周杰伦"), Artist(id: "", name: "  ")],
+            album: Album(id: "al-12", name: "12新作")
+        )
+        XCTAssertEqual(structuredTrack.resolvedArtistsForNavigation.count, 1)
+        XCTAssertEqual(structuredTrack.resolvedArtistsForNavigation.first?.id, "ar-jay")
+        XCTAssertEqual(structuredTrack.resolvedArtistsForNavigation.first?.name, "周杰伦")
+
+        // 2) 通过真实 JS 插件夹具，测试当前切到 "local" 时从歌词页跨源直达原歌曲所属插件歌手页及所有歌曲
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-artist-nav-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+
+        let pluginDir = tmpRoot.appendingPathComponent("plugins/jay-plugin", isDirectory: true)
+        try FileManager.default.createDirectory(at: pluginDir, withIntermediateDirectories: true)
+        let manifest: [String: Any] = [
+            "id": "jay-plugin",
+            "name": "Jay Test Source",
+            "version": "1.0.0",
+            "main": "index.js",
+            "playback": "stream"
+        ]
+        let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted])
+        try manifestData.write(to: pluginDir.appendingPathComponent("plugin.json"))
+        let indexJS = #"""
+        export function artist(args) {
+          if (args.id !== "ar-jay") { throw new Error("not found"); }
+          return {
+            artist: { id: "ar-jay", name: "周杰伦", following: false },
+            tracks: [
+              { id: "t1", name: "红尘客栈", artists: [{ id: "ar-jay", name: "周杰伦" }], album: { id: "al12", name: "12新作" }, duration: 274000 },
+              { id: "t2", name: "夜曲", artists: [{ id: "ar-jay", name: "周杰伦" }], album: { id: "al11", name: "十一月的萧邦" }, duration: 226000 }
+            ],
+            albums: [
+              { id: "al12", name: "12新作", released: "2012-12-28" }
+            ]
+          };
+        }
+        export function search(args) {
+          if (args.kind === "artists") {
+            return { artists: [{ id: "ar-jay", name: "周杰伦" }], more: false };
+          }
+          if (args.kind === "tracks") {
+            return {
+              tracks: [
+                { id: "t3", name: "七里香", artists: [{ id: "ar-jay", name: "周杰伦" }], album: { id: "al7", name: "七里香" }, duration: 299000 }
+              ],
+              more: false
+            };
+          }
+          return { more: false };
+        }
+        export function stream(args) {
+          return { url: "https://example.com/" + args.id + ".mp3", type: "mp3" };
+        }
+        """#
+        try indexJS.write(to: pluginDir.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        let model = AppModel(baseDataDir: tmpRoot)
+        model.switchSource(to: "local")
+        XCTAssertEqual(model.activeSourceID, "local", "即使当前浏览源停留在 local，点开插件歌曲歌手仍应跨源命中")
+
+        let crossSourceOutcome = await model.loadArtistPage(artistID: "ar-jay", fallbackName: "周杰伦", sourceID: "jay-plugin")
+        XCTAssertNotNil(crossSourceOutcome)
+        XCTAssertEqual(crossSourceOutcome?.resolvedSourceID, "jay-plugin")
+        XCTAssertEqual(crossSourceOutcome?.page.artist.name, "周杰伦")
+        XCTAssertEqual(crossSourceOutcome?.page.tracks?.map(\.name), ["红尘客栈", "夜曲"])
+        XCTAssertEqual(crossSourceOutcome?.page.tracks?.first?.source, "jay-plugin")
+        XCTAssertEqual(crossSourceOutcome?.page.albums?.first?.name, "12新作")
+
+        // 3) 若歌曲缺少 artist.id，通过名字搜索匹配歌手 ID 再加载全部作品
+        let missingIdOutcome = await model.loadArtistPage(artistID: "", fallbackName: "周杰伦", sourceID: "jay-plugin")
+        XCTAssertEqual(missingIdOutcome?.page.artist.id, "ar-jay")
+        XCTAssertEqual(missingIdOutcome?.page.tracks?.count, 2)
+
+        // 4) 分页查看更多歌曲：从 search 补齐同一歌手其它歌曲并自动盖上 sourceID
+        let moreTracks = await model.loadMoreArtistTracks(artistName: "周杰伦", sourceID: "jay-plugin", offset: 0)
+        XCTAssertEqual(moreTracks.tracks.map(\.name), ["七里香"])
+        XCTAssertEqual(moreTracks.tracks.first?.source, "jay-plugin")
+        XCTAssertFalse(moreTracks.hasMore)
+
+        // 5) 队列终极兜底：若某首演示/内存中曲目未入库也无所属插件，点击歌手仍可在队列中聚合看到她的歌曲
+        let queueOnlyTrack = Track(
+            id: "demo-queue-track",
+            source: "unregistered-source",
+            name: "春日影 (Demo)",
+            artists: [Artist(id: "ar-queue", name: "MyGO_Solo")],
+            album: Album(id: "al-q", name: "Demo")
+        )
+        model.player.playQueue([queueOnlyTrack], start: 0)
+        model.player.pause()
+        let queueFallbackOutcome = await model.loadArtistPage(artistID: "ar-queue", fallbackName: "MyGO_Solo", sourceID: "unregistered-source")
+        XCTAssertEqual(queueFallbackOutcome?.page.artist.name, "MyGO_Solo")
+        XCTAssertEqual(queueFallbackOutcome?.page.tracks?.map(\.name), ["春日影 (Demo)"])
+
+        _ = ArtistDetailView(artistID: "ar-jay", fallbackName: "周杰伦", sourceID: "jay-plugin").environmentObject(model)
+        _ = AlbumDetailView(albumID: "al12", fallbackName: "12新作", sourceID: "jay-plugin").environmentObject(model)
     }
 
     // MARK: - 13. 缓冲超时看门狗、OGG 格式拦截与灰色无权限歌曲队列跳过回归测试
@@ -953,9 +1079,9 @@ final class MyGoMusicTests: XCTestCase {
         ]
         let stageLine = LyricLine(at: 10.0, end: 12.2, text: "迷子となる", words: shortWords)
 
-        // Flow 舞台落位（命中桌面三档高度表 [-0.11, 0.0, 0.09]）
+        // Flow 舞台九宫格随机落位（命中上/中/下三档纵深高度表 [-0.31, -0.02, 0.24]）
         let flowPlace = StageMath.flowPlacement(for: stageLine, containerWidth: 360)
-        XCTAssertTrue([-0.11, 0.0, 0.09].contains(flowPlace.verticalShiftRatio))
+        XCTAssertTrue([-0.31, -0.02, 0.24].contains(flowPlace.verticalShiftRatio))
 
         // 光束火花数：普通词 9 条 / 行末词 16 条 / 超出持续时长清空
         let midSparks = StageMath.sparkStreaks(size: CGSize(width: 44, height: 48), since: 0.14, seed: 10.0, isLastWord: false)
@@ -964,17 +1090,22 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(lastSparks.count, 16)
         XCTAssertTrue(StageMath.sparkStreaks(size: CGSize(width: 44, height: 48), since: 1.5, seed: 10.0, isLastWord: false).isEmpty)
 
-        // Steps 导标状态三阶段流转
+        // Steps 导标状态三阶段流转（对齐桌面 ui_stage_styles.go：未唱排隐藏，已唱直角导标保留 0.22 淡影）
         let pRow = PartitaRow(from: 0, to: shortWords.count, x: -24, y: 12, scale: 1.0, left: true)
         let upcomingRow = StageMath.partitaRowMotion(words: shortWords[...], row: pRow, pos: 8.5)
         let singingRow = StageMath.partitaRowMotion(words: shortWords[...], row: pRow, pos: 10.5)
         let pastRow = StageMath.partitaRowMotion(words: shortWords[...], row: pRow, pos: 12.5)
         XCTAssertEqual(upcomingRow.guideState, .upcoming)
+        XCTAssertEqual(upcomingRow.opacity, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(upcomingRow.guideProgress, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(upcomingRow.guideAlpha, 0.0, accuracy: 0.0001)
         XCTAssertEqual(singingRow.guideState, .singing)
-        XCTAssertEqual(pastRow.guideState, .past)
+        XCTAssertEqual(singingRow.opacity, 1.0, accuracy: 0.0001)
         XCTAssertGreaterThan(singingRow.guideProgress, 0.5)
+        XCTAssertEqual(pastRow.guideState, .past)
+        XCTAssertEqual(pastRow.guideAlpha, 0.22, accuracy: 0.0001)
 
-        // Tilt 超宽文本自适应防折行字号压缩 + 斜体上下交错波浪
+        // Tilt 超宽文本自适应防折行字号压缩 + 段落进场前隐形 + 桌面字重/字距 + 斜体波浪交错
         var wideWords: [LyricWord] = []
         for idx in 0..<24 {
             let st = 20.0 + Double(idx) * 0.18
@@ -985,7 +1116,24 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertLessThan(fitted.fontSize, 38.0)
         XCTAssertGreaterThanOrEqual(fitted.fittedLineRatio, 0.48)
 
+        let plainPart = TiltPart(from: 0, to: shortWords.count, lean: false, tail: false)
         let leanPart = TiltPart(from: 0, to: 4, lean: true, tail: false)
+        let preTiltPart = StageMath.tiltPartMotion(words: shortWords[...], part: plainPart, pos: 9.6, size: 32)
+        let afterTiltPart = StageMath.tiltPartMotion(words: shortWords[...], part: plainPart, pos: 10.5, size: 32)
+        let activeLeanPart = StageMath.tiltPartMotion(words: shortWords[0..<4], part: leanPart, pos: 10.5, size: 32)
+        XCTAssertEqual(preTiltPart.opacity, 0.0, accuracy: 0.0001, "Tilt 段在开唱前 250ms 之前必须保持隐形")
+        XCTAssertEqual(afterTiltPart.opacity, 1.0, accuracy: 0.0001)
+        XCTAssertFalse(afterTiltPart.isLightWeight, "桌面普通倾诉段使用 Regular(400) 字重而非 Light")
+        XCTAssertFalse(afterTiltPart.isItalic)
+        XCTAssertEqual(afterTiltPart.tracking, 32 * 0.08, accuracy: 0.0001)
+        XCTAssertTrue(activeLeanPart.isItalic)
+        XCTAssertTrue(activeLeanPart.useAccentColor)
+        XCTAssertEqual(activeLeanPart.tracking, 32 * 0.15, accuracy: 0.0001)
+
+        let preChar = StageMath.tiltCharMotion(partSince: -0.1, charDuration: 0.35, charStart: 10.5, charOrderIndex: 1, part: leanPart, size: 32, pos: 9.65)
+        XCTAssertEqual(preChar.opacity, 0.0, accuracy: 0.0001, "Tilt 单字在段落起唱前 250ms 之前必须保持隐形")
+        let staggeredChar = StageMath.tiltCharMotion(partSince: 0.02, charDuration: 0.35, charStart: 10.5, charOrderIndex: 3, part: leanPart, size: 32, pos: 9.77)
+        XCTAssertEqual(staggeredChar.opacity, 0.0, accuracy: 0.0001, "Tilt 后续字符在 stagger 延迟期未到前应当保持隐形")
         let evenChar = StageMath.tiltCharMotion(partSince: 0.25, charDuration: 0.35, charStart: 10.0, charOrderIndex: 0, part: leanPart, size: 32, pos: 10.12)
         let oddChar = StageMath.tiltCharMotion(partSince: 0.25, charDuration: 0.35, charStart: 10.35, charOrderIndex: 1, part: leanPart, size: 32, pos: 10.12)
         XCTAssertLessThan(evenChar.waveOffsetY * oddChar.waveOffsetY, 0, "斜体倾诉句相邻字符应当上下交替波浪错位")
@@ -1157,15 +1305,17 @@ final class MyGoMusicTests: XCTestCase {
         let targetShape = shapes[1]
         let stateBefore = StageMath.stageWordState(word: targetWord, shape: targetShape, pos: 0.5)
         let stateActive = StageMath.stageWordState(word: targetWord, shape: targetShape, pos: targetWord.start + 0.12)
-        XCTAssertGreaterThan(stateActive.opacity, stateBefore.opacity, "进入演唱时刻时单词不透明度必须提升")
+        XCTAssertEqual(stateBefore.opacity, 0.0, "Flow/Steps 待唱单词应先完全隐身，不可提前摆成 KTV 灰字点亮")
+        XCTAssertGreaterThan(stateActive.opacity, stateBefore.opacity, "进入演唱时刻时单词应凭空弹出显形")
         XCTAssertGreaterThan(stateActive.scale, stateBefore.scale, "进入演唱时刻时单词缩放应弹跳放大")
         XCTAssertGreaterThan(stateActive.brightness, stateBefore.brightness, "进入演唱时刻时单词亮度应点亮")
+        XCTAssertLessThan(stateActive.blur, stateBefore.blur, "进入演唱时刻时单词应由虚焦迅速聚焦清晰")
 
         let exitOpacityMid = StageMath.lineExitOpacity(nextLineStart: lines[1].at, at: lines[1].at + 0.15)
         XCTAssertGreaterThan(exitOpacityMid, 0.0)
         XCTAssertLessThan(exitOpacityMid, 1.0, "切换至下一句时旧行应在 0.4s 退场窗口内平滑叠化消隐")
 
-        // 4) 验证 Flow 在 3s 整倍时间戳下不再全数共振锁死在同一落位（左上角）
+        // 4) 验证 Flow 在 3s 整倍时间戳下真随机散落到九宫格不同方位（左上/正中/右下等）
         let periodicLines = (0..<12).map { idx in
             LyricLine(
                 at: TimeInterval(idx * 3),
@@ -1175,8 +1325,8 @@ final class MyGoMusicTests: XCTestCase {
             )
         }
         let placements = periodicLines.map { StageMath.flowPlacement(for: $0, containerWidth: 345) }
-        XCTAssertGreaterThan(Set(placements.map(\.alignment)).count, 1, "Flow 横向错落不应在 3s 周期时间戳上全部锁死于左上角")
-        XCTAssertGreaterThan(Set(placements.map(\.verticalShiftRatio)).count, 1, "Flow 纵向浮沉不应全部锁死在顶部")
+        XCTAssertGreaterThanOrEqual(Set(placements.map(\.alignment)).count, 2, "Flow 应具备左/中/右多方位随机落位")
+        XCTAssertGreaterThanOrEqual(Set(placements.map(\.verticalShiftRatio)).count, 2, "Flow 应具备上/中/下多层级纵深错落")
     }
 
     // MARK: - 16. 系统硬件音量双向同步与防回弹拖动锁测试
@@ -1281,6 +1431,262 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(likedMap[staleTrackID], true)
         XCTAssertEqual(likedMap[wavURL.path], true)
         XCTAssertEqual(source.folders(), [newMusicDir.path], "应清理失效的历史沙盒容器 MusicFiles 冗余路径")
+    }
+
+    // MARK: - 18. 插件转译磁盘缓存命中/失效与冷启动异步延迟装配测试
+
+    func testPluginTranspilerCacheHitAndInvalidationOnEdit() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mygo-transpile-cache-\(UUID().uuidString)", isDirectory: true)
+        let pluginDir = root.appendingPathComponent("plugin", isDirectory: true)
+        let cacheURL = root.appendingPathComponent("data/.transpiled-cache-v2.json")
+        defer { try? fm.removeItem(at: root) }
+        try fm.createDirectory(at: pluginDir, withIntermediateDirectories: true)
+
+        let entryURL = pluginDir.appendingPathComponent("index.ts")
+        let sourceV1 = """
+        interface Meta { tag: string; }
+        export const marker: string = "ver1";
+        """
+        try sourceV1.write(to: entryURL, atomically: true, encoding: .utf8)
+
+        let origAttrs = try fm.attributesOfItem(atPath: entryURL.path)
+        let origModDate = origAttrs[.modificationDate] as? Date ?? Date()
+
+        let direct = try PluginModuleTranspiler.bundleEntry(entryURL: entryURL, pluginDir: pluginDir)
+        let firstCached = try PluginModuleTranspiler.bundleEntryCached(
+            entryURL: entryURL,
+            pluginDir: pluginDir,
+            cacheFileURL: cacheURL
+        )
+        XCTAssertEqual(firstCached.code, direct.code, "首次生成缓存结果应与直接转译完全一致")
+        XCTAssertEqual(firstCached.exports, direct.exports)
+        XCTAssertTrue(fm.fileExists(atPath: cacheURL.path), "应落盘 .transpiled-cache-v2.json")
+
+        // 同 mtime + 同文件大小下修改源码，二次调用必须直接命中磁盘缓存而不重新扫描
+        let sourceSameSize = """
+        interface Meta { tag: string; }
+        export const marker: string = "ver2";
+        """
+        XCTAssertEqual(sourceSameSize.utf8.count, sourceV1.utf8.count)
+        try sourceSameSize.write(to: entryURL, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.modificationDate: origModDate], ofItemAtPath: entryURL.path)
+
+        let hitResult = try PluginModuleTranspiler.bundleEntryCached(
+            entryURL: entryURL,
+            pluginDir: pluginDir,
+            cacheFileURL: cacheURL
+        )
+        XCTAssertTrue(hitResult.code.contains("\"ver1\""), "指纹一致时应直接复用缓存结果")
+
+        // 修改大小（和时间戳）后应自动失效并重新转译最新源码
+        let sourceV3 = """
+        interface Meta { tag: string; }
+        export const marker: string = "ver3_updated";
+        """
+        try sourceV3.write(to: entryURL, atomically: true, encoding: .utf8)
+        let rebuilt = try PluginModuleTranspiler.bundleEntryCached(
+            entryURL: entryURL,
+            pluginDir: pluginDir,
+            cacheFileURL: cacheURL
+        )
+        XCTAssertTrue(rebuilt.code.contains("\"ver3_updated\""), "文件变动后应自动失效并重新打包最新源码")
+        XCTAssertFalse(rebuilt.code.contains("interface Meta"), "重打包后仍应正常剥离 TS 类型声明")
+    }
+
+    @MainActor
+    func testDeferredStartupCompletesWithoutBlockingMainInitAndRestoresState() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mygo-deferred-start-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let pluginDir = root.appendingPathComponent("plugins/fast-test", isDirectory: true)
+        try fm.createDirectory(at: pluginDir, withIntermediateDirectories: true)
+        try """
+        {
+          "id": "fast-test",
+          "name": "Fast Test",
+          "version": "1.0.0",
+          "main": "index.js"
+        }
+        """.write(to: pluginDir.appendingPathComponent("plugin.json"), atomically: true, encoding: .utf8)
+        try """
+        export const info = () => ({ id: "fast-test", name: "Fast Test", version: "1.0.0", playback: "stream" });
+        """.write(to: pluginDir.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        let track = Track(
+            id: "fast-t1",
+            source: "fast-test",
+            name: "Delayed Warm Track",
+            artists: [Artist(id: "a1", name: "MyGO!!!!!")],
+            album: Album(id: "al1", name: "Album"),
+            duration: 90_000
+        )
+        let session = SavedPlaybackSession(
+            queue: [track],
+            currentIndex: 0,
+            positionSeconds: 12.5,
+            shuffle: false,
+            repeatMode: .all
+        )
+        let sessionData = try JSONEncoder().encode(session)
+        try sessionData.write(to: root.appendingPathComponent("session.json"))
+
+        let app = AppModel(baseDataDir: root, deferHeavyStartup: true)
+        // 验证同步 init 阶段未做插件发现/会话恢复阻塞，首帧可立即可见
+        XCTAssertFalse(app.isStartupReady)
+        XCTAssertTrue(app.isLoadingHome)
+        XCTAssertTrue(app.pluginSources.isEmpty)
+        XCTAssertNil(app.player.currentTrack)
+
+        await app.waitUntilStartupReady()
+
+        XCTAssertTrue(app.isStartupReady)
+        XCTAssertNotNil(app.deferredStartupDurationMs)
+        XCTAssertEqual(app.pluginSources.map(\.manifest.id), ["fast-test"])
+        XCTAssertEqual(app.player.currentTrack?.id, "fast-t1")
+        XCTAssertFalse(app.player.isPlaying, "冷启动恢复历史会话不应自动突兀开声")
+        let cacheFile = root.appendingPathComponent("plugin-data/fast-test/.transpiled-cache-v2.json")
+        XCTAssertTrue(fm.fileExists(atPath: cacheFile.path), "后台延迟装配也应产出插件转译磁盘缓存")
+    }
+
+    func testFloatingTabBarSliderMathAndGestures() {
+        let barWidth: CGFloat = 353
+        let count = 4
+
+        let slotW = FloatingTabBarSliderMath.slotWidth(barWidth: barWidth, count: count)
+        XCTAssertGreaterThan(slotW, 75)
+
+        // 1. 四个槽位中心严格递增且分别精准映射回原索引
+        let centers = (0..<count).map {
+            FloatingTabBarSliderMath.slotCenterX(index: $0, barWidth: barWidth, count: count)
+        }
+        for i in 0..<(count - 1) {
+            XCTAssertLessThan(centers[i], centers[i + 1])
+        }
+        for i in 0..<count {
+            XCTAssertEqual(FloatingTabBarSliderMath.tabIndex(forX: centers[i], barWidth: barWidth, count: count), i)
+        }
+
+        // 2. 向左/向右过度拖出边界时保持 Apple 橡皮筋阻尼且不出界
+        let overLeft = FloatingTabBarSliderMath.clampedPillCenterX(rawX: -120, barWidth: barWidth, count: count)
+        XCTAssertLessThan(overLeft, centers[0])
+        XCTAssertGreaterThan(overLeft, centers[0] - FloatingTabBarMetrics.outerInset * 0.71)
+
+        let overRight = FloatingTabBarSliderMath.clampedPillCenterX(rawX: barWidth + 120, barWidth: barWidth, count: count)
+        XCTAssertGreaterThan(overRight, centers[3])
+        XCTAssertLessThan(overRight, centers[3] + FloatingTabBarMetrics.outerInset * 0.71)
+
+        // 3. 连续拖到第 3 个槽位附近松手，精确落入目标 Tab
+        let dragToLibrary = FloatingTabBarSliderMath.resolvedTargetTab(
+            selectedTab: 0,
+            pillCenterX: centers[2] + 6,
+            translationWidth: centers[2] - centers[0],
+            predictedEndTranslationWidth: centers[2] - centers[0],
+            barWidth: barWidth,
+            count: count
+        )
+        XCTAssertEqual(dragToLibrary, 2)
+
+        // 4. 在当前 Tab 内虽未划过中线但带明显右扫动量，按 Flick 惯性切到下一格
+        let flickRight = FloatingTabBarSliderMath.resolvedTargetTab(
+            selectedTab: 1,
+            pillCenterX: centers[1] + 14,
+            translationWidth: 14,
+            predictedEndTranslationWidth: 72,
+            barWidth: barWidth,
+            count: count
+        )
+        XCTAssertEqual(flickRight, 2)
+
+        // 5. 极慢微小挪动不误触轻扫
+        let jitterOnly = FloatingTabBarSliderMath.resolvedTargetTab(
+            selectedTab: 1,
+            pillCenterX: centers[1] + 3,
+            translationWidth: 3,
+            predictedEndTranslationWidth: 5,
+            barWidth: barWidth,
+            count: count
+        )
+        XCTAssertEqual(jitterOnly, 1)
+    }
+
+    func testBackdropFogDesktopParityMathAndMotion() {
+        // 1. 鲜明红封面 -> Deep(v=0.30) 与明亮通透 Fog(v=0.72)
+        let redCover = BackdropRGBColor(r: 0.86, g: 0.18, b: 0.16)
+        let (deep, fog) = BackdropFogMath.fogColors(from: redCover)
+        let (_, deepS, deepV) = BackdropFogMath.rgbToHSV(r: deep.r, g: deep.g, b: deep.b)
+        let (_, fogS, fogV) = BackdropFogMath.rgbToHSV(r: fog.r, g: fog.g, b: fog.b)
+        XCTAssertEqual(deepV, 0.30, accuracy: 0.02)
+        XCTAssertEqual(fogV, 0.72, accuracy: 0.02)
+        XCTAssertGreaterThan(deepS, 0.70)
+        XCTAssertLessThan(fogS, deepS)
+
+        // 2. 低饱和灰度封面应严格保灰不强行染成假彩色（对应 "A gray cover stays gray."）
+        let grayCover = BackdropRGBColor(r: 0.45, g: 0.45, b: 0.47)
+        let (grayDeep, grayFog) = BackdropFogMath.fogColors(from: grayCover)
+        let (_, gdS, _) = BackdropFogMath.rgbToHSV(r: grayDeep.r, g: grayDeep.g, b: grayDeep.b)
+        let (_, gfS, gfV) = BackdropFogMath.rgbToHSV(r: grayFog.r, g: grayFog.g, b: grayFog.b)
+        XCTAssertLessThan(gdS, 0.08)
+        XCTAssertLessThan(gfS, 0.08)
+        XCTAssertEqual(gfV, 0.72, accuracy: 0.02)
+
+        // 3. 关闭烟雾时的静态双色渐变（Top v=0.35, Foot v=0.24）
+        let (top, foot) = BackdropFogMath.backdropColors(from: redCover)
+        let (_, _, topV) = BackdropFogMath.rgbToHSV(r: top.r, g: top.g, b: top.b)
+        let (_, _, footV) = BackdropFogMath.rgbToHSV(r: foot.r, g: foot.g, b: foot.b)
+        XCTAssertEqual(topV, 0.35, accuracy: 0.02)
+        XCTAssertEqual(footV, 0.24, accuracy: 0.02)
+
+        // 4. 18 桶主色提纯：大量黑色背景 + 一片鲜艳天蓝色高光时，应提取天蓝而不是黑灰泥色
+        var pixels = [UInt8]()
+        pixels.reserveCapacity(24 * 24 * 4)
+        for i in 0..<(24 * 24) {
+            if i < 420 {
+                pixels.append(contentsOf: [18, 18, 22, 255]) // 深暗背景像素会被阈值跳过
+            } else {
+                pixels.append(contentsOf: [45, 165, 245, 255]) // 高饱和主题天蓝
+            }
+        }
+        let dominant = BackdropFogMath.dominantColorFromRGBA(bytes: pixels, width: 24, height: 24)
+        XCTAssertNotNil(dominant)
+        XCTAssertGreaterThan(dominant?.b ?? 0, 0.85)
+        XCTAssertLessThan(dominant?.r ?? 1, 0.35)
+
+        // 5. 对标 Go TestBackdropDrifts：播放 4s 加速至 speed==1 飘移，鼓点快冲、暂停 4s 内丝滑滑停至 speed==0 且停后纹丝不动
+        var motion = BackdropMotionState()
+        let frameInterval = 1.0 / 30.0
+        var now: TimeInterval = 100.0
+        let quiet = [Float](repeating: 0, count: 24)
+        for _ in 0..<120 {
+            now += frameInterval
+            motion.step(now: now, playing: true, levels: quiet, live: true)
+        }
+        XCTAssertEqual(motion.speed, 1.0, accuracy: 0.001)
+        XCTAssertGreaterThan(motion.drift, 3.0)
+
+        let loud = [Float](repeating: 1.0, count: 24)
+        now += frameInterval
+        motion.step(now: now, playing: true, levels: loud, live: true)
+        XCTAssertGreaterThan(motion.bassLevel, 0.2)
+
+        var moving = true
+        for _ in 0..<120 {
+            now += frameInterval
+            moving = motion.step(now: now, playing: false, levels: quiet, live: false)
+        }
+        XCTAssertFalse(moving)
+        XCTAssertEqual(motion.speed, 0.0, accuracy: 0.001)
+
+        let frozenDrift = motion.drift
+        now += 1.0
+        motion.step(now: now, playing: false, levels: quiet, live: false)
+        XCTAssertEqual(motion.drift, frozenDrift, accuracy: 1e-6)
+
+        // 6. 切歌 700ms 立方淡出验证
+        XCTAssertEqual(BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: 0.0), 1.0, accuracy: 0.001)
+        XCTAssertEqual(BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: 0.35), 0.125, accuracy: 0.01)
+        XCTAssertEqual(BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: 0.70), 0.0, accuracy: 0.001)
     }
 }
 

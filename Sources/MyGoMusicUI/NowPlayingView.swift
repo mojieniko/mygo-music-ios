@@ -4,7 +4,16 @@
 #if canImport(MyGoMusicCore)
 import MyGoMusicCore
 #endif
+#if canImport(Metal)
+import Metal
+#endif
+#if canImport(MetalKit)
+import MetalKit
+#endif
 import SwiftUI
+#if canImport(QuartzCore)
+import QuartzCore
+#endif
 
 public struct NowPlayingView: View {
     @EnvironmentObject private var app: AppModel
@@ -13,19 +22,31 @@ public struct NowPlayingView: View {
     @State private var newCommentText = ""
     @State private var scrubbingPosition: TimeInterval? = nil
     @State private var growAppeared = false
-    @StateObject private var coverAccentLoader = ArtworkImageLoader()
+    @State private var navPath = NavigationPath()
 
     public init() {}
 
     public var body: some View {
+        NavigationStack(path: $navPath) {
+            playerMainContent
+                #if os(iOS)
+                .toolbar(.hidden, for: .navigationBar)
+                #endif
+                .navigationDestination(for: NavigationTarget.self) { target in
+                    HomeView.buildDestination(for: target)
+                }
+                .environment(\.mygoNavigate) { target in
+                    navPath.append(target)
+                }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var playerMainContent: some View {
         let track = app.player.currentTrack
         let isRadio = app.player.radioName?.isEmpty == false
-        let smokeAccentColor: Color = {
-            let base = coverAccentLoader.dominantColor.map { MyGoTheme.brightenAccentColor($0) }
-                ?? Color(red: 0.96, green: 0.92, blue: 0.90)
-            return MyGoTheme.mix(base, with: .white, ratio: 0.35)
-        }()
-        ZStack {
+        let smokeAccentColor = Color.white
+        return ZStack {
             if let track {
                 let isStage = app.activeNowPlayingPane == .stage
                 VStack(spacing: isRadio ? 16 : 14) {
@@ -104,15 +125,6 @@ public struct NowPlayingView: View {
             NowPlayingBackdropView(imageURL: track?.album.imageUrl, player: app.player, fogEnabled: app.settings.fog)
                 .ignoresSafeArea()
         }
-        .task(id: track?.album.imageUrl ?? track?.id ?? "none") {
-            await coverAccentLoader.load(
-                rawURLString: track?.album.imageUrl,
-                pixelSize: 200,
-                extractDominantColor: true,
-                headersProvider: { url in app.imageHeaders(for: url) }
-            )
-        }
-        .preferredColorScheme(.dark)
     }
 
     // MARK: - 顶部面板切换栏（对应 npTabs / stageStyleButton）
@@ -169,7 +181,14 @@ public struct NowPlayingView: View {
                             .buttonStyle(.plain)
                         }
                     }
-                    .padding(.trailing, 4)
+                    .padding(.trailing, 12)
+                }
+                .mask {
+                    HStack(spacing: 0) {
+                        Rectangle().fill(.black)
+                        LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                            .frame(width: 14)
+                    }
                 }
 
                 if app.activeNowPlayingPane == .stage {
@@ -244,6 +263,9 @@ public struct NowPlayingView: View {
                 },
                 onExitRadio: {
                     app.player.exitRadio()
+                },
+                onSelectArtist: { artist in
+                    navPath.append(NavigationTarget.artist(id: artist.id, name: artist.name, sourceID: track.source))
                 }
             )
 
@@ -386,25 +408,32 @@ public struct NowPlayingView: View {
             }
 
             if canPost {
+                let submitComment: () -> Void = {
+                    let text = newCommentText
+                    guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                    newCommentText = ""
+                    MyGoKeyboard.dismiss()
+                    Task { await app.postComment(text: text) }
+                }
                 HStack(spacing: 10) {
                     TextField(I18n.t("Write a comment…"), text: $newCommentText)
                         .textFieldStyle(.plain)
                         .foregroundStyle(.white)
+                        .submitLabel(.send)
+                        .onSubmit {
+                            submitComment()
+                        }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .background(.white.opacity(0.1), in: Capsule())
 
-                    Button(I18n.t("Post")) {
-                        let text = newCommentText
-                        newCommentText = ""
-                        Task { await app.postComment(text: text) }
-                    }
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(MyGoTheme.accent, in: Capsule())
-                    .disabled(newCommentText.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button(I18n.t("Post"), action: submitComment)
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(MyGoTheme.accent, in: Capsule())
+                        .disabled(newCommentText.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
         }
@@ -512,6 +541,7 @@ private struct NowPlayingCoverHeaderView: View {
     let onNext: () -> Void
     let onPrev: () -> Void
     let onExitRadio: () -> Void
+    let onSelectArtist: (Artist) -> Void
 
     @State private var coverTilt: CGSize = .zero
 
@@ -573,10 +603,7 @@ private struct NowPlayingCoverHeaderView: View {
                     .foregroundStyle(.white)
                     .lineLimit(1)
 
-                Text(track.artistNames)
-                    .font(.system(size: 14.5, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.65))
-                    .lineLimit(1)
+                artistInteractiveButton
             }
             Spacer()
 
@@ -590,6 +617,52 @@ private struct NowPlayingCoverHeaderView: View {
             .buttonStyle(.plain)
         }
     }
+
+    @ViewBuilder
+    private var artistInteractiveButton: some View {
+        let artists = track.resolvedArtistsForNavigation
+        if artists.isEmpty {
+            Text(track.artistNames)
+                .font(.system(size: 14.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.65))
+                .lineLimit(1)
+        } else if artists.count == 1 {
+            Button {
+                onSelectArtist(artists[0])
+            } label: {
+                artistLinkLabel
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(I18n.tf("Go to Artist: %s", artists[0].name))
+        } else {
+            Menu {
+                ForEach(Array(artists.enumerated()), id: \.offset) { _, artist in
+                    Button {
+                        onSelectArtist(artist)
+                    } label: {
+                        Label(artist.name, systemImage: "person.wave.2")
+                    }
+                }
+            } label: {
+                artistLinkLabel
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var artistLinkLabel: some View {
+        HStack(spacing: 4) {
+            Text(track.artistNames)
+                .font(.system(size: 14.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.76))
+                .lineLimit(1)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+    }
 }
 
 // MARK: - 底部播放控制与进度条（独立订阅 player，隔离高频 position 触发整屏重绘）
@@ -598,7 +671,7 @@ private struct NowPlayingBottomControlsView: View {
     @ObservedObject var player: PlayerEngine
     let track: Track
     let smoke: Bool
-    var smokeAccent: Color = Color(red: 0.96, green: 0.92, blue: 0.90)
+    var smokeAccent: Color = .white
     @Binding var volume: Double
     @Binding var scrubbingPosition: TimeInterval?
 
@@ -708,7 +781,7 @@ private struct NowPlayingBottomControlsView: View {
                         )
 
                         if smoke {
-                            let smokeHeight: CGFloat = 128
+                            let smokeHeight: CGFloat = 158
                             ProgressSmokeView(
                                 progress: ratio,
                                 level: smokeStrength,
@@ -910,15 +983,15 @@ private struct ProgressSeekBar: View {
                     .frame(height: barHeight)
                     .padding(.horizontal, 6)
 
-                // 已播放轨道：开启烟雾播放时为左淡右亮白彗星流光，否则为纯净高可读实线
+                // 已播放轨道：开启白色蒸汽时为左淡右亮洁白流光，否则为纯净高可读实线
                 if smokeEnabled && showCometStyle {
                     Capsule()
                         .fill(
                             LinearGradient(
                                 colors: [
-                                    .white.opacity(0.30),
-                                    MyGoTheme.mix(.white, with: smokeAccent, ratio: 0.35).opacity(0.76),
-                                    .white.opacity(0.95)
+                                    MyGoTheme.mix(.white, with: smokeAccent, ratio: 0.35).opacity(0.32),
+                                    MyGoTheme.mix(.white, with: smokeAccent, ratio: 0.25).opacity(0.84),
+                                    .white.opacity(0.98)
                                 ],
                                 startPoint: .leading,
                                 endPoint: .trailing
@@ -928,7 +1001,7 @@ private struct ProgressSeekBar: View {
                         .padding(.leading, 6)
                 } else {
                     Capsule()
-                        .fill(.white.opacity(0.86))
+                        .fill(MyGoTheme.mix(.white, with: smokeAccent, ratio: 0.20).opacity(0.86))
                         .frame(width: max(barHeight, width * fraction), height: barHeight)
                         .padding(.leading, 6)
                 }
@@ -1009,14 +1082,14 @@ struct ProgressSmokeView: View {
         10 * scale
     }
 
-    // 对照桌面 ui_player.go (smokeLife=1.4, smokeWisps=36..46)：紧贴小烟囱白点口连绵冒出，向左上方拉长扩散
-    static let smokeLife: Double = 1.45
+    // 对照桌面 ui_player.go，适当加大飘散半径与升腾行程，呈现饱满蓬松的白色小烟囱蒸汽
+    static let smokeLife: Double = 1.65
     private let life: Double = ProgressSmokeView.smokeLife
-    private let wispCount: Int = 46
+    private let wispCount: Int = 56
 
     var body: some View {
         GeometryReader { geometry in
-            let bleed = 64 * scale
+            let bleed = 88 * scale
             TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !isActive && drainComplete)) { timeline in
                 Canvas { context, size in
                     drawSmoke(
@@ -1095,9 +1168,9 @@ struct ProgressSmokeView: View {
             tracker.spawns = tracker.spawns.filter { $0.key >= oldestKeep }
         }
 
-        // 1. 火车小烟囱蒸汽羽流层（黄金微模糊 2.75pt：既锁紧出嘴细流清晰度，又让粒子彻底融合成平滑蒸汽束）
+        // 1. 火车小烟囱白色蒸汽羽流层（3.15pt 柔和融合：既保持喷口紧实清晰，又使稍大一点的白烟饱满蓬松）
         context.drawLayer { layer in
-            layer.addFilter(.blur(radius: 2.75 * scale))
+            layer.addFilter(.blur(radius: 3.15 * scale))
             if useAdditiveBlend && !lightSurfaceMode {
                 layer.blendMode = .plusLighter
             }
@@ -1136,14 +1209,12 @@ struct ProgressSmokeView: View {
             }
         }
 
-        // 2. 火车烟囱口亮点：柔和光晕 + 极小亮白核心 dot（对照 ui_player.go:104-107）
+        // 2. 火车烟囱口亮点：纯净白光晕 + 晶亮白点发射口
         let em = tracker.emitterLevel
         guard em > 0.01 else { return }
 
-        let haloColor: Color = lightSurfaceMode
-            ? MyGoTheme.mix(Color(red: 0.42, green: 0.44, blue: 0.48), with: tintColor, ratio: 0.55)
-            : MyGoTheme.mix(tintColor, with: .white, ratio: 0.35)
-        let glowRadius = (7.2 + 6.5 * strength) * scale
+        let haloColor: Color = MyGoTheme.mix(.white, with: tintColor, ratio: 0.24)
+        let glowRadius = (9.2 + 7.8 * strength) * scale
         let glowRect = CGRect(
             x: headX - glowRadius,
             y: anchorY - glowRadius,
@@ -1154,8 +1225,8 @@ struct ProgressSmokeView: View {
             Path(ellipseIn: glowRect),
             with: .radialGradient(
                 Gradient(colors: [
-                    haloColor.opacity((lightSurfaceMode ? 0.35 : 0.62) * em),
-                    haloColor.opacity((lightSurfaceMode ? 0.12 : 0.22) * em),
+                    haloColor.opacity((lightSurfaceMode ? 0.36 : 0.68) * em),
+                    haloColor.opacity((lightSurfaceMode ? 0.14 : 0.26) * em),
                     .clear
                 ]),
                 center: CGPoint(x: headX, y: anchorY),
@@ -1164,7 +1235,7 @@ struct ProgressSmokeView: View {
             )
         )
 
-        let coreSize = (4.2 + 1.15 * strength) * scale
+        let coreSize = (4.8 + 1.25 * strength) * scale
         let coreRect = CGRect(
             x: headX - coreSize * 0.5,
             y: anchorY - coreSize * 0.5,
@@ -1172,8 +1243,8 @@ struct ProgressSmokeView: View {
             height: coreSize
         )
         let coreColor: Color = lightSurfaceMode
-            ? MyGoTheme.mix(.white, with: tintColor, ratio: 0.25)
-            : MyGoTheme.mix(.white, with: tintColor, ratio: 0.12)
+            ? MyGoTheme.mix(Color(white: 0.88), with: tintColor, ratio: 0.25)
+            : .white
         context.fill(
             Path(ellipseIn: coreRect),
             with: .color(coreColor.opacity(min(1.0, 0.96 * em)))
@@ -1206,26 +1277,26 @@ struct ProgressSmokeView: View {
             return nil
         }
 
-        // 紧贴喷嘴向上偏左喷涌并呈现轻柔连绵的蒸汽卷曲
-        let driftLeft = CGFloat(age) * (11.5 + 15.5 * CGFloat(a)) * scale
-        let liftUp = CGFloat(age) * (14.5 + 17.5 * CGFloat(b)) * scale
-        let sway = CGFloat(sin(age * (2.3 + 1.6 * c) + d * .pi * 2)) * (2.6 * pow(Double(f), 0.90)) * scale
+        // 紧贴喷嘴向上偏左喷涌并呈现稍大一些、更加连绵蓬松的白色蒸汽卷曲
+        let driftLeft = CGFloat(age) * (15.5 + 20.5 * CGFloat(a)) * scale
+        let liftUp = CGFloat(age) * (20.0 + 23.5 * CGFloat(b)) * scale
+        let sway = CGFloat(sin(age * (2.2 + 1.6 * c) + d * .pi * 2)) * (3.4 * pow(Double(f), 0.90)) * scale
 
         let center = CGPoint(
             x: spawnX - driftLeft + sway * 0.42,
             y: anchorY - 1.3 * scale - liftUp + sway * 0.26
         )
 
-        // 刚喷出时像小烟囱口径般紧凑纤细 (radius ~2.2pt)，向外逐步膨胀融为轻雾
-        let radius = (2.2 + f * (9.8 + 7.4 * CGFloat(d))) * scale
-        let rx = radius * (1.28 + 0.14 * CGFloat(a))
-        let ry = radius * (0.90 + 0.10 * CGFloat(b))
+        // 刚喷出时保持紧凑口径，随后迅速舒展成饱满白雾
+        let radius = (2.3 + f * (14.2 + 10.6 * CGFloat(d))) * scale
+        let rx = radius * (1.30 + 0.15 * CGFloat(a))
+        let ry = radius * (0.94 + 0.12 * CGFloat(b))
 
         // 零悬空断根：刚出生 3% 内立刻显形，紧贴光点口
         let fadeIn = min(Double(f) / 0.03, 1.0)
-        let fadeOut = pow(1.0 - Double(f), 1.45)
-        let levelGain = 0.72 + 0.56 * Double(strength)
-        let baseOpacity = lightSurfaceMode ? 0.18 : (useAdditiveBlend ? 0.19 : 0.24)
+        let fadeOut = pow(1.0 - Double(f), 1.42)
+        let levelGain = 0.76 + 0.56 * Double(strength)
+        let baseOpacity = lightSurfaceMode ? 0.22 : (useAdditiveBlend ? 0.23 : 0.28)
         let alpha = fadeIn * fadeOut * baseOpacity * levelGain * quietDensityScale
         guard alpha > 0.004 else { return nil }
 
@@ -1257,12 +1328,12 @@ struct ProgressSmokeView: View {
         let smokeColor: Color
         let coreMixColor: Color
         if lightSurfaceMode {
-            let smokyGrey = Color(red: 0.44, green: 0.46, blue: 0.50)
-            smokeColor = MyGoTheme.mix(smokyGrey, with: tintColor, ratio: 0.28)
-            coreMixColor = MyGoTheme.mix(smokyGrey, with: tintColor, ratio: 0.15)
+            let smokyGrey = Color(red: 0.56, green: 0.58, blue: 0.63)
+            smokeColor = MyGoTheme.mix(smokyGrey, with: tintColor, ratio: 0.16)
+            coreMixColor = MyGoTheme.mix(Color(white: 0.74), with: tintColor, ratio: 0.18)
         } else {
-            smokeColor = MyGoTheme.mix(.white, with: tintColor, ratio: 0.24)
-            coreMixColor = MyGoTheme.mix(.white, with: tintColor, ratio: 0.10)
+            smokeColor = MyGoTheme.mix(.white, with: tintColor, ratio: 0.22)
+            coreMixColor = MyGoTheme.mix(.white, with: tintColor, ratio: 0.12)
         }
 
         // 沿气流斜向 -39° 微微拉伸绘制，使连串粒子无缝接成一条飘逸蒸汽束
@@ -2101,7 +2172,7 @@ public struct CoverWallPaneView: View {
     }
 }
 
-// MARK: - 正在播放动态烟雾与流光背景（对应 backdrop.go）
+// MARK: - 正在播放动态烟雾与流光背景（1:1 移植桌面端 backdrop.go GPU Shader）
 
 struct NowPlayingBackdropView: View {
     @EnvironmentObject private var app: AppModel
@@ -2112,9 +2183,61 @@ struct NowPlayingBackdropView: View {
     let fogEnabled: Bool
     var preview: Bool = false
 
+    private var resolvedTint: BackdropRGBColor {
+        artworkLoader.dominantRGB ?? .defaultTint
+    }
+
     var body: some View {
+        let tint = resolvedTint
         ZStack {
-            MyGoTheme.nowPlayingBg
+            if fogEnabled && FogMetalPipeline.shared.pipelineState != nil {
+                FogShaderBackdropRepresentable(
+                    tint: tint,
+                    tintKey: imageURL ?? "",
+                    player: player,
+                    preview: preview,
+                    reduceMotion: reduceMotion
+                )
+            } else if fogEnabled {
+                let pair = BackdropFogMath.fogColors(from: tint)
+                LinearGradient(
+                    colors: [
+                        Color(red: pair.deep.r, green: pair.deep.g, blue: pair.deep.b),
+                        Color(red: pair.fog.r, green: pair.fog.g, blue: pair.fog.b),
+                        Color(red: pair.deep.r, green: pair.deep.g, blue: pair.deep.b)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            } else {
+                stillBackdropView(tint: tint)
+            }
+        }
+        .allowsHitTesting(false)
+        .task(id: "\(imageURL ?? "")|\(fogEnabled)") {
+            await artworkLoader.load(
+                rawURLString: imageURL,
+                pixelSize: 200,
+                extractDominantColor: true
+            ) { url in
+                app.imageHeaders(for: url)
+            }
+        }
+    }
+
+    /// 关闭实验性烟雾开关后的桌面同款静态柔光背景（对应 backdrop.go drawBackdrop）
+    @ViewBuilder
+    private func stillBackdropView(tint: BackdropRGBColor) -> some View {
+        let pair = BackdropFogMath.backdropColors(from: tint)
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: pair.top.r, green: pair.top.g, blue: pair.top.b),
+                    Color(red: pair.foot.r, green: pair.foot.g, blue: pair.foot.b)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
 
             if let image = artworkLoader.image {
                 GeometryReader { geo in
@@ -2122,98 +2245,550 @@ struct NowPlayingBackdropView: View {
                         .resizable()
                         .scaledToFill()
                         .frame(width: geo.size.width, height: geo.size.height)
-                        .blur(radius: 65)
-                        .opacity(0.30)
+                        .blur(radius: 56)
+                        .opacity(0.14)
                 }
                 .clipped()
             }
 
-            if fogEnabled {
-                TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: (!player.isPlaying && !preview) || reduceMotion)) { timeline in
-                    Canvas { context, size in
-                        drawFog(
-                            in: &context,
-                            size: size,
-                            time: timeline.date.timeIntervalSinceReferenceDate,
-                            tint: artworkLoader.dominantColor ?? MyGoTheme.accent,
-                            bass: CGFloat(player.audioBands.first ?? 0.15)
-                        )
-                    }
-                }
-            }
-
             LinearGradient(
-                colors: [.black.opacity(fogEnabled ? 0.10 : 0.18), .black.opacity(fogEnabled ? 0.34 : 0.48)],
+                stops: [
+                    .init(color: .clear, location: 0.55),
+                    .init(color: .black.opacity(0.18), location: 1.0)
+                ],
                 startPoint: .top,
                 endPoint: .bottom
             )
         }
-        .allowsHitTesting(false)
-        .task(id: "\(imageURL ?? "")|\(fogEnabled)") {
-            await artworkLoader.load(rawURLString: imageURL, pixelSize: 200, extractDominantColor: fogEnabled) { url in
-                app.imageHeaders(for: url)
-            }
-        }
-    }
-
-    private func drawFog(in context: inout GraphicsContext, size: CGSize, time: Double, tint: Color, bass: CGFloat) {
-        guard size.width > 0, size.height > 0 else { return }
-        let phase = time * 0.16
-        let beat = min(max(bass, 0), 1)
-
-        for layerIndex in 0..<3 {
-            let layer = CGFloat(layerIndex)
-            let baseline = size.height * (0.34 + layer * 0.14 + 0.018 * sin(phase + Double(layer)))
-            let thickness = size.height * (0.12 + beat * 0.025)
-            let amplitude = min(size.height * (0.038 + beat * 0.016), 28) * (1 + layer * 0.12)
-            var bank = Path()
-            bank.move(to: CGPoint(x: 0, y: baseline))
-
-            let segments = 12
-            for step in 0..<segments {
-                let x0 = size.width * CGFloat(step) / CGFloat(segments)
-                let x1 = size.width * CGFloat(step + 1) / CGFloat(segments)
-                let wave0 = sin(Double(step) * 0.72 + phase * (1.1 + Double(layer) * 0.12) + Double(layer) * 1.7)
-                let wave1 = sin(Double(step + 1) * 0.72 + phase * (1.1 + Double(layer) * 0.12) + Double(layer) * 1.7)
-                let y0 = baseline + amplitude * CGFloat(wave0)
-                let y1 = baseline + amplitude * CGFloat(wave1)
-                bank.addQuadCurve(
-                    to: CGPoint(x: x1, y: y1),
-                    control: CGPoint(x: (x0 + x1) / 2, y: (y0 + y1) / 2 - amplitude * 0.35)
-                )
-            }
-
-            for step in (0..<segments).reversed() {
-                let x0 = size.width * CGFloat(step + 1) / CGFloat(segments)
-                let x1 = size.width * CGFloat(step) / CGFloat(segments)
-                let wave0 = sin(Double(step + 1) * 0.58 + phase * 0.72 + Double(layer) * 2.1)
-                let wave1 = sin(Double(step) * 0.58 + phase * 0.72 + Double(layer) * 2.1)
-                let y0 = baseline + thickness + amplitude * 0.62 * CGFloat(wave0)
-                let y1 = baseline + thickness + amplitude * 0.62 * CGFloat(wave1)
-                bank.addQuadCurve(
-                    to: CGPoint(x: x1, y: y1),
-                    control: CGPoint(x: (x0 + x1) / 2, y: (y0 + y1) / 2 + amplitude * 0.2)
-                )
-            }
-            bank.closeSubpath()
-
-            let top = CGPoint(x: size.width * 0.5, y: baseline - amplitude)
-            let bottom = CGPoint(x: size.width * 0.5, y: baseline + thickness + amplitude)
-            context.drawLayer { fog in
-                fog.addFilter(.blur(radius: min(size.width, size.height) * 0.055))
-                fog.fill(
-                    bank,
-                    with: .linearGradient(
-                        Gradient(stops: [
-                            .init(color: tint.opacity(0.04), location: 0),
-                            .init(color: tint.opacity(0.42 + Double(beat) * 0.10 - Double(layerIndex) * 0.035), location: 0.48),
-                            .init(color: tint.opacity(0.09), location: 1)
-                        ]),
-                        startPoint: top,
-                        endPoint: bottom
-                    )
-                )
-            }
-        }
     }
 }
+
+#if canImport(Metal) && canImport(MetalKit)
+
+private struct FogShaderUniforms {
+    var deepColor: SIMD4<Float>
+    var fogColor: SIMD4<Float>
+    var beforeDeepColor: SIMD4<Float>
+    var beforeFogColor: SIMD4<Float>
+    var params: SIMD4<Float>       // x = drift, y = bass, z = width, w = height
+    var beforeParams: SIMD4<Float> // x = beforeDrift, y = beforeBass, z = beforeAlpha, w = 0
+}
+
+private final class FogMetalPipeline: @unchecked Sendable {
+    static let shared = FogMetalPipeline()
+
+    let device: MTLDevice?
+    let commandQueue: MTLCommandQueue?
+    let pipelineState: MTLRenderPipelineState?
+
+    private static let metalSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct VertexOut {
+        float4 position [[position]];
+        float2 uv;
+    };
+
+    struct FogUniforms {
+        float4 deepColor;
+        float4 fogColor;
+        float4 beforeDeepColor;
+        float4 beforeFogColor;
+        float4 params;
+        float4 beforeParams;
+    };
+
+    vertex VertexOut mygoFogVertex(uint vid [[vertex_id]]) {
+        constexpr float2 positions[4] = {
+            float2(-1.0, -1.0),
+            float2( 1.0, -1.0),
+            float2(-1.0,  1.0),
+            float2( 1.0,  1.0)
+        };
+        constexpr float2 uvs[4] = {
+            float2(0.0, 1.0),
+            float2(1.0, 1.0),
+            float2(0.0, 0.0),
+            float2(1.0, 0.0)
+        };
+        VertexOut out;
+        out.position = float4(positions[vid], 0.0, 1.0);
+        out.uv = uvs[vid];
+        return out;
+    }
+
+    inline float fogHash(float2 p) {
+        return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+    }
+
+    inline float fogNoise(float2 p) {
+        float2 i = floor(p);
+        float2 f = fract(p);
+        float2 u = f * f * (3.0 - 2.0 * f);
+        float a = fogHash(i);
+        float b = fogHash(i + float2(1.0, 0.0));
+        float c = fogHash(i + float2(0.0, 1.0));
+        float d = fogHash(i + float2(1.0, 1.0));
+        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    }
+
+    inline float fogFbm(float2 p) {
+        float v = 0.0;
+        float amp = 0.5;
+        for (int i = 0; i < 5; i++) {
+            v += amp * fogNoise(p);
+            p = p * 2.03 + float2(1.7, 9.2);
+            amp *= 0.5;
+        }
+        return v;
+    }
+
+    inline float3 evalFogPixel(float2 uv, float2 size, float t, float bass, float3 deepRGB, float3 fogRGB) {
+        float2 pos = uv * size;
+        float2 p = pos / size.y * 2.4;
+        float2 rise = float2(0.0, t * 0.1);
+        float2 q = float2(
+            fogFbm(p + rise + float2(0.0, t * 0.04)),
+            fogFbm(p + rise + float2(5.2, 1.3) - float2(t * 0.05, 0.0))
+        );
+        float f = fogFbm(p + rise + 0.9 * q);
+        float bank = fogFbm(p * 0.45 + rise * 0.6 + float2(3.7, 0.0));
+        float cloud = smoothstep(0.3 - 0.06 * bass, 0.78, f) * (0.45 + 0.75 * smoothstep(0.3, 0.65, bank));
+        float m = smoothstep(-0.1, 0.4, uv.y) * (1.0 - 0.5 * smoothstep(0.65, 1.0, uv.y));
+        float3 c = mix(deepRGB, fogRGB, min(cloud * m * (0.85 + 0.35 * bass), 1.0));
+        float g = length((uv - float2(0.5, 0.42)) * float2(1.0, 1.25));
+        c *= 1.08 - 0.45 * smoothstep(0.2, 0.85, g);
+
+        float cell = size.y / 22.0;
+        float2 sp = (pos + float2(0.0, t * cell * 0.9)) / cell;
+        float2 id = floor(sp);
+        float h = fogHash(id + float2(3.1, 7.7));
+        if (h > 0.93) {
+            float2 at = float2(fogHash(id + float2(1.3, 2.9)), fogHash(id + float2(8.1, 4.3))) * 0.8 + 0.1;
+            float d = length((fract(sp) - at) * cell) / max(cell * 0.05, 0.7);
+            float glint = 0.5 + 0.5 * sin(t * (1.5 + 2.0 * h) + h * 40.0);
+            c += float3(0.75, 0.82, 1.0) * exp(-d * d) * glint * (0.25 + 0.3 * m);
+        }
+        return clamp(c, 0.0, 1.0);
+    }
+
+    fragment float4 mygoFogFragment(VertexOut in [[stage_in]], constant FogUniforms &u [[buffer(0)]]) {
+        float2 size = max(u.params.zw, float2(64.0, 64.0));
+        float3 col = evalFogPixel(in.uv, size, u.params.x, u.params.y, u.deepColor.rgb, u.fogColor.rgb);
+        float beforeAlpha = u.beforeParams.z;
+        if (beforeAlpha > 0.001) {
+            float3 beforeCol = evalFogPixel(
+                in.uv,
+                size,
+                u.beforeParams.x,
+                u.beforeParams.y,
+                u.beforeDeepColor.rgb,
+                u.beforeFogColor.rgb
+            );
+            col = mix(col, beforeCol, clamp(beforeAlpha, 0.0, 1.0));
+        }
+        return float4(col, 1.0);
+    }
+    """
+
+    private init() {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue(),
+              let lib = try? device.makeLibrary(source: Self.metalSource, options: nil),
+              let vfn = lib.makeFunction(name: "mygoFogVertex"),
+              let ffn = lib.makeFunction(name: "mygoFogFragment") else {
+            self.device = nil
+            self.commandQueue = nil
+            self.pipelineState = nil
+            return
+        }
+        let desc = MTLRenderPipelineDescriptor()
+        desc.vertexFunction = vfn
+        desc.fragmentFunction = ffn
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        self.device = device
+        self.commandQueue = queue
+        self.pipelineState = try? device.makeRenderPipelineState(descriptor: desc)
+    }
+}
+
+@MainActor
+private final class FogMTKView: MTKView {
+    var onLayoutChanged: (() -> Void)?
+
+    #if canImport(UIKit)
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        onLayoutChanged?()
+    }
+    #else
+    override func layout() {
+        super.layout()
+        onLayoutChanged?()
+    }
+    #endif
+}
+
+@MainActor
+private final class FogMetalCoordinator: NSObject, MTKViewDelegate {
+    weak var mtkView: MTKView?
+    weak var player: PlayerEngine?
+
+    private var motion = BackdropMotionState()
+    private var hasInitializedTint = false
+    private var currentTint: BackdropRGBColor = .defaultTint
+    private var currentDeep: BackdropRGBColor
+    private var currentFog: BackdropRGBColor
+
+    private var beforeDeep: BackdropRGBColor = .defaultTint
+    private var beforeFog: BackdropRGBColor = .defaultTint
+    private var beforeDrift: Double = 0
+    private var beforeBass: Double = 0
+    private var fadeStart: TimeInterval? = nil
+
+    private var previewMode: Bool = false
+    private var reduceMotion: Bool = false
+    private var lastTintKey: String = ""
+
+    #if canImport(UIKit)
+    private var displayLink: CADisplayLink?
+    #else
+    private var timer: Timer?
+    #endif
+
+    override init() {
+        let initial = BackdropFogMath.fogColors(from: .defaultTint)
+        self.currentDeep = initial.deep
+        self.currentFog = initial.fog
+        super.init()
+    }
+
+    func stopTicker() {
+        setTickerActive(false)
+        #if canImport(UIKit)
+        displayLink?.invalidate()
+        displayLink = nil
+        #endif
+    }
+
+    func update(
+        tint: BackdropRGBColor,
+        tintKey: String,
+        player: PlayerEngine,
+        preview: Bool,
+        reduceMotion: Bool
+    ) {
+        self.player = player
+        self.previewMode = preview
+        self.reduceMotion = reduceMotion
+
+        if !hasInitializedTint {
+            hasInitializedTint = true
+            currentTint = tint
+            lastTintKey = tintKey
+            let next = BackdropFogMath.fogColors(from: tint)
+            currentDeep = next.deep
+            currentFog = next.fog
+        } else if tint != currentTint || tintKey != lastTintKey {
+            if tint != currentTint {
+                beforeDeep = currentDeep
+                beforeFog = currentFog
+                beforeDrift = motion.drift
+                beforeBass = motion.bassLevel
+                fadeStart = Date.timeIntervalSinceReferenceDate
+            }
+            currentTint = tint
+            lastTintKey = tintKey
+            let next = BackdropFogMath.fogColors(from: tint)
+            currentDeep = next.deep
+            currentFog = next.fog
+        }
+
+        ensureTickerState(forceDraw: true)
+    }
+
+    func attach(to view: FogMTKView) {
+        self.mtkView = view
+        view.onLayoutChanged = { [weak self] in
+            self?.handleLayoutChange()
+        }
+        syncDrawableSize()
+        ensureTickerState(forceDraw: true)
+    }
+
+    func handleLayoutChange() {
+        syncDrawableSize()
+        mtkView?.draw()
+    }
+
+    func syncDrawableSize() {
+        guard let view = mtkView else { return }
+        let b = view.bounds.size
+        guard b.width > 1, b.height > 1 else { return }
+        // 按桌面端 div = 2 等效半分辨率离屏渲染并 GPU 双线性柔化放大，兼顾奶油级柔雾观感与超低功耗
+        let targetW = max(64.0, (b.width * 0.55).rounded())
+        let targetH = max(64.0, (b.height * 0.55).rounded())
+        if abs(view.drawableSize.width - targetW) > 1 || abs(view.drawableSize.height - targetH) > 1 {
+            view.drawableSize = CGSize(width: targetW, height: targetH)
+        }
+    }
+
+    private func ensureTickerState(forceDraw: Bool) {
+        let now = Date.timeIntervalSinceReferenceDate
+        let isPlaying = (player?.isPlaying ?? false)
+        let shouldMove = (isPlaying || previewMode) && !reduceMotion
+        let isFading: Bool = {
+            guard let start = fadeStart else { return false }
+            return BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: now - start) > 0.001
+        }()
+
+        let needsTicker = shouldMove || isFading || motion.speed > 0.001 || motion.bassLevel > 0.004
+        setTickerActive(needsTicker)
+
+        if forceDraw {
+            tickFrame(at: now)
+        }
+    }
+
+    private func setTickerActive(_ active: Bool) {
+        #if canImport(UIKit)
+        if active {
+            if displayLink == nil {
+                let link = CADisplayLink(target: self, selector: #selector(onDisplayLink))
+                if #available(iOS 15.0, *) {
+                    link.preferredFrameRateRange = CAFrameRateRange(minimum: 24, maximum: 30, preferred: 30)
+                }
+                link.add(to: .main, forMode: .common)
+                displayLink = link
+            }
+            displayLink?.isPaused = false
+        } else {
+            displayLink?.isPaused = true
+        }
+        #else
+        if active {
+            if timer == nil {
+                let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.tickFrame(at: Date.timeIntervalSinceReferenceDate)
+                    }
+                }
+                RunLoop.main.add(t, forMode: .common)
+                timer = t
+            }
+        } else {
+            timer?.invalidate()
+            timer = nil
+        }
+        #endif
+    }
+
+    #if canImport(UIKit)
+    @objc private func onDisplayLink() {
+        tickFrame(at: Date.timeIntervalSinceReferenceDate)
+    }
+    #endif
+
+    private func tickFrame(at now: TimeInterval) {
+        let isPlaying = (player?.isPlaying ?? false)
+        let isLive = isPlaying && !(player?.isLoading ?? false)
+        let moving = (isPlaying || previewMode) && !reduceMotion
+
+        var liveLevels: [Float] = []
+        if isLive, let player {
+            let pos = player.livePlaybackPosition()
+            let rhythm = player.sampleAudioRhythm(at: pos, lines: player.lyrics, isScrubbing: false)
+            // 按低频主导加权铺满 24 格，使 group(0, 6) 准确反映真实底鼓/贝斯跃动
+            let bassF = Float(rhythm.bass * 0.72 + rhythm.beatPulse * 0.38)
+            liveLevels = Array(repeating: min(1.0, max(0.0, bassF)), count: 6)
+            liveLevels.append(contentsOf: rhythm.bands.map { min(1.0, max(0.0, $0)) })
+        }
+
+        let stillMoving = motion.step(
+            now: now,
+            playing: moving,
+            levels: liveLevels,
+            live: isLive && !reduceMotion
+        )
+        let fading: Bool
+        if let start = fadeStart {
+            if BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: now - start) <= 0.001 {
+                fadeStart = nil
+                fading = false
+            } else {
+                fading = true
+            }
+        } else {
+            fading = false
+        }
+
+        syncDrawableSize()
+        mtkView?.draw()
+
+        if !stillMoving && !fading && !moving {
+            setTickerActive(false)
+        }
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func draw(in view: MTKView) {
+        let gpu = FogMetalPipeline.shared
+        guard let pipeline = gpu.pipelineState,
+              let queue = gpu.commandQueue,
+              let rpd = view.currentRenderPassDescriptor,
+              let drawable = view.currentDrawable,
+              let cmd = queue.makeCommandBuffer(),
+              let encoder = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
+            return
+        }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        let beforeAlpha: Double
+        if let start = fadeStart {
+            beforeAlpha = BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: now - start)
+        } else {
+            beforeAlpha = 0
+        }
+
+        let dSize = view.drawableSize
+        let safeW = Float(max(64, dSize.width > 1 ? dSize.width : view.bounds.width * 0.55))
+        let safeH = Float(max(64, dSize.height > 1 ? dSize.height : view.bounds.height * 0.55))
+
+        var uniforms = FogShaderUniforms(
+            deepColor: SIMD4<Float>(Float(currentDeep.r), Float(currentDeep.g), Float(currentDeep.b), 1),
+            fogColor: SIMD4<Float>(Float(currentFog.r), Float(currentFog.g), Float(currentFog.b), 1),
+            beforeDeepColor: SIMD4<Float>(Float(beforeDeep.r), Float(beforeDeep.g), Float(beforeDeep.b), 1),
+            beforeFogColor: SIMD4<Float>(Float(beforeFog.r), Float(beforeFog.g), Float(beforeFog.b), 1),
+            params: SIMD4<Float>(Float(motion.drift), Float(min(motion.bassLevel, 1.0)), safeW, safeH),
+            beforeParams: SIMD4<Float>(Float(beforeDrift), Float(min(beforeBass, 1.0)), Float(beforeAlpha), 0)
+        )
+
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FogShaderUniforms>.stride, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        encoder.endEncoding()
+        cmd.present(drawable)
+        cmd.commit()
+    }
+}
+
+#if canImport(UIKit)
+private struct FogShaderBackdropRepresentable: UIViewRepresentable {
+    let tint: BackdropRGBColor
+    let tintKey: String
+    @ObservedObject var player: PlayerEngine
+    let preview: Bool
+    let reduceMotion: Bool
+
+    func makeCoordinator() -> FogMetalCoordinator {
+        FogMetalCoordinator()
+    }
+
+    func makeUIView(context: Context) -> FogMTKView {
+        let view = FogMTKView(frame: .zero, device: FogMetalPipeline.shared.device)
+        view.colorPixelFormat = .bgra8Unorm
+        view.isPaused = true
+        view.enableSetNeedsDisplay = false
+        view.autoResizeDrawable = false
+        view.isOpaque = true
+        view.clearColor = MTLClearColor(red: tint.r * 0.3, green: tint.g * 0.3, blue: tint.b * 0.3, alpha: 1.0)
+        view.delegate = context.coordinator
+        context.coordinator.attach(to: view)
+        context.coordinator.update(
+            tint: tint,
+            tintKey: tintKey,
+            player: player,
+            preview: preview,
+            reduceMotion: reduceMotion
+        )
+        return view
+    }
+
+    func updateUIView(_ uiView: FogMTKView, context: Context) {
+        context.coordinator.update(
+            tint: tint,
+            tintKey: tintKey,
+            player: player,
+            preview: preview,
+            reduceMotion: reduceMotion
+        )
+    }
+
+    static func dismantleUIView(_ uiView: FogMTKView, coordinator: FogMetalCoordinator) {
+        uiView.onLayoutChanged = nil
+        coordinator.stopTicker()
+    }
+}
+#else
+private struct FogShaderBackdropRepresentable: NSViewRepresentable {
+    let tint: BackdropRGBColor
+    let tintKey: String
+    @ObservedObject var player: PlayerEngine
+    let preview: Bool
+    let reduceMotion: Bool
+
+    func makeCoordinator() -> FogMetalCoordinator {
+        FogMetalCoordinator()
+    }
+
+    func makeNSView(context: Context) -> FogMTKView {
+        let view = FogMTKView(frame: .zero, device: FogMetalPipeline.shared.device)
+        view.colorPixelFormat = .bgra8Unorm
+        view.isPaused = true
+        view.enableSetNeedsDisplay = false
+        view.autoResizeDrawable = false
+        view.delegate = context.coordinator
+        context.coordinator.attach(to: view)
+        context.coordinator.update(
+            tint: tint,
+            tintKey: tintKey,
+            player: player,
+            preview: preview,
+            reduceMotion: reduceMotion
+        )
+        return view
+    }
+
+    func updateNSView(_ nsView: FogMTKView, context: Context) {
+        context.coordinator.update(
+            tint: tint,
+            tintKey: tintKey,
+            player: player,
+            preview: preview,
+            reduceMotion: reduceMotion
+        )
+    }
+
+    static func dismantleNSView(_ nsView: FogMTKView, coordinator: FogMetalCoordinator) {
+        nsView.onLayoutChanged = nil
+        coordinator.stopTicker()
+    }
+}
+#endif
+
+#else
+
+private struct FogShaderBackdropRepresentable: View {
+    let tint: BackdropRGBColor
+    let tintKey: String
+    @ObservedObject var player: PlayerEngine
+    let preview: Bool
+    let reduceMotion: Bool
+
+    var body: some View {
+        let pair = BackdropFogMath.fogColors(from: tint)
+        LinearGradient(
+            colors: [
+                Color(red: pair.deep.r, green: pair.deep.g, blue: pair.deep.b),
+                Color(red: pair.fog.r, green: pair.fog.g, blue: pair.fog.b),
+                Color(red: pair.deep.r, green: pair.deep.g, blue: pair.deep.b)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
+
+#endif

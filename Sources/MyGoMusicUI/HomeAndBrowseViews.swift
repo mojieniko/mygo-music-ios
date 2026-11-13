@@ -11,8 +11,8 @@ import SwiftUI
 public enum NavigationTarget: Hashable {
     case browse(page: String, title: String?)
     case sectionTracks(title: String, subtitle: String?, tracks: [Track])
-    case album(id: String, name: String)
-    case artist(id: String, name: String)
+    case album(id: String, name: String, sourceID: String? = nil)
+    case artist(id: String, name: String, sourceID: String? = nil)
     case playlist(id: String, name: String)
     case show(id: String, name: String)
     case likedSongs
@@ -311,10 +311,10 @@ public struct HomeView: View {
             BrowsePageView(page: page, fallbackTitle: title)
         case .sectionTracks(let title, let subtitle, let tracks):
             SectionTracksPageView(title: title, subtitle: subtitle, tracks: tracks)
-        case .album(let id, let name):
-            AlbumDetailView(albumID: id, fallbackName: name)
-        case .artist(let id, let name):
-            ArtistDetailView(artistID: id, fallbackName: name)
+        case .album(let id, let name, let sourceID):
+            AlbumDetailView(albumID: id, fallbackName: name, sourceID: sourceID)
+        case .artist(let id, let name, let sourceID):
+            ArtistDetailView(artistID: id, fallbackName: name, sourceID: sourceID)
         case .playlist(let id, let name):
             PlaylistDetailView(playlistID: id, fallbackName: name)
         case .show(let id, let name):
@@ -733,12 +733,22 @@ public struct AlbumDetailView: View {
     @EnvironmentObject private var app: AppModel
     public let albumID: String
     public let fallbackName: String
+    public let sourceID: String?
 
     @State private var albumPage: AlbumPage? = nil
+    @State private var resolvedSourceID: String? = nil
     @State private var isLoading = true
     @State private var isSaved = false
 
+    public init(albumID: String, fallbackName: String, sourceID: String? = nil) {
+        self.albumID = albumID
+        self.fallbackName = fallbackName
+        self.sourceID = sourceID
+    }
+
     public var body: some View {
+        let targetSourceID = resolvedSourceID ?? sourceID ?? app.activeSourceID
+        let targetSource = app.source(forID: targetSourceID) ?? app.activeSource
         ScrollView {
             if isLoading {
                 ProgressView()
@@ -788,11 +798,10 @@ public struct AlbumDetailView: View {
                             }
                             .buttonStyle(.plain)
 
-                            if app.activeSource.can("saveAlbum") {
-                                let srcID = app.activeSourceID
+                            if targetSource.can("saveAlbum") {
                                 Button {
                                     Task {
-                                        isSaved = await app.toggleSaveAlbum(sourceID: srcID, albumID: albumID, currentlySaved: isSaved)
+                                        isSaved = await app.toggleSaveAlbum(sourceID: targetSourceID, albumID: albumID, currentlySaved: isSaved)
                                     }
                                 } label: {
                                     Image(systemName: isSaved ? "heart.fill" : "heart")
@@ -822,10 +831,13 @@ public struct AlbumDetailView: View {
         .navigationTitle(albumPage?.album.name ?? fallbackName)
         .task {
             isLoading = true
-            albumPage = try? await app.activeSource.album(id: albumID)
-            isSaved = albumPage?.album.saved ?? app.savedAlbums.contains(where: { $0.id == albumID })
-            if let tracks = albumPage?.tracks {
-                await app.checkLikes(for: tracks)
+            if let loaded = await app.loadAlbumPage(albumID: albumID, sourceID: sourceID) {
+                albumPage = loaded.page
+                resolvedSourceID = loaded.resolvedSourceID
+                isSaved = loaded.page.album.saved ?? app.savedAlbums.contains(where: { $0.id == albumID })
+                if let tracks = loaded.page.tracks {
+                    await app.checkLikes(for: tracks)
+                }
             }
             isLoading = false
         }
@@ -836,12 +848,63 @@ public struct ArtistDetailView: View {
     @EnvironmentObject private var app: AppModel
     public let artistID: String
     public let fallbackName: String
+    public let sourceID: String?
 
     @State private var artistPage: ArtistPage? = nil
+    @State private var resolvedSourceID: String? = nil
     @State private var isLoading = true
     @State private var isFollowing = false
+    @State private var searchOffset = 0
+    @State private var hasMoreSearchTracks = false
+    @State private var isLoadingMoreTracks = false
+
+    public init(artistID: String, fallbackName: String, sourceID: String? = nil) {
+        self.artistID = artistID
+        self.fallbackName = fallbackName
+        self.sourceID = sourceID
+    }
+
+    private func loadArtistDetails() async {
+        isLoading = true
+        if let outcome = await app.loadArtistPage(artistID: artistID, fallbackName: fallbackName, sourceID: sourceID) {
+            artistPage = outcome.page
+            resolvedSourceID = outcome.resolvedSourceID
+            isFollowing = outcome.page.artist.following ?? false
+            searchOffset = outcome.searchMoreOffset
+            hasMoreSearchTracks = outcome.hasMoreSearchTracks
+            if let tracks = outcome.page.tracks {
+                await app.checkLikes(for: tracks)
+            }
+        } else {
+            artistPage = nil
+        }
+        isLoading = false
+    }
+
+    private func loadMoreSongs() async {
+        guard !isLoadingMoreTracks,
+              hasMoreSearchTracks,
+              let current = artistPage else { return }
+        let sid = resolvedSourceID ?? sourceID ?? app.activeSourceID
+        let targetName = current.artist.name.isEmpty ? fallbackName : current.artist.name
+        isLoadingMoreTracks = true
+        let more = await app.loadMoreArtistTracks(artistName: targetName, sourceID: sid, offset: searchOffset)
+        var existing = current.tracks ?? []
+        var seenKeys = Set(existing.map(\.compositeKey))
+        let appended = more.tracks.filter { seenKeys.insert($0.compositeKey).inserted }
+        if !appended.isEmpty {
+            existing.append(contentsOf: appended)
+            artistPage?.tracks = existing
+            await app.checkLikes(for: appended)
+        }
+        searchOffset = more.nextOffset
+        hasMoreSearchTracks = more.hasMore
+        isLoadingMoreTracks = false
+    }
 
     public var body: some View {
+        let targetSourceID = resolvedSourceID ?? sourceID ?? app.activeSourceID
+        let targetSource = app.source(forID: targetSourceID) ?? app.activeSource
         ScrollView {
             if isLoading {
                 ProgressView()
@@ -849,6 +912,7 @@ public struct ArtistDetailView: View {
             } else if let page = artistPage {
                 let tracks = page.tracks ?? []
                 let albums = page.albums ?? []
+                let effectiveArtistID = page.artist.id.isEmpty ? artistID : page.artist.id
                 VStack(alignment: .leading, spacing: 22) {
                     VStack(spacing: 12) {
                         ArtworkView(
@@ -887,11 +951,10 @@ public struct ArtistDetailView: View {
                                 .buttonStyle(.plain)
                             }
 
-                            if app.activeSource.can("followArtist") {
-                                let srcID = app.activeSourceID
+                            if targetSource.can("followArtist") && !effectiveArtistID.isEmpty {
                                 Button {
                                     Task {
-                                        isFollowing = await app.toggleFollowArtist(sourceID: srcID, artistID: artistID, currentlyFollowing: isFollowing)
+                                        isFollowing = await app.toggleFollowArtist(sourceID: targetSourceID, artistID: effectiveArtistID, currentlyFollowing: isFollowing)
                                     }
                                 } label: {
                                     Label(
@@ -913,14 +976,26 @@ public struct ArtistDetailView: View {
 
                     if !tracks.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text(I18n.t("Songs"))
-                                .font(.system(size: 19, weight: .bold))
-                                .padding(.horizontal, 16)
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(I18n.t("Songs"))
+                                    .font(.system(size: 19, weight: .bold))
+                                Text("\(tracks.count)\(hasMoreSearchTracks ? "+" : "")")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 16)
+
                             ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
                                 TrackRowView(track: tr, index: idx) {
                                     app.player.playTrack(tracks, at: idx)
                                 }
                                 .padding(.horizontal, 8)
+                            }
+
+                            if hasMoreSearchTracks {
+                                LoadMoreButton(isLoading: isLoadingMoreTracks) {
+                                    Task { await loadMoreSongs() }
+                                }
                             }
                         }
                     }
@@ -933,7 +1008,7 @@ public struct ArtistDetailView: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 16) {
                                     ForEach(albums) { album in
-                                        NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name)) {
+                                        NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name, sourceID: targetSourceID)) {
                                             CoverCardView(
                                                 title: album.name,
                                                 subtitle: album.released,
@@ -949,17 +1024,32 @@ public struct ArtistDetailView: View {
                         }
                     }
                 }
+                .padding(.bottom, 24)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "person.wave.2")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.secondary.opacity(0.6))
+                    Text(I18n.t("Nothing found"))
+                        .font(.system(size: 16, weight: .semibold))
+                    Button {
+                        Task { await loadArtistDetails() }
+                    } label: {
+                        Label(I18n.t("Retry"), systemImage: "arrow.clockwise")
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 8)
+                            .background(MyGoTheme.accent, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .frame(maxWidth: .infinity, minHeight: 260)
             }
         }
         .navigationTitle(artistPage?.artist.name ?? fallbackName)
         .task {
-            isLoading = true
-            artistPage = try? await app.activeSource.artist(id: artistID)
-            isFollowing = artistPage?.artist.following ?? false
-            if let tracks = artistPage?.tracks {
-                await app.checkLikes(for: tracks)
-            }
-            isLoading = false
+            await loadArtistDetails()
         }
     }
 }

@@ -234,6 +234,24 @@ public struct Track: Codable, Identifiable, Hashable, Sendable {
         (artists ?? []).map(\.name).joined(separator: ", ")
     }
 
+    /// 解析用于点击跳转歌手主页的歌手列表（过滤空名，缺失结构化列表时回退按分隔符拆分）
+    public var resolvedArtistsForNavigation: [Artist] {
+        let structured = (artists ?? []).compactMap { artist -> Artist? in
+            let trimmed = artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return Artist(id: artist.id.trimmingCharacters(in: .whitespacesAndNewlines), name: trimmed, imageUrl: artist.imageUrl, following: artist.following)
+        }
+        if !structured.isEmpty {
+            return structured
+        }
+        let separators = CharacterSet(charactersIn: ",/、&×")
+        return artistNames
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { Artist(id: "", name: $0) }
+    }
+
     /// 转换为秒数时长
     public var durationSeconds: TimeInterval {
         TimeInterval(duration) / 1000.0

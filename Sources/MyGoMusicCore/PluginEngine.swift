@@ -478,9 +478,24 @@ private final class PluginHTTPClient: NSObject, URLSessionTaskDelegate, @uncheck
 
 /// 将插件中的 TypeScript 与 ES Module 语法安全转换为 JavaScriptCore 可执行的脚本，支持本地相对模块打包
 public enum PluginModuleTranspiler {
-    public struct TranspiledModule: Sendable {
+    public struct TranspiledModule: Codable, Sendable {
         public let code: String
         public let exports: Set<String>
+    }
+
+    private static let transpilerCacheVersion = 3
+
+    private struct FileStamp: Codable, Equatable {
+        let relativePath: String
+        let mtimeMillis: Int64
+        let size: Int64
+    }
+
+    private struct CachedTranspiledBundle: Codable {
+        let version: Int
+        let entryPath: String
+        let files: [FileStamp]
+        let module: TranspiledModule
     }
 
     /// 扫描单文件并转换为可运行 JS（兼容无本地 import 场景与直接代码转译测试）
@@ -635,6 +650,86 @@ public enum PluginModuleTranspiler {
         return TranspiledModule(code: finalCode, exports: entryRewritten.exports)
     }
 
+    /// 带磁盘指纹缓存的插件打包入口：插件脚本/JSON 未变动时直接复用已转译 JS，避免冷启动重复扫描
+    public static func bundleEntryCached(
+        entryURL: URL,
+        pluginDir: URL,
+        cacheFileURL: URL
+    ) throws -> TranspiledModule {
+        let canonicalRoot = pluginDir.standardizedFileURL.resolvingSymlinksInPath()
+        let canonicalEntry = entryURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard isInsideDirectory(canonicalEntry, root: canonicalRoot) else {
+            throw SourceError.message("main must reside inside plugin directory")
+        }
+
+        let rootPrefix = canonicalRoot.path.hasSuffix("/") ? canonicalRoot.path : canonicalRoot.path + "/"
+        let entryRelPath: String
+        if canonicalEntry.path.hasPrefix(rootPrefix) {
+            entryRelPath = String(canonicalEntry.path.dropFirst(rootPrefix.count))
+        } else {
+            entryRelPath = canonicalEntry.lastPathComponent
+        }
+
+        let currentStamps = collectPluginFileStamps(in: canonicalRoot, rootPrefix: rootPrefix)
+        if !currentStamps.isEmpty,
+           let cacheData = try? Data(contentsOf: cacheFileURL),
+           let cached = try? JSONDecoder().decode(CachedTranspiledBundle.self, from: cacheData),
+           cached.version == transpilerCacheVersion,
+           cached.entryPath == entryRelPath,
+           cached.files == currentStamps {
+            return cached.module
+        }
+
+        let compiled = try bundleEntry(entryURL: entryURL, pluginDir: pluginDir)
+        if !currentStamps.isEmpty {
+            let bundle = CachedTranspiledBundle(
+                version: transpilerCacheVersion,
+                entryPath: entryRelPath,
+                files: currentStamps,
+                module: compiled
+            )
+            if let encoded = try? JSONEncoder().encode(bundle) {
+                try? FileManager.default.createDirectory(
+                    at: cacheFileURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try? encoded.write(to: cacheFileURL, options: .atomic)
+            }
+        }
+        return compiled
+    }
+
+    private static func collectPluginFileStamps(in canonicalRoot: URL, rootPrefix: String) -> [FileStamp] {
+        let fm = FileManager.default
+        let watchedExts: Set<String> = ["js", "mjs", "cjs", "ts", "mts", "tsx", "json"]
+        guard let enumerator = fm.enumerator(
+            at: canonicalRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var stamps: [FileStamp] = []
+        for case let fileURL as URL in enumerator {
+            let ext = fileURL.pathExtension.lowercased()
+            guard watchedExts.contains(ext) else { continue }
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]),
+                  values.isRegularFile == true else {
+                continue
+            }
+            let resolvedPath = fileURL.standardizedFileURL.resolvingSymlinksInPath().path
+            let relPath = resolvedPath.hasPrefix(rootPrefix)
+                ? String(resolvedPath.dropFirst(rootPrefix.count))
+                : fileURL.lastPathComponent
+            let mtimeMillis = Int64(((values.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1_000).rounded())
+            let size = Int64(values.fileSize ?? 0)
+            stamps.append(FileStamp(relativePath: relPath, mtimeMillis: mtimeMillis, size: size))
+        }
+        stamps.sort { $0.relativePath < $1.relativePath }
+        return stamps
+    }
+
     private static func isInsideDirectory(_ url: URL, root: URL) -> Bool {
         let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
         return url.path == root.path || url.path.hasPrefix(rootPath)
@@ -684,9 +779,25 @@ public enum PluginModuleTranspiler {
         /// 源码字符数组与每个字符是否位于可执行代码区（非字符串/模板纯字面量/注释/正则）
         let chars: [Character]
         let isCode: [Bool]
+        /// 一次遍历建立 UTF-16 偏移到字符索引的 O(1) 查表，避免正则循环内反复执行 O(N) distance 计算
+        private let utf16ToChar: [Int]
 
         init(_ source: String) {
-            let arr = Array(source)
+            var arr: [Character] = []
+            arr.reserveCapacity(source.utf16.count)
+            var u16Map: [Int] = []
+            u16Map.reserveCapacity(source.utf16.count + 1)
+            var charIdx = 0
+            for ch in source {
+                arr.append(ch)
+                let unitCount = ch.utf16.count
+                for _ in 0..<unitCount {
+                    u16Map.append(charIdx)
+                }
+                charIdx += 1
+            }
+            u16Map.append(charIdx)
+
             let n = arr.count
             var codeFlags = [Bool](repeating: true, count: n)
 
@@ -877,6 +988,13 @@ public enum PluginModuleTranspiler {
 
             self.chars = arr
             self.isCode = codeFlags
+            self.utf16ToChar = u16Map
+        }
+
+        func charOffset(forUTF16Offset u16Offset: Int) -> Int {
+            guard !utf16ToChar.isEmpty else { return 0 }
+            let clamped = min(max(u16Offset, 0), utf16ToChar.count - 1)
+            return utf16ToChar[clamped]
         }
 
         private static func precedingIdentifier(_ chars: [Character], endingAt idx: Int) -> String {
@@ -925,7 +1043,7 @@ public enum PluginModuleTranspiler {
             var result = working
             for match in matches.reversed() {
                 guard let fullRange = Range(match.range, in: result) else { continue }
-                let charOffset = result.distance(from: result.startIndex, to: fullRange.lowerBound)
+                let charOffset = mask.charOffset(forUTF16Offset: match.range.location)
                 // 检查匹配起始第一个非空白字符是否在代码区
                 var probe = charOffset
                 while probe < mask.chars.count && mask.chars[probe].isWhitespace {
@@ -1471,7 +1589,7 @@ public enum PluginModuleTranspiler {
             var out = result
             for match in matches.reversed() {
                 guard let startRange = Range(match.range, in: out) else { continue }
-                let offset = out.distance(from: out.startIndex, to: startRange.lowerBound)
+                let offset = currentMask.charOffset(forUTF16Offset: match.range.location)
                 var probe = offset
                 while probe < currentMask.chars.count && currentMask.chars[probe].isWhitespace {
                     probe += 1
@@ -1480,11 +1598,11 @@ public enum PluginModuleTranspiler {
 
                 let matchedStr = String(out[startRange])
                 if matchedStr.hasSuffix("{") {
-                    // 按花括号配对找到整块 interface/declare 结束位置
+                    // 按花括号配对找到整块 interface/declare 结束位置（沿字符索引线性步进，消除 O(N^2) distance 开销）
                     var idx = out.index(before: startRange.upperBound)
+                    var cIdx = offset + max(matchedStr.count - 1, 0)
                     var depth = 0
                     while idx < out.endIndex {
-                        let cIdx = out.distance(from: out.startIndex, to: idx)
                         if cIdx < currentMask.isCode.count && currentMask.isCode[cIdx] {
                             if out[idx] == "{" { depth += 1 }
                             else if out[idx] == "}" {
@@ -1497,6 +1615,7 @@ public enum PluginModuleTranspiler {
                             }
                         }
                         idx = out.index(after: idx)
+                        cIdx += 1
                     }
                 } else {
                     out.removeSubrange(startRange)
@@ -1516,7 +1635,7 @@ public enum PluginModuleTranspiler {
         var out = source
         for match in matches.reversed() {
             guard let range = Range(match.range, in: out) else { continue }
-            let offset = out.distance(from: out.startIndex, to: range.lowerBound)
+            let offset = mask.charOffset(forUTF16Offset: match.range.location)
             var probe = offset
             while probe < mask.chars.count && mask.chars[probe].isWhitespace {
                 probe += 1
@@ -1659,7 +1778,12 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
             throw SourceError.message("main escapes plugin directory: \(relMain)")
         }
 
-        self.transpiled = try PluginModuleTranspiler.bundleEntry(entryURL: mainFile, pluginDir: self.pluginDir)
+        let transpiledCacheURL = self.dataDir.appendingPathComponent(".transpiled-cache-v2.json")
+        self.transpiled = try PluginModuleTranspiler.bundleEntryCached(
+            entryURL: mainFile,
+            pluginDir: self.pluginDir,
+            cacheFileURL: transpiledCacheURL
+        )
 
         self.locales = Self.loadLocales(from: self.pluginDir)
         if let s = Self.loadJSONDictionary(from: dataDir.appendingPathComponent("settings.json")) {

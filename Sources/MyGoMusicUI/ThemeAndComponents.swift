@@ -99,9 +99,9 @@ public final class ArtworkImageLoader: ObservableObject {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
-    private static let paletteContext = CIContext()
     @Published public private(set) var image: Image? = nil
     @Published public private(set) var dominantColor: Color? = nil
+    @Published public private(set) var dominantRGB: BackdropRGBColor? = nil
     private var currentTaskKey: String = ""
 
     public init() {}
@@ -112,10 +112,14 @@ public final class ArtworkImageLoader: ObservableObject {
         extractDominantColor: Bool = false,
         headersProvider: ((URL) -> [String: String])?
     ) async {
-        if extractDominantColor { dominantColor = nil }
+        if extractDominantColor {
+            dominantColor = nil
+            dominantRGB = nil
+        }
         guard let resolved = sizedImageURL(rawURLString, px: pixelSize), !resolved.isEmpty else {
             self.image = nil
             self.dominantColor = nil
+            self.dominantRGB = nil
             return
         }
 
@@ -212,35 +216,36 @@ public final class ArtworkImageLoader: ObservableObject {
     }
 
     private func updateDominantColor(from data: Data) {
-        #if canImport(UIKit)
-        guard let image = UIImage(data: data), let cgImage = image.cgImage else { return }
-        let input = CIImage(cgImage: cgImage)
-        guard let filter = CIFilter(name: "CIAreaAverage") else { return }
-        filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(CIVector(cgRect: input.extent), forKey: kCIInputExtentKey)
-        guard let output = filter.outputImage else { return }
-        var pixel = [UInt8](repeating: 0, count: 4)
-        let bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
-        Self.paletteContext.render(output, toBitmap: &pixel, rowBytes: 4, bounds: bounds, format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
-
-        let average = UIColor(
-            red: CGFloat(pixel[0]) / 255,
-            green: CGFloat(pixel[1]) / 255,
-            blue: CGFloat(pixel[2]) / 255,
-            alpha: 1
-        )
-        var hue: CGFloat = 0
-        var saturation: CGFloat = 0
-        var brightness: CGFloat = 0
-        average.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: nil)
-        let tint = UIColor(
-            hue: hue,
-            saturation: min(max(saturation * 1.25, 0.38), 0.82),
-            brightness: min(max(brightness * 1.65, 0.48), 0.82),
-            alpha: 1
-        )
-        dominantColor = Color(uiColor: tint)
-        #endif
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return
+        }
+        let sampleSize = 24
+        var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: sampleSize,
+            height: sampleSize,
+            bitsPerComponent: 8,
+            bytesPerRow: sampleSize * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return
+        }
+        ctx.interpolationQuality = .low
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+        guard let dominant = BackdropFogMath.dominantColorFromRGBA(
+            bytes: pixels,
+            width: sampleSize,
+            height: sampleSize
+        ) else {
+            return
+        }
+        dominantRGB = dominant
+        dominantColor = Color(red: dominant.r, green: dominant.g, blue: dominant.b)
     }
 }
 
@@ -549,6 +554,7 @@ public struct DailyFeatureCardView: View {
 
 public struct TrackRowView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.mygoNavigate) private var navigate
     public let track: Track
     public let index: Int?
     public let onPlay: () -> Void
@@ -653,6 +659,24 @@ public struct TrackRowView: View {
                         ForEach(app.myPlaylists.filter { $0.fixed != true }) { pl in
                             Button(pl.name) {
                                 Task { await app.addTrack(track, toPlaylist: pl.id) }
+                            }
+                        }
+                    }
+                }
+                let trackArtists = track.resolvedArtistsForNavigation
+                if trackArtists.count == 1, let artist = trackArtists.first {
+                    Button {
+                        navigate(.artist(id: artist.id, name: artist.name, sourceID: track.source))
+                    } label: {
+                        Label(I18n.tf("Go to Artist: %s", artist.name), systemImage: "person.wave.2")
+                    }
+                } else if trackArtists.count > 1 {
+                    Menu(I18n.t("Artists")) {
+                        ForEach(Array(trackArtists.enumerated()), id: \.offset) { _, artist in
+                            Button {
+                                navigate(.artist(id: artist.id, name: artist.name, sourceID: track.source))
+                            } label: {
+                                Label(artist.name, systemImage: "person.wave.2")
                             }
                         }
                     }
@@ -1062,3 +1086,24 @@ public struct SystemVolumeHardwareHostView: UIViewRepresentable {
     }
 }
 #endif
+
+// MARK: - 跨视图键盘统一收起工具（兼容系统输入法与第三方输入法）
+
+public enum MyGoKeyboard {
+    /// 主动结束当前所有窗口的第一响应者，确保搜索或提交后软键盘立即彻底退下。
+    @MainActor
+    public static func dismiss() {
+        #if canImport(UIKit)
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows {
+                window.endEditing(true)
+            }
+        }
+        #elseif canImport(AppKit)
+        let app: NSApplication? = NSApp
+        app?.keyWindow?.makeFirstResponder(nil)
+        #endif
+    }
+}

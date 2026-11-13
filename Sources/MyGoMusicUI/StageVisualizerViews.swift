@@ -198,7 +198,8 @@ private struct StageVisualizerFrameView: View {
         accent: Color,
         rhythm: AudioRhythmState
     ) -> some View {
-        let stageContentWidth = max(200.0, width - 48.0)
+        let stageContentWidth = max(200.0, width - 56.0)
+        let stageContentHeight = max(240.0, height * 0.78)
 
         ZStack {
             // 中央演艺舞台区域（为底部译文与下一句预留底部安全高度，保持构图呼吸感）
@@ -213,7 +214,7 @@ private struct StageVisualizerFrameView: View {
                             style: stageStyle,
                             fade: exitOpacity,
                             width: stageContentWidth,
-                            height: height * 0.72,
+                            height: stageContentHeight,
                             fontSize: baseFontSize,
                             accent: accent,
                             sparks: false,
@@ -241,7 +242,7 @@ private struct StageVisualizerFrameView: View {
                             style: stageStyle,
                             fade: 1.0,
                             width: stageContentWidth,
-                            height: height * 0.72,
+                            height: stageContentHeight,
                             fontSize: baseFontSize,
                             accent: accent,
                             sparks: stageSparks,
@@ -266,7 +267,7 @@ private struct StageVisualizerFrameView: View {
                         style: stageStyle,
                         fade: 1.0,
                         width: stageContentWidth,
-                        height: height * 0.72,
+                        height: stageContentHeight,
                         fontSize: baseFontSize,
                         accent: accent,
                         sparks: stageSparks,
@@ -367,47 +368,45 @@ private struct StageAudioAtmosphereView: View {
     let rhythm: AudioRhythmState
 
     var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
-            let vocalOpacity = 0.08 + 0.14 * rhythm.vocal + 0.07 * rhythm.beatPulse
-            let bassScale = 0.88 + 0.24 * rhythm.bass + 0.16 * rhythm.beatPulse
-            let bassOpacity = 0.06 + 0.15 * rhythm.bass + 0.09 * rhythm.beatPulse
+        Canvas { context, size in
+            let w = size.width
+            let h = size.height
+            guard w > 0, h > 0 else { return }
 
-            ZStack {
-                // 中央人声感应柔光
-                Ellipse()
-                    .fill(
-                        RadialGradient(
-                            colors: [accent.opacity(vocalOpacity), .clear],
-                            center: .center,
-                            startRadius: 4,
-                            endRadius: max(w, h) * 0.42
-                        )
-                    )
-                    .frame(width: w * 0.92, height: h * 0.56)
-                    .scaleEffect(0.95 + 0.08 * rhythm.vocal)
-                    .position(x: w * 0.5, y: h * 0.42)
-                    .blendMode(.screen)
+            let vocalOpacity = 0.04 + 0.09 * rhythm.vocal + 0.05 * rhythm.beatPulse
+            let bassOpacity = 0.035 + 0.085 * rhythm.bass + 0.055 * rhythm.beatPulse
+            let pulseScale = 0.96 + 0.12 * rhythm.bass + 0.08 * rhythm.beatPulse
 
-                // 低频踩鼓脉冲光浪
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                accent.opacity(bassOpacity),
-                                Color.white.opacity(0.035 * rhythm.beatPulse),
-                                .clear
-                            ],
-                            center: .center,
-                            startRadius: 2,
-                            endRadius: w * 0.48
-                        )
-                    )
-                    .frame(width: w * 0.85, height: w * 0.85)
-                    .scaleEffect(bassScale)
-                    .position(x: w * 0.5, y: h * 0.58)
-                    .blendMode(.screen)
+            // 使用远大于渐变半径的全屏扩展区域与多段高斯式衰减停靠点，消除形状裁切造成的圆形/椭圆硬边
+            let canvasExtent = Path(CGRect(x: -w * 0.5, y: -h * 0.5, width: w * 2.0, height: h * 2.0))
+            let mainCenter = CGPoint(x: w * 0.5, y: h * 0.45)
+            let mainRadius = max(w, h) * 0.62 * (0.96 + 0.06 * rhythm.vocal)
+            let mainGrad = Gradient(stops: [
+                .init(color: accent.opacity(vocalOpacity), location: 0.0),
+                .init(color: accent.opacity(vocalOpacity * 0.50), location: 0.34),
+                .init(color: accent.opacity(vocalOpacity * 0.14), location: 0.68),
+                .init(color: .clear, location: 1.0)
+            ])
+
+            let bassCenter = CGPoint(x: w * 0.5, y: h * 0.58)
+            let bassRadius = max(w, h) * 0.54 * pulseScale
+            let bassGrad = Gradient(stops: [
+                .init(color: accent.opacity(bassOpacity), location: 0.0),
+                .init(color: Color.white.opacity(0.025 * rhythm.beatPulse), location: 0.30),
+                .init(color: accent.opacity(bassOpacity * 0.14), location: 0.64),
+                .init(color: .clear, location: 1.0)
+            ])
+
+            context.drawLayer { ctx in
+                ctx.blendMode = .screen
+                ctx.fill(
+                    canvasExtent,
+                    with: .radialGradient(mainGrad, center: mainCenter, startRadius: 0, endRadius: mainRadius)
+                )
+                ctx.fill(
+                    canvasExtent,
+                    with: .radialGradient(bassGrad, center: bassCenter, startRadius: 0, endRadius: bassRadius)
+                )
             }
         }
     }
@@ -433,20 +432,10 @@ private struct StageFlowLineView: View {
             if charLen > 12 { return fontSize * 0.88 }
             return fontSize * 0.94
         }()
-        let spreadScale = 0.42
-        let marginScale = 0.92
-        let shapes = StageMath.stageShapes(for: line, fontSize: adaptiveFontSize, spreadScale: spreadScale)
-        let rows = StageMath.flowRows(
-            for: line,
-            shapes: shapes,
-            fontSize: adaptiveFontSize,
-            availableWidth: max(180, availableWidth),
-            marginScale: marginScale
-        )
+        let spreadScale = 0.68
+        let marginScale = 0.95
         let placement = StageMath.flowPlacement(for: line, containerWidth: availableWidth)
-        let isCompactWidth = availableWidth < 460
         let rowAlignment: HorizontalAlignment = {
-            if isCompactWidth { return .center }
             switch placement.alignment {
             case .leading: return .leading
             case .center: return .center
@@ -454,26 +443,29 @@ private struct StageFlowLineView: View {
             }
         }()
         let frameAlignment: Alignment = {
-            if isCompactWidth { return .center }
             switch placement.alignment {
             case .leading: return .leading
             case .center: return .center
             case .trailing: return .trailing
             }
         }()
-        let horizontalSway: Double = {
-            guard isCompactWidth else { return 0 }
-            switch placement.alignment {
-            case .leading: return -14.0
-            case .center: return 0.0
-            case .trailing: return 14.0
-            }
-        }()
-        let verticalShift = placement.verticalShiftRatio * availableHeight * (isCompactWidth ? 0.55 : 1.0)
+        // 非居中落点时适度收窄换行宽度（78%），让中等长度歌词也明确呈现左上/右上/左下/右下的空间错落感
+        let rowWrapWidth = placement.alignment == .center
+            ? max(180, availableWidth * 0.96)
+            : max(180, availableWidth * 0.80)
+        let shapes = StageMath.stageShapes(for: line, fontSize: adaptiveFontSize, spreadScale: spreadScale)
+        let rows = StageMath.flowRows(
+            for: line,
+            shapes: shapes,
+            fontSize: adaptiveFontSize,
+            availableWidth: rowWrapWidth,
+            marginScale: marginScale
+        )
+        let verticalShift = placement.verticalShiftRatio * availableHeight
         let exitLift = (1.0 - fade) * -14.0
         let exitScale = 1.0 - (1.0 - fade) * 0.04
 
-        VStack(alignment: rowAlignment, spacing: max(18, adaptiveFontSize * 0.62)) {
+        VStack(alignment: rowAlignment, spacing: max(22, adaptiveFontSize * 0.70)) {
             ForEach(Array(rows.enumerated()), id: \.offset) { _, wordIndices in
                 HStack(spacing: 0) {
                     ForEach(wordIndices, id: \.self) { idx in
@@ -483,17 +475,16 @@ private struct StageFlowLineView: View {
                                 shape: shapes[idx],
                                 pos: pos,
                                 rhythm: rhythm,
-                                horizontalSpreadScale: 0.42
+                                horizontalSpreadScale: spreadScale
                             )
                             let safeState: WordRenderState = {
                                 var st = rawState
-                                // 控制单字竖直散落幅度，防止上下行发生字母碰撞
-                                st.y = min(10.0, max(-10.0, st.y))
+                                st.y = min(14.0, max(-14.0, st.y))
                                 if idx == wordIndices.first {
-                                    st.x = max(-10.0, st.x)
+                                    st.x = max(-18.0, st.x)
                                 }
                                 if idx == wordIndices.last {
-                                    st.x = min(10.0, st.x)
+                                    st.x = min(18.0, st.x)
                                 }
                                 return st
                             }()
@@ -513,7 +504,7 @@ private struct StageFlowLineView: View {
             }
         }
         .frame(maxWidth: availableWidth, alignment: frameAlignment)
-        .offset(x: horizontalSway, y: verticalShift + exitLift)
+        .offset(y: verticalShift + exitLift)
         .scaleEffect(exitScale)
         .opacity(fade)
     }
@@ -533,12 +524,12 @@ private struct StagePartitaLineView: View {
     let rhythm: AudioRhythmState
 
     var body: some View {
-        let rows = StageMath.partitaRows(for: line, height: max(280, availableHeight))
+        let rows = StageMath.partitaRows(for: line, height: max(340, availableHeight * 1.15))
         let totalChars = StageMath.wordsLength(line.words[...])
         let rowFontSize = (totalChars > 40 ? fontSize * 0.78 : fontSize) * 0.80
         let grow = 1.0 + 0.05 * (1.0 - fade)
 
-        VStack(spacing: max(14, rowFontSize * 0.56)) {
+        VStack(spacing: 4) {
             ForEach(Array(rows.enumerated()), id: \.offset) { rIdx, row in
                 if row.from < row.to, row.to <= line.words.count {
                     partitaRowView(
@@ -568,13 +559,15 @@ private struct StagePartitaLineView: View {
             rhythm: rhythm
         )
         let seed = (rowWords[row.from].start * 1000.0).rounded() / 1000.0
-        let rowShapes = buildRowWordShapes(
+        let built = buildRowWordShapes(
             words: rowWords,
             rowScale: row.scale,
             seed: seed,
             fontSize: rowFontSize,
             isLastRow: isLastRow
         )
+        let rowShapes = built.shapes
+        let rowPad = max(2.0, rowFontSize * (built.effectiveScale * 1.32 - 1.0) / 2.0)
 
         HStack(spacing: 0) {
             ForEach(Array(rowWords.enumerated()), id: \.offset) { localIdx, word in
@@ -584,7 +577,7 @@ private struct StagePartitaLineView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background {
-            // 对照桌面 ui_stage_styles.go:248-261 实时绘制的 L 型直角引导角标
+            // 对照桌面 ui_stage_styles.go:248-261 实时绘制的 L 型交叉直角引导角标
             PartitaGuideCornerOverlay(
                 isLeft: row.left,
                 motion: rowMotion,
@@ -592,11 +585,13 @@ private struct StagePartitaLineView: View {
             )
         }
         .offset(
-            x: min(max(rowMotion.offsetX, -availableWidth * 0.14), availableWidth * 0.14),
+            x: min(max(rowMotion.offsetX, -availableWidth * 0.24), availableWidth * 0.24),
             y: rowMotion.offsetY
         )
         .scaleEffect(rowMotion.scale)
         .opacity(rowMotion.opacity)
+        .padding(.top, rowPad)
+        .padding(.bottom, rowPad + 6.0)
     }
 
     private func partitaWordNodeView(word: LyricWord, shape: WordShape, rowFontSize: Double) -> some View {
@@ -616,7 +611,7 @@ private struct StagePartitaLineView: View {
             accent: accent,
             sparks: sparks,
             rhythm: rhythm,
-            trailingMargin: shape.margin * 0.72
+            trailingMargin: shape.margin * 0.85
         )
     }
 
@@ -626,80 +621,107 @@ private struct StagePartitaLineView: View {
         seed: Double,
         fontSize: Double,
         isLastRow: Bool
-    ) -> [WordShape] {
-        var shapes: [WordShape] = []
-        var widths: [Double] = []
-        shapes.reserveCapacity(words.count)
-        widths.reserveCapacity(words.count)
-        let boundedRowScale = min(1.38, max(0.86, rowScale * 0.86))
+    ) -> (shapes: [WordShape], effectiveScale: Double) {
+        let baseWidths = words.map { StageMath.wordWidth($0.text, fontSize: fontSize) }
+        let sumBaseWidth = baseWidths.reduce(0.0, +)
+        let desiredScale = min(1.56, max(0.76, rowScale * 0.92))
+        let maxSafeWidth = max(140.0, availableWidth * 0.88)
+        let estGap = Double(max(words.count - 1, 0)) * fontSize * 0.14
+        let estScaledWidth = sumBaseWidth * desiredScale + estGap + 24.0
+        let effectiveScale: Double
+        if estScaledWidth > maxSafeWidth && estScaledWidth > 0 {
+            effectiveScale = max(0.62, desiredScale * (maxSafeWidth / estScaledWidth))
+        } else {
+            effectiveScale = desiredScale
+        }
 
-        for (i, word) in words.enumerated() {
+        var shapes: [WordShape] = []
+        var scaledWidths: [Double] = []
+        shapes.reserveCapacity(words.count)
+        scaledWidths.reserveCapacity(words.count)
+
+        for (i, _) in words.enumerated() {
             let ws = seed + Double(i) * 7.13
-            widths.append(StageMath.wordWidth(word.text, fontSize: fontSize))
+            scaledWidths.append(baseWidths[i] * effectiveScale)
             shapes.append(
                 WordShape(
                     x: (StageMath.lineRandom(seed: ws, offset: 1) - 0.5) * 12,
                     y: (StageMath.lineRandom(seed: ws, offset: 2) - 0.5) * 12,
                     rotate: (StageMath.lineRandom(seed: ws, offset: 3) - 0.5) * 6,
-                    scale: boundedRowScale,
+                    scale: effectiveScale,
                     drift: (StageMath.lineRandom(seed: ws, offset: 8) - 0.5) * 18,
                     margin: 0,
                     last: false
                 )
             )
         }
-        StageMath.spaceWords(&shapes, widths: widths, gap: fontSize * 0.1)
+        StageMath.spaceWords(&shapes, widths: scaledWidths, gap: fontSize * 0.1, spreadScale: 0.44)
         if !shapes.isEmpty {
             shapes[shapes.count - 1].margin = 0
             shapes[shapes.count - 1].last = isLastRow
         }
-        return shapes
+        return (shapes, effectiveScale)
     }
 }
 
-/// 云阶 L 型直角矢量引导标（随歌唱阶段从拐角展开、亮显主题色并轻泛音律霓虹）
+/// 云阶 L 型交叉直角矢量引导标（精确外扩绘制画布以防越界裁切，1:1 对照 ui_stage_styles.go:248-261）
 private struct PartitaGuideCornerOverlay: View {
     let isLeft: Bool
     let motion: StagePartitaRowMotion
     let accent: Color
 
+    private static let bleed: CGFloat = 20
+
     var body: some View {
         Canvas { context, size in
             let g = motion.guideProgress
-            guard g > 0.01, size.width > 4, size.height > 4 else { return }
+            guard g > 0.01, size.width > Self.bleed * 2 + 4, size.height > Self.bleed * 2 + 4 else { return }
 
             let baseColor: Color = (motion.guideState == .singing) ? accent : .white
             let strokeColor = baseColor.opacity(motion.guideAlpha)
-            let bottom = size.height
-            let vertLen = min(30.0, size.height + 14.0) * g
-            let horizLen = (size.width + 26.0) * g
-            let lineWidth: CGFloat = (motion.guideState == .singing) ? 1.5 : 1.0
+            let r = CGRect(
+                x: Double(Self.bleed),
+                y: Double(Self.bleed),
+                width: Double(size.width - Self.bleed * 2),
+                height: Double(size.height - Self.bleed * 2)
+            )
+            let vertLen = 32.0 * g
+            let horizLen = (r.width + 32.0) * g
+            let lineWidth: CGFloat = (motion.guideState == .singing) ? 1.35 : 1.0
 
             var path = Path()
             if isLeft {
-                let x = -6.0
-                path.move(to: CGPoint(x: x, y: bottom + 12.0))
-                path.addLine(to: CGPoint(x: x, y: bottom + 12.0 - vertLen))
-                path.move(to: CGPoint(x: -12.0, y: bottom + 5.0))
-                path.addLine(to: CGPoint(x: -12.0 + horizLen, y: bottom + 5.0))
+                let vx = r.minX - 8.0
+                let vStartY = r.maxY + 14.0
+                path.move(to: CGPoint(x: vx, y: vStartY))
+                path.addLine(to: CGPoint(x: vx, y: vStartY - vertLen))
+
+                let hx = r.minX - 14.0
+                let hy = r.maxY + 6.0
+                path.move(to: CGPoint(x: hx, y: hy))
+                path.addLine(to: CGPoint(x: hx + horizLen, y: hy))
             } else {
-                let x = size.width + 6.0
-                path.move(to: CGPoint(x: x, y: bottom + 12.0))
-                path.addLine(to: CGPoint(x: x, y: bottom + 12.0 - vertLen))
-                path.move(to: CGPoint(x: size.width + 12.0, y: bottom + 5.0))
-                path.addLine(to: CGPoint(x: size.width + 12.0 - horizLen, y: bottom + 5.0))
+                let vx = r.maxX + 8.0
+                let vStartY = r.maxY + 14.0
+                path.move(to: CGPoint(x: vx, y: vStartY))
+                path.addLine(to: CGPoint(x: vx, y: vStartY - vertLen))
+
+                let hx = r.maxX + 14.0
+                let hy = r.maxY + 6.0
+                path.move(to: CGPoint(x: hx, y: hy))
+                path.addLine(to: CGPoint(x: hx - horizLen, y: hy))
             }
 
             if motion.guideState == .singing {
                 context.drawLayer { layer in
-                    layer.addFilter(.shadow(color: accent.opacity(0.65), radius: 5))
+                    layer.addFilter(.shadow(color: accent.opacity(0.55), radius: 4))
                     layer.stroke(path, with: .color(strokeColor), lineWidth: lineWidth)
                 }
             } else {
                 context.stroke(path, with: .color(strokeColor), lineWidth: lineWidth)
             }
         }
-        .padding(-16)
+        .padding(-Self.bleed)
         .allowsHitTesting(false)
     }
 }
@@ -743,6 +765,19 @@ private struct StageTiltLineView: View {
         .padding(.horizontal, 20)
         .offset(y: exitRise)
         .opacity(fade)
+    }
+}
+
+/// 合成右侧斜体几何错切（使 iOS 苹方中文与日文假名也能呈现桌面级 12° 倾斜，1:1 还原倾诉样式）
+private struct ItalicShearEffect: GeometryEffect {
+    let isItalic: Bool
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        guard isItalic else { return ProjectionTransform(.identity) }
+        let shear: CGFloat = -0.212
+        return ProjectionTransform(
+            CGAffineTransform(a: 1, b: 0, c: shear, d: 1, tx: -shear * size.height * 0.5, ty: 0)
+        )
     }
 }
 
@@ -798,25 +833,28 @@ private struct StageTiltPartRowView: View {
                     )
                     let seed = ((token.sparkWordStart ?? 0) * 1000.0).rounded()
                     let sparkSince = token.sparkWordStart.map { pos - $0 } ?? -1
+                    let sparkVisible = sparks && token.sparkWordStart != nil
+                        && sparkSince >= 0 && sparkSince < StageMath.sparkTime
 
                     let charView = Text(token.text)
                         .font(.system(
                             size: motion.fontSize,
-                            weight: motion.isLightWeight ? .light : .semibold
+                            weight: motion.isLightWeight ? .light : .regular
                         ))
                         .italic(motion.isItalic)
                         .foregroundStyle(baseColor.opacity(chMotion.opacity))
                         .shadow(
-                            color: motion.useAccentColor
-                                ? accent.opacity(0.45 * chMotion.highlightStrength)
-                                : accent.opacity(0.55 * chMotion.highlightStrength),
-                            radius: 6 + 6 * chMotion.highlightStrength
+                            color: chMotion.highlightStrength > 0.04
+                                ? accent.opacity(0.38 * chMotion.highlightStrength)
+                                : .clear,
+                            radius: chMotion.highlightStrength > 0.04 ? (4 + 5 * chMotion.highlightStrength) : 0
                         )
-                        .padding(.trailing, motion.tracking * 0.65)
+                        .modifier(ItalicShearEffect(isItalic: motion.isItalic))
+                        .padding(.trailing, motion.tracking)
                         .scaleEffect(chMotion.scale)
                         .offset(y: chMotion.waveOffsetY)
 
-                    if sparks, token.sparkWordStart != nil {
+                    if sparkVisible {
                         charView.overlay {
                             StageSparkCanvasOverlay(
                                 since: sparkSince,
@@ -850,6 +888,7 @@ private struct StageTiltPartRowView: View {
             let charCount = max(1, trimmedRight.count)
             let eachDur = max(0.05, (word.end - word.start) / Double(charCount))
             var localIdx = 0
+            var hasEmittedWordSpark = false
 
             for ch in trimmedRight {
                 let s = String(ch)
@@ -867,7 +906,8 @@ private struct StageTiltPartRowView: View {
                         )
                     )
                 } else {
-                    let isSparkAnchor = (localIdx == 0)
+                    let isSparkAnchor = !hasEmittedWordSpark
+                    hasEmittedWordSpark = true
                     result.append(
                         CharToken(
                             id: "\(wIdx)-\(localIdx)-\(s)",
@@ -918,34 +958,44 @@ private struct StageWordNodeView: View {
     var body: some View {
         let glowBlur = fontSize * (0.18 + 0.08 * rhythm.bass)
 
-        ZStack {
-            if state.glow > 0.015 {
+        Group {
+            if state.opacity <= 0.002 {
+                // 未唱到前保持布局占位但完全隐身，到拍后在原地旁边凭空弹射蹦出且绝不挤动已显出的字
                 Text(word.text)
                     .font(.system(size: fontSize, weight: .heavy))
-                    .foregroundStyle(accent.opacity(min(1.0, 0.88 * state.glow)))
-                    .blur(radius: glowBlur)
+                    .opacity(0)
+                    .fixedSize(horizontal: true, vertical: true)
+            } else {
+                ZStack {
+                    if state.glow > 0.015 {
+                        Text(word.text)
+                            .font(.system(size: fontSize, weight: .heavy))
+                            .foregroundStyle(accent.opacity(min(1.0, 0.88 * state.glow)))
+                            .blur(radius: glowBlur)
+                    }
+                    Text(word.text)
+                        .font(.system(size: fontSize, weight: .heavy))
+                        .foregroundStyle(.white.opacity(state.brightness))
+                        .blur(radius: state.blur * 0.52)
+                }
+                .fixedSize(horizontal: true, vertical: true)
+                .overlay {
+                    if sparks && state.sparkSince >= 0 && state.sparkSince < StageMath.sparkTime {
+                        StageSparkCanvasOverlay(
+                            since: state.sparkSince,
+                            seed: (word.start * 1000.0).rounded(),
+                            accent: accent,
+                            isLastWord: shape.last,
+                            rhythm: rhythm
+                        )
+                    }
+                }
+                .scaleEffect(state.scale)
+                .rotationEffect(.degrees(state.rotate))
+                .offset(x: state.x, y: state.y)
+                .opacity(state.opacity)
             }
-            Text(word.text)
-                .font(.system(size: fontSize, weight: .heavy))
-                .foregroundStyle(.white.opacity(state.brightness))
-                .blur(radius: state.blur * 0.42)
         }
-        .fixedSize(horizontal: true, vertical: true)
-        .overlay {
-            if sparks && state.sparkSince >= 0 && state.sparkSince < StageMath.sparkTime {
-                StageSparkCanvasOverlay(
-                    since: state.sparkSince,
-                    seed: (word.start * 1000.0).rounded(),
-                    accent: accent,
-                    isLastWord: shape.last,
-                    rhythm: rhythm
-                )
-            }
-        }
-        .scaleEffect(state.scale)
-        .rotationEffect(.degrees(state.rotate))
-        .offset(x: state.x, y: state.y)
-        .opacity(state.opacity)
         .padding(.trailing, trailingMargin)
     }
 }

@@ -5,6 +5,9 @@
 import MyGoMusicCore
 #endif
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 import UniformTypeIdentifiers
 import WebKit
 
@@ -154,9 +157,9 @@ public struct SettingsView: View {
                                         .fill(
                                             LinearGradient(
                                                 colors: [
-                                                    .white.opacity(0.32),
-                                                    MyGoTheme.mix(.white, with: MyGoTheme.accent, ratio: 0.30).opacity(0.82),
-                                                    .white.opacity(0.96)
+                                                    .white.opacity(0.30),
+                                                    .white.opacity(0.84),
+                                                    .white.opacity(0.98)
                                                 ],
                                                 startPoint: .leading,
                                                 endPoint: .trailing
@@ -164,18 +167,18 @@ public struct SettingsView: View {
                                         )
                                         .frame(width: geometry.size.width * progress, height: 2.5)
                                     if app.settings.smoke {
-                                        let previewSmokeHeight: CGFloat = 86
+                                        let previewSmokeHeight: CGFloat = 104
                                         ProgressSmokeView(
                                             progress: CGFloat(progress),
                                             level: CGFloat(app.player.audioBands.first ?? 0.25),
                                             horizontalInset: 0,
-                                            scale: 0.72,
+                                            scale: 0.78,
                                             useAdditiveBlend: true,
-                                            tintColor: MyGoTheme.mix(MyGoTheme.accent, with: .white, ratio: 0.45),
+                                            tintColor: .white,
                                             isActive: true
                                         )
                                         .frame(height: previewSmokeHeight)
-                                        .offset(y: -(previewSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.72)))
+                                        .offset(y: -(previewSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.78)))
                                         .allowsHitTesting(false)
                                     }
                                 }
@@ -745,12 +748,14 @@ private struct PluginSettingFieldRow: View {
             .textInputAutocapitalization(.never)
             #endif
             .onSubmit {
+                MyGoKeyboard.dismiss()
                 saveValue(value)
             }
 
             if value != savedValue {
                 HStack(spacing: 8) {
                     Button {
+                        MyGoKeyboard.dismiss()
                         saveValue(value)
                     } label: {
                         Text(I18n.t("Save changes"))
@@ -885,8 +890,8 @@ public struct MiniPlayerBarView: View {
                             .fill(
                                 LinearGradient(
                                     colors: colorScheme == .dark
-                                        ? [.white.opacity(0.32), .white.opacity(0.88)]
-                                        : [MyGoTheme.accent.opacity(0.45), MyGoTheme.accent.opacity(0.95)],
+                                        ? [.white.opacity(0.35), .white.opacity(0.90)]
+                                        : [Color.primary.opacity(0.24), Color.primary.opacity(0.54)],
                                     startPoint: .leading,
                                     endPoint: .trailing
                                 )
@@ -895,14 +900,14 @@ public struct MiniPlayerBarView: View {
                     }
                     .overlay(alignment: .leading) {
                         if app.settings.smoke && app.player.isPlaying && !app.player.isLoading {
-                            let miniSmokeHeight: CGFloat = 68
+                            let miniSmokeHeight: CGFloat = 82
                             ProgressSmokeView(
                                 progress: ratio,
                                 level: miniLevel,
                                 horizontalInset: 0,
-                                scale: 0.52,
+                                scale: 0.56,
                                 useAdditiveBlend: colorScheme == .dark,
-                                tintColor: MyGoTheme.mix(MyGoTheme.accent, with: .white, ratio: 0.35),
+                                tintColor: .white,
                                 isActive: true,
                                 lightSurfaceMode: colorScheme == .light
                             )
@@ -914,7 +919,7 @@ public struct MiniPlayerBarView: View {
                                     Rectangle().fill(.black)
                                 }
                             }
-                            .offset(y: -(miniSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.52)))
+                            .offset(y: -(miniSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.56)))
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
                         }
@@ -1282,6 +1287,85 @@ public enum FloatingTabBarMetrics {
     public static let bottomInsetWithMiniPlayer: CGFloat = 164
 }
 
+/// 悬浮胶囊导航栏滑块几何与手势切换计算模型
+public enum FloatingTabBarSliderMath {
+    /// 计算单个标签槽位宽度
+    public static func slotWidth(barWidth: CGFloat, count: Int) -> CGFloat {
+        guard count > 0 else { return max(1, barWidth) }
+        let innerWidth = max(0, barWidth - FloatingTabBarMetrics.outerInset * 2)
+        let totalSpacing = FloatingTabBarMetrics.itemSpacing * CGFloat(max(0, count - 1))
+        return max(1, (innerWidth - totalSpacing) / CGFloat(count))
+    }
+
+    /// 计算第 index 个标签槽位的水平中心 X 坐标
+    public static func slotCenterX(index: Int, barWidth: CGFloat, count: Int) -> CGFloat {
+        guard count > 0 else { return barWidth * 0.5 }
+        let clampedIndex = min(max(0, index), count - 1)
+        let width = slotWidth(barWidth: barWidth, count: count)
+        return FloatingTabBarMetrics.outerInset
+            + width * 0.5
+            + CGFloat(clampedIndex) * (width + FloatingTabBarMetrics.itemSpacing)
+    }
+
+    /// 对超出首尾槽位中心范围的拖拽坐标施加 Apple 橡皮筋阻尼
+    public static func clampedPillCenterX(rawX: CGFloat, barWidth: CGFloat, count: Int) -> CGFloat {
+        guard count > 1 else {
+            return slotCenterX(index: 0, barWidth: barWidth, count: count)
+        }
+        let minX = slotCenterX(index: 0, barWidth: barWidth, count: count)
+        let maxX = slotCenterX(index: count - 1, barWidth: barWidth, count: count)
+        let limit = FloatingTabBarMetrics.outerInset * 0.7
+        if rawX < minX {
+            let delta = minX - rawX
+            return minX - limit * (delta / (delta + limit * 2.5))
+        }
+        if rawX > maxX {
+            let delta = rawX - maxX
+            return maxX + limit * (delta / (delta + limit * 2.5))
+        }
+        return rawX
+    }
+
+    /// 将水平坐标映射到最近的标签槽位索引
+    public static func tabIndex(forX x: CGFloat, barWidth: CGFloat, count: Int) -> Int {
+        guard count > 1 else { return 0 }
+        var bestIndex = 0
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for idx in 0..<count {
+            let dist = abs(x - slotCenterX(index: idx, barWidth: barWidth, count: count))
+            if dist < bestDistance {
+                bestDistance = dist
+                bestIndex = idx
+            }
+        }
+        return bestIndex
+    }
+
+    /// 结合拖放落点与快速轻扫速度，解析松手后的最终目标标签
+    public static func resolvedTargetTab(
+        selectedTab: Int,
+        pillCenterX: CGFloat,
+        translationWidth: CGFloat,
+        predictedEndTranslationWidth: CGFloat,
+        barWidth: CGFloat,
+        count: Int
+    ) -> Int {
+        guard count > 1 else { return 0 }
+        let directTarget = tabIndex(forX: pillCenterX, barWidth: barWidth, count: count)
+        if directTarget != selectedTab {
+            return directTarget
+        }
+        let slotW = slotWidth(barWidth: barWidth, count: count)
+        let extraMomentum = predictedEndTranslationWidth - translationWidth
+        let isQuickFlick = abs(extraMomentum) > 30 || abs(predictedEndTranslationWidth) > slotW * 0.55
+        if isQuickFlick && abs(translationWidth) >= 8 {
+            let step = translationWidth > 0 ? 1 : -1
+            return min(max(0, selectedTab + step), count - 1)
+        }
+        return directTarget
+    }
+}
+
 private struct MainTabItem: Identifiable {
     let id: Int
     let titleKey: String
@@ -1294,7 +1378,16 @@ private struct FloatingCapsuleTabBar: View {
     let onSelect: (Int) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @Namespace private var highlightNamespace
+    @State private var barWidth: CGFloat = 0
+    @State private var pillCenterX: CGFloat? = nil
+    @State private var hoveredTab: Int? = nil
+    @State private var pressedTab: Int? = nil
+    @State private var isDraggingPill: Bool = false
+    @State private var grabOffset: CGFloat = 0
+    @State private var didLockStartState: Bool = false
+    @State private var cancelledGesture: Bool = false
+    @State private var hapticCount: Int = 0
+    @State private var lastHapticTab: Int? = nil
 
     private let items: [MainTabItem] = [
         MainTabItem(id: 0, titleKey: "Home", icon: "house", selectedIcon: "house.fill"),
@@ -1304,41 +1397,41 @@ private struct FloatingCapsuleTabBar: View {
     ]
 
     var body: some View {
+        let activeHighlightTab = isDraggingPill ? (hoveredTab ?? selectedTab) : selectedTab
+        let pillWidth = FloatingTabBarSliderMath.slotWidth(barWidth: barWidth, count: items.count)
+        let restCenterX = FloatingTabBarSliderMath.slotCenterX(
+            index: selectedTab,
+            barWidth: barWidth,
+            count: items.count
+        )
+        let displayCenterX = (isDraggingPill ? pillCenterX : nil) ?? restCenterX
+
         HStack(spacing: FloatingTabBarMetrics.itemSpacing) {
             ForEach(items) { item in
-                let isSelected = (selectedTab == item.id)
-                Button {
-                    onSelect(item.id)
-                } label: {
-                    VStack(spacing: FloatingTabBarMetrics.iconLabelSpacing) {
-                        Image(systemName: isSelected ? item.selectedIcon : item.icon)
-                            .font(.system(size: FloatingTabBarMetrics.iconSize, weight: isSelected ? .semibold : .medium))
-                            .frame(height: FloatingTabBarMetrics.iconFrameHeight)
-                            .scaleEffect(isSelected ? 1.03 : 1.0)
+                let isSelected = (activeHighlightTab == item.id)
+                let isPressingInactive = (!isDraggingPill && pressedTab == item.id && item.id != selectedTab)
+                VStack(spacing: FloatingTabBarMetrics.iconLabelSpacing) {
+                    Image(systemName: isSelected ? item.selectedIcon : item.icon)
+                        .font(.system(size: FloatingTabBarMetrics.iconSize, weight: isSelected ? .semibold : .medium))
+                        .frame(height: FloatingTabBarMetrics.iconFrameHeight)
+                        .scaleEffect(isSelected ? (isDraggingPill ? 1.07 : 1.03) : (isPressingInactive ? 0.94 : 1.0))
 
-                        Text(I18n.t(item.titleKey))
-                            .font(.system(size: FloatingTabBarMetrics.labelFontSize, weight: isSelected ? .semibold : .medium))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.85)
-                    }
-                    .foregroundStyle(foregroundColor(isSelected: isSelected))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: FloatingTabBarMetrics.activePillHeight)
-                    .background {
-                        if isSelected {
-                            ZStack {
-                                Capsule(style: .continuous)
-                                    .fill(activePillColor)
-                                Capsule(style: .continuous)
-                                    .strokeBorder(activePillBorderGradient, lineWidth: 0.6)
-                            }
-                            .matchedGeometryEffect(id: "ActiveTabCapsule", in: highlightNamespace)
-                        }
-                    }
-                    .contentShape(Capsule(style: .continuous))
+                    Text(I18n.t(item.titleKey))
+                        .font(.system(size: FloatingTabBarMetrics.labelFontSize, weight: isSelected ? .semibold : .medium))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                 }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+                .foregroundStyle(foregroundColor(isSelected: isSelected))
+                .opacity(isPressingInactive ? 0.72 : 1.0)
+                .frame(maxWidth: .infinity)
+                .frame(height: FloatingTabBarMetrics.activePillHeight)
+                .contentShape(Capsule(style: .continuous))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(I18n.t(item.titleKey))
+                .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
+                .accessibilityAction {
+                    onSelect(item.id)
+                }
             }
         }
         .padding(FloatingTabBarMetrics.outerInset)
@@ -1349,12 +1442,42 @@ private struct FloatingCapsuleTabBar: View {
                     .fill(.thinMaterial)
                 Capsule(style: .continuous)
                     .fill(capsuleSurfaceColor)
+
+                // 跟手可滑动的 Liquid Glass 选中胶囊药丸
+                if barWidth > 0 {
+                    activeIndicatorPill(width: pillWidth)
+                        .position(x: displayCenterX, y: FloatingTabBarMetrics.barHeight * 0.5)
+                        .clipShape(Capsule(style: .continuous))
+                        .allowsHitTesting(false)
+                }
             }
         }
         .overlay(
             Capsule(style: .continuous)
                 .strokeBorder(capsuleBorderGradient, lineWidth: 0.85)
         )
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        barWidth = proxy.size.width
+                    }
+                    .onChange(of: proxy.size.width) { _, newWidth in
+                        barWidth = newWidth
+                    }
+            }
+        }
+        .contentShape(Capsule(style: .continuous))
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                .onChanged { value in
+                    handleDragChanged(value)
+                }
+                .onEnded { value in
+                    handleDragEnded(value)
+                }
+        )
+        .sensoryFeedback(.selection, trigger: hapticCount)
         .shadow(
             color: .black.opacity(colorScheme == .dark ? 0.36 : 0.085),
             radius: 22,
@@ -1371,6 +1494,169 @@ private struct FloatingCapsuleTabBar: View {
         .padding(.horizontal, FloatingTabBarMetrics.horizontalPadding)
     }
 
+    private func activeIndicatorPill(width: CGFloat) -> some View {
+        ZStack {
+            Capsule(style: .continuous)
+                .fill(isDraggingPill ? draggingPillColor : activePillColor)
+            Capsule(style: .continuous)
+                .strokeBorder(activePillBorderGradient, lineWidth: isDraggingPill ? 0.9 : 0.6)
+        }
+        .frame(width: max(40, width), height: FloatingTabBarMetrics.activePillHeight)
+        .scaleEffect(x: isDraggingPill ? 1.07 : 1.0, y: isDraggingPill ? 1.11 : 1.0)
+        .shadow(
+            color: .black.opacity(isDraggingPill ? (colorScheme == .dark ? 0.28 : 0.09) : 0),
+            radius: isDraggingPill ? 10 : 0,
+            x: 0,
+            y: isDraggingPill ? 3 : 0
+        )
+        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isDraggingPill)
+    }
+
+    private func handleDragChanged(_ value: DragGesture.Value) {
+        guard barWidth > 0 else { return }
+        if !didLockStartState {
+            didLockStartState = true
+            cancelledGesture = false
+            lastHapticTab = nil
+            let startTab = FloatingTabBarSliderMath.tabIndex(
+                forX: value.startLocation.x,
+                barWidth: barWidth,
+                count: items.count
+            )
+            pressedTab = startTab
+            if startTab == selectedTab {
+                grabOffset = FloatingTabBarSliderMath.slotCenterX(
+                    index: selectedTab,
+                    barWidth: barWidth,
+                    count: items.count
+                ) - value.startLocation.x
+            } else {
+                grabOffset = 0
+            }
+        }
+
+        guard !cancelledGesture else { return }
+
+        if !isDraggingPill {
+            // 未进入横向滑动前若明显竖向滑出，视为取消
+            if abs(value.translation.height) > 36 && abs(value.translation.height) > abs(value.translation.width) * 1.3 {
+                cancelledGesture = true
+                pressedTab = nil
+                return
+            }
+            if abs(value.translation.width) >= 6 {
+                isDraggingPill = true
+                pressedTab = nil
+                let rawCenter = value.location.x + grabOffset
+                let clamped = FloatingTabBarSliderMath.clampedPillCenterX(
+                    rawX: rawCenter,
+                    barWidth: barWidth,
+                    count: items.count
+                )
+                let initialHover = FloatingTabBarSliderMath.tabIndex(
+                    forX: clamped,
+                    barWidth: barWidth,
+                    count: items.count
+                )
+                withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.84)) {
+                    pillCenterX = clamped
+                    hoveredTab = initialHover
+                }
+                if initialHover != selectedTab {
+                    emitHapticIfNeeded(for: initialHover)
+                }
+            }
+            return
+        }
+
+        // 已进入滑块拖动状态后容忍单指自然弧线抖动，仅极端偏离时取消
+        if abs(value.translation.height) > 100 {
+            cancelledGesture = true
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
+                isDraggingPill = false
+                pillCenterX = nil
+                hoveredTab = nil
+            }
+            return
+        }
+
+        let clamped = FloatingTabBarSliderMath.clampedPillCenterX(
+            rawX: value.location.x + grabOffset,
+            barWidth: barWidth,
+            count: items.count
+        )
+        let nextHover = FloatingTabBarSliderMath.tabIndex(
+            forX: clamped,
+            barWidth: barWidth,
+            count: items.count
+        )
+        pillCenterX = clamped
+        if nextHover != hoveredTab {
+            withAnimation(.snappy(duration: 0.16)) {
+                hoveredTab = nextHover
+            }
+            emitHapticIfNeeded(for: nextHover)
+        }
+    }
+
+    private func handleDragEnded(_ value: DragGesture.Value) {
+        let wasDragging = isDraggingPill
+        let wasCancelled = cancelledGesture
+        let previousHapticTab = lastHapticTab
+        let fallbackCenter = pillCenterX ?? FloatingTabBarSliderMath.slotCenterX(
+            index: selectedTab,
+            barWidth: barWidth,
+            count: items.count
+        )
+        didLockStartState = false
+        cancelledGesture = false
+        pressedTab = nil
+        lastHapticTab = nil
+
+        guard !wasCancelled else {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
+                isDraggingPill = false
+                pillCenterX = nil
+                hoveredTab = nil
+            }
+            return
+        }
+
+        let targetTab: Int
+        if wasDragging {
+            targetTab = FloatingTabBarSliderMath.resolvedTargetTab(
+                selectedTab: selectedTab,
+                pillCenterX: fallbackCenter,
+                translationWidth: value.translation.width,
+                predictedEndTranslationWidth: value.predictedEndTranslation.width,
+                barWidth: barWidth,
+                count: items.count
+            )
+        } else {
+            targetTab = FloatingTabBarSliderMath.tabIndex(
+                forX: value.location.x,
+                barWidth: barWidth,
+                count: items.count
+            )
+        }
+
+        if targetTab != selectedTab && previousHapticTab != targetTab {
+            hapticCount += 1
+        }
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
+            isDraggingPill = false
+            pillCenterX = nil
+            hoveredTab = nil
+        }
+        onSelect(targetTab)
+    }
+
+    private func emitHapticIfNeeded(for tab: Int) {
+        guard lastHapticTab != tab else { return }
+        lastHapticTab = tab
+        hapticCount += 1
+    }
+
     private var capsuleSurfaceColor: Color {
         colorScheme == .dark
             ? Color(white: 0.14).opacity(0.68)
@@ -1381,6 +1667,12 @@ private struct FloatingCapsuleTabBar: View {
         colorScheme == .dark
             ? Color.white.opacity(0.15)
             : Color.black.opacity(0.055)
+    }
+
+    private var draggingPillColor: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.24)
+            : Color.white.opacity(0.88)
     }
 
     private var activePillBorderGradient: LinearGradient {
@@ -1429,6 +1721,7 @@ public struct MainView: View {
     @EnvironmentObject private var app: AppModel
     @State private var selectedTab: Int = 0
     @State private var activatedTabs: Set<Int> = [0]
+    @State private var isKeyboardVisible: Bool = false
 
     public init() {}
 
@@ -1450,14 +1743,15 @@ public struct MainView: View {
 
     @ViewBuilder
     private func tabWithBottomOverlayInset<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        let insetHeight: CGFloat = isKeyboardVisible
+            ? 0
+            : (app.player.currentTrack == nil
+                ? FloatingTabBarMetrics.bottomInsetEmptyPlayer
+                : FloatingTabBarMetrics.bottomInsetWithMiniPlayer)
         content()
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 Color.clear
-                    .frame(
-                        height: app.player.currentTrack == nil
-                            ? FloatingTabBarMetrics.bottomInsetEmptyPlayer
-                            : FloatingTabBarMetrics.bottomInsetWithMiniPlayer
-                    )
+                    .frame(height: insetHeight)
                     .allowsHitTesting(false)
             }
     }
@@ -1484,7 +1778,7 @@ public struct MainView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            // 悬浮于安全区上方的提示胶囊、Mini Player Bar 与悬浮胶囊导航栏
+            // 悬浮于安全区上方的提示胶囊、Mini Player Bar 与悬浮胶囊导航栏（输入法弹起时平滑避让，不遮挡搜索结果）
             VStack(spacing: FloatingTabBarMetrics.overlaySpacing) {
                 if let toast = app.toastMessage {
                     Text(toast)
@@ -1499,6 +1793,7 @@ public struct MainView: View {
                 MiniPlayerBarView()
 
                 FloatingCapsuleTabBar(selectedTab: $selectedTab) { targetTab in
+                    MyGoKeyboard.dismiss()
                     activatedTabs.insert(targetTab)
                     withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
                         selectedTab = targetTab
@@ -1506,9 +1801,32 @@ public struct MainView: View {
                 }
             }
             .padding(.bottom, bottomOverlayPadding)
+            .frame(height: isKeyboardVisible ? 0 : nil, alignment: .bottom)
+            .opacity(isKeyboardVisible ? 0 : 1)
+            .clipped()
+            .allowsHitTesting(!isKeyboardVisible)
         }
-        .sensoryFeedback(.selection, trigger: selectedTab)
         .preferredColorScheme(preferredScheme)
+        #if canImport(UIKit)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.20)) {
+                isKeyboardVisible = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.20)) {
+                isKeyboardVisible = false
+            }
+        }
+        #endif
+        .onChange(of: selectedTab) { _, _ in
+            MyGoKeyboard.dismiss()
+        }
+        .onChange(of: app.isNowPlayingPresented) { _, presented in
+            if presented {
+                MyGoKeyboard.dismiss()
+            }
+        }
         #if os(iOS)
         // iOS 上全屏展示正在播放页（与原生音乐 App 一致）
         .fullScreenCover(isPresented: $app.isNowPlayingPresented) {
@@ -1524,6 +1842,7 @@ public struct MainView: View {
         #endif
         #if DEBUG
         .onAppear {
+            print(String(format: "[MyGoStartup] MainView first frame appeared (syncInit=%.2fms)", app.syncInitDurationMs))
             applyDebugLaunchOptionsIfNeeded()
         }
         #endif
@@ -1576,8 +1895,9 @@ public struct MainView: View {
         let seekArg = args.first(where: { $0.hasPrefix("-MyGoSeek:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_SEEK"]
 
         Task { @MainActor in
-            // 延时等待 UIWindowScene 挂载与会话恢复完成，避免 fullScreenCover 被首帧吞掉
-            try? await Task.sleep(nanoseconds: 450_000_000)
+            await app.waitUntilStartupReady()
+            // 等待 UIWindowScene 首帧完全挂载，避免 fullScreenCover 被吞掉
+            try? await Task.sleep(nanoseconds: 180_000_000)
             guard app.player.currentTrack != nil else { return }
             applyDebugStageConfig(pane: paneArg ?? (app.settings.lyricsStage ? "stage" : "lyrics"), style: styleArg)
             app.isNowPlayingPresented = true
@@ -1585,7 +1905,7 @@ public struct MainView: View {
                 app.player.resume()
             }
             if let seekStr = seekArg, let sec = Double(seekStr) {
-                try? await Task.sleep(nanoseconds: 450_000_000)
+                try? await Task.sleep(nanoseconds: 350_000_000)
                 app.player.seek(to: sec)
             }
         }
@@ -1603,6 +1923,18 @@ public struct MainView: View {
             item.value.map { (item.name.lowercased(), $0) }
         }, uniquingKeysWith: { _, latest in latest })
 
+        if !app.isStartupReady {
+            Task { @MainActor in
+                await app.waitUntilStartupReady()
+                applyDebugQuery(query)
+            }
+            return true
+        }
+        applyDebugQuery(query)
+        return true
+    }
+
+    private func applyDebugQuery(_ query: [String: String]) {
         if let tabStr = query["tab"], let tab = Int(tabStr), (0...3).contains(tab) {
             activatedTabs.insert(tab)
             selectedTab = tab
@@ -1632,7 +1964,6 @@ public struct MainView: View {
         if let seekStr = query["seek"], let sec = Double(seekStr) {
             app.player.seek(to: sec)
         }
-        return true
     }
     #endif
 }

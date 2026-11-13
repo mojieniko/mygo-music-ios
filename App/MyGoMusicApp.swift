@@ -11,7 +11,7 @@ import SwiftUI
 
 @main
 struct MyGoMusicApp: App {
-    @StateObject private var appModel = AppModel()
+    @StateObject private var appModel = AppModel(deferHeavyStartup: true)
 
     var body: some Scene {
         WindowGroup {

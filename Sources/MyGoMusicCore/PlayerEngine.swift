@@ -1392,11 +1392,18 @@ public final class PlayerEngine: ObservableObject {
     private var lockScreenArtwork: MPMediaItemArtwork?
     private var lastPublishedNowPlayingMeta: NowPlayingDisplayMetadata?
 
-    public init(cacheDir: URL? = nil) {
+    public init(cacheDir: URL? = nil, activateAudioSessionOnInit: Bool = false) {
         let dir = cacheDir ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MyGoMusicAudioCache", isDirectory: true)
         self.diskCache = AudioDiskCache(cacheDir: dir)
-        configureAudioSession()
+        if activateAudioSessionOnInit {
+            configureAudioSession()
+        } else {
+            // 仅在后台预设播放会话类别，避免冷启动首帧前被同步 AVAudioSession.setActive IPC 阻塞
+            Task.detached(priority: .utility) {
+                Self.preparePlaybackAudioCategory()
+            }
+        }
         configureRemoteCommands()
         startBandUpdateTimer()
     }
@@ -2025,7 +2032,10 @@ public final class PlayerEngine: ObservableObject {
         gen: Int,
         forceProxy: Bool = false
     ) async {
-        ensureAudioSessionActive()
+        // 仅当真正开始播放时激活系统音频会话，冷启动恢复暂停会话时避免同步抢占音频路由
+        if autoPlay {
+            ensureAudioSessionActive()
+        }
 
         let assetURL: URL?
         let rawURL = stream.url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2651,6 +2661,17 @@ public final class PlayerEngine: ObservableObject {
 
     private func configureAudioSession() {
         ensureAudioSessionActive()
+    }
+
+    nonisolated private static func preparePlaybackAudioCategory() {
+        #if os(iOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+        } catch {
+            print("AVAudioSession category setup failed: \(error)")
+        }
+        #endif
     }
 
     private func ensureAudioSessionActive() {

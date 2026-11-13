@@ -166,7 +166,10 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var pluginLoadFailures: [PluginLoadFailure] = []
     @Published public private(set) var pluginOrigins: [String: PluginOrigin] = [:]
     @Published public private(set) var isCheckingUpdates: Bool = false
+    @Published public private(set) var isStartupReady: Bool = true
     @Published public var activeSourceID: String = "kugou-lite"
+    public private(set) var syncInitDurationMs: Double = 0
+    public private(set) var deferredStartupDurationMs: Double? = nil
 
     // 当前活动音乐源的数据缓存
     @Published public private(set) var isLoadingHome: Bool = false
@@ -221,13 +224,15 @@ public final class AppModel: ObservableObject {
     private var playerCancellable: AnyCancellable?
     private var trackChangeCancellable: AnyCancellable?
     private var captionTask: Task<Void, Never>?
+    private var startupTask: Task<Void, Never>? = nil
     private var commentLikePendingIDs: Set<String> = []
     private var searchGeneration = 0
     private var suggestionGeneration = 0
     private var sourceRefreshGeneration = 0
     private var artworkGeneration = 0
 
-    public init(baseDataDir: URL? = nil) {
+    public init(baseDataDir: URL? = nil, deferHeavyStartup: Bool = false) {
+        let initStartNs = DispatchTime.now().uptimeNanoseconds
         let rootDir = baseDataDir ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MyGoMusic", isDirectory: true)
         self.baseDataDir = rootDir
@@ -245,30 +250,39 @@ public final class AppModel: ObservableObject {
         } else {
             initialSettings = AppSettings()
         }
-        self.settings = initialSettings
-        I18n.setLanguage(initialSettings.language)
-
-        // 初始化本地音乐源（并将示例音频放入本地目录以便开箱体验）
-        let localDir = rootDir.appendingPathComponent("local", isDirectory: true)
-        let createdLocalSource = LocalMusicSource(dataDir: localDir)
-        self.localSource = createdLocalSource
-
-        // 初始化播放器
-        let createdPlayer = PlayerEngine(cacheDir: rootDir.appendingPathComponent("audio-cache", isDirectory: true))
-        self.player = createdPlayer
-
-        // 彻底清理演示插件（demo-plugin）与演示铃声，不再展示演示音源
-        Self.purgeDemoPluginAndFiles(pluginsDir: self.pluginsDir, localDir: localDir)
         if initialSettings.source == "demo" {
             initialSettings.source = "kugou-lite"
         }
+        self.settings = initialSettings
+        I18n.setLanguage(initialSettings.language)
+
+        // 初始化本地音乐源（App 冷启动时延后扫描以免阻塞首帧渲染）
+        let localDir = rootDir.appendingPathComponent("local", isDirectory: true)
+        let createdLocalSource = LocalMusicSource(dataDir: localDir, eagerSyncScan: !deferHeavyStartup)
+        self.localSource = createdLocalSource
+
+        // 初始化播放器（冷启动不提前同步激活系统音频会话）
+        let createdPlayer = PlayerEngine(
+            cacheDir: rootDir.appendingPathComponent("audio-cache", isDirectory: true),
+            activateAudioSessionOnInit: !deferHeavyStartup
+        )
+        self.player = createdPlayer
 
         self.player.volume = initialSettings.volume
         self.player.diskCache.limitMB = initialSettings.cacheMB
         self.activeNowPlayingPane = initialSettings.lyricsStage ? .stage : .lyrics
+        if deferHeavyStartup {
+            self.isStartupReady = false
+            self.isLoadingHome = true
+            self.activeSourceID = initialSettings.source
+        }
 
-        // 发现并加载所有插件
-        reloadPlugins()
+        createdLocalSource.onChange = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.isStartupReady, self.activeSourceID == LocalMusicSource.sourceID else { return }
+                await self.refreshActiveSource()
+            }
+        }
 
         // 绑定播放器回调
         self.player.sourceResolver = { [weak self] id in
@@ -348,21 +362,72 @@ public final class AppModel: ObservableObject {
             self?.objectWillChange.send()
         }
 
-        // 恢复上次使用的音源与播放会话
+        if deferHeavyStartup {
+            self.syncInitDurationMs = Double(DispatchTime.now().uptimeNanoseconds - initStartNs) / 1_000_000.0
+            #if DEBUG
+            print(String(format: "[MyGoStartup] syncInit=%.2fms (deferHeavyStartup=true)", self.syncInitDurationMs))
+            #endif
+            self.startupTask = Task { [weak self] in
+                await self?.bootstrapDeferredStartup(localDir: localDir, startupBeganNs: initStartNs)
+            }
+        } else {
+            // 同步路径（供单元测试与非延迟场景直接完成初始化）
+            Self.purgeDemoPluginAndFiles(pluginsDir: self.pluginsDir, localDir: localDir)
+            reloadPlugins()
+            resolveInitialActiveSource()
+            restorePlaybackSessionIfNeeded()
+            self.syncInitDurationMs = Double(DispatchTime.now().uptimeNanoseconds - initStartNs) / 1_000_000.0
+            Task {
+                await refreshActiveSource()
+            }
+        }
+    }
+
+    /// 等待延迟启动装配完成（同步初始化模式立即返回）
+    public func waitUntilStartupReady() async {
+        await startupTask?.value
+    }
+
+    private func resolveInitialActiveSource() {
         let preferredID = self.settings.source
         if enabledSources.contains(where: { $0.info().id == preferredID }) {
             self.activeSourceID = preferredID
         } else if let first = enabledSources.first {
             self.activeSourceID = first.info().id
         }
-
-        restorePlaybackSessionIfNeeded()
-        Task {
-            await refreshActiveSource()
-        }
     }
 
-    private static func purgeDemoPluginAndFiles(pluginsDir: URL, localDir: URL) {
+    private func bootstrapDeferredStartup(localDir: URL, startupBeganNs: UInt64) async {
+        let rootDir = self.baseDataDir
+        let pluginsRoot = self.pluginsDir
+        let pluginDataRoot = self.pluginDataDir
+
+        let payload: (snapshot: PluginDiscoverySnapshot, session: SavedPlaybackSession?) =
+            await Task.detached(priority: .userInitiated) {
+                Self.purgeDemoPluginAndFiles(pluginsDir: pluginsRoot, localDir: localDir)
+                let snapshot = Self.loadPluginSnapshot(pluginsDir: pluginsRoot, pluginDataDir: pluginDataRoot)
+                let sessionURL = rootDir.appendingPathComponent("session.json")
+                let restoredSession = (try? Data(contentsOf: sessionURL))
+                    .flatMap { try? JSONDecoder().decode(SavedPlaybackSession.self, from: $0) }
+                return (snapshot, restoredSession)
+            }.value
+
+        applyPluginSnapshot(payload.snapshot)
+        resolveInitialActiveSource()
+
+        if let session = payload.session, player.currentTrack == nil {
+            player.restoreSession(session)
+        }
+        self.isStartupReady = true
+        self.deferredStartupDurationMs = Double(DispatchTime.now().uptimeNanoseconds - startupBeganNs) / 1_000_000.0
+        #if DEBUG
+        print(String(format: "[MyGoStartup] deferredReady=%.2fms plugins=%d", self.deferredStartupDurationMs ?? 0, payload.snapshot.plugins.count))
+        #endif
+
+        await refreshActiveSource()
+    }
+
+    nonisolated private static func purgeDemoPluginAndFiles(pluginsDir: URL, localDir: URL) {
         let fm = FileManager.default
         let demoDir = pluginsDir.appendingPathComponent("demo", isDirectory: true)
         if fm.fileExists(atPath: demoDir.path) {
@@ -377,16 +442,37 @@ public final class AppModel: ObservableObject {
 
     // MARK: - 音源管理（对应 makeSources / enabledChanged / switchSource）
 
-    public func reloadPlugins() {
+    private struct PluginDiscoverySnapshot: Sendable {
+        let plugins: [JSPluginSource]
+        let failures: [PluginLoadFailure]
+        let origins: [String: PluginOrigin]
+    }
+
+    nonisolated private static func loadPluginSnapshot(
+        pluginsDir: URL,
+        pluginDataDir: URL
+    ) -> PluginDiscoverySnapshot {
         let result = PluginInstaller.discoverDetailed(pluginsDir: pluginsDir, dataRootDir: pluginDataDir)
         let discovered = result.plugins.filter { $0.manifest.id != "demo" }
         var origins: [String: PluginOrigin] = [:]
-        var updates = settings.pluginUpdates
         for p in discovered {
-            wirePluginCallbacks(p)
             if let origin = PluginInstaller.readOrigin(in: p.pluginDir) {
                 origins[p.manifest.id] = origin
             }
+        }
+        let failures = result.failures.filter { $0.folderName != "demo" }
+        return PluginDiscoverySnapshot(plugins: discovered, failures: failures, origins: origins)
+    }
+
+    public func reloadPlugins() {
+        let snapshot = Self.loadPluginSnapshot(pluginsDir: pluginsDir, pluginDataDir: pluginDataDir)
+        applyPluginSnapshot(snapshot)
+    }
+
+    private func applyPluginSnapshot(_ snapshot: PluginDiscoverySnapshot) {
+        var updates = settings.pluginUpdates
+        for p in snapshot.plugins {
+            wirePluginCallbacks(p)
             if let pendingVer = updates[p.manifest.id],
                let curVer = p.manifest.version,
                !PluginInstaller.isNewerVersion(pendingVer, than: curVer) {
@@ -396,11 +482,11 @@ public final class AppModel: ObservableObject {
         if updates != settings.pluginUpdates {
             settings.pluginUpdates = updates
         }
-        self.pluginOrigins = origins
-        self.pluginLoadFailures = result.failures.filter { $0.folderName != "demo" }
-        self.pluginSources = discovered
+        self.pluginOrigins = snapshot.origins
+        self.pluginLoadFailures = snapshot.failures
+        self.pluginSources = snapshot.plugins
         Task {
-            for p in discovered where p.can("account") {
+            for p in snapshot.plugins where p.can("account") {
                 if let acc = try? await p.account() {
                     self.accountsBySource[p.manifest.id] = acc
                 } else {
@@ -813,6 +899,201 @@ public final class AppModel: ObservableObject {
             showToast(I18n.t("That didn't work. Try again later."))
             return currentlyFollowing
         }
+    }
+
+    /// 跨源/本源加载歌手详情页的结果包
+    public struct ArtistLoadOutcome: Sendable {
+        public var page: ArtistPage
+        public var resolvedSourceID: String
+        public var searchMoreOffset: Int
+        public var hasMoreSearchTracks: Bool
+    }
+
+    /// 按优先级候选音源拉取歌手完整主页与所有歌曲（带按名搜歌手 ID、搜歌曲及播放队列四级兜底）
+    public func loadArtistPage(artistID: String, fallbackName: String, sourceID: String? = nil) async -> ArtistLoadOutcome? {
+        let trimmedID = artistID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = fallbackName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var candidates: [any MusicSource] = []
+        if let sid = sourceID?.trimmingCharacters(in: .whitespacesAndNewlines), !sid.isEmpty,
+           let preferred = source(forID: sid) {
+            candidates.append(preferred)
+        }
+        if !candidates.contains(where: { $0.info().id == activeSource.info().id }) {
+            candidates.append(activeSource)
+        }
+        for src in enabledSources where !candidates.contains(where: { $0.info().id == src.info().id }) {
+            candidates.append(src)
+        }
+
+        // 1) 直接查明确传入的 artistID；非原曲所属源试查 ID 时必须校验歌手名称，防止不同平台数字 ID 撞车
+        for src in candidates where !trimmedID.isEmpty && src.can("artist") {
+            if let page = try? await src.artist(id: trimmedID) {
+                let sid = src.info().id
+                let isSameSource = sourceID?.trimmingCharacters(in: .whitespacesAndNewlines) == sid
+                if isSameSource || trimmedName.isEmpty || Self.artistNameMatches(page.artist.name, target: trimmedName) {
+                    return await enrichArtistOutcome(page: page, source: src, fallbackName: trimmedName)
+                }
+            }
+        }
+
+        // 2) ID 为空或插件未认出该 ID：按歌手名搜索最匹配歌手再拉取完整歌手页
+        if !trimmedName.isEmpty {
+            for src in candidates where src.can("artist") && src.can("search") {
+                if let res = try? await src.search(query: trimmedName, kind: .artists, offset: 0),
+                   let matched = Self.pickBestMatchingArtist(from: res.artists ?? [], name: trimmedName),
+                   !matched.id.isEmpty,
+                   let page = try? await src.artist(id: matched.id) {
+                    return await enrichArtistOutcome(page: page, source: src, fallbackName: trimmedName)
+                }
+            }
+
+            // 3) 若目标源不支持 artist() 接口，兜底用搜索歌曲聚合展示该歌手曲目（严格校验歌手名避免无关推荐混入）
+            for src in candidates where src.can("search") {
+                if let res = try? await src.search(query: trimmedName, kind: .tracks, offset: 0),
+                   let raw = res.tracks, !raw.isEmpty {
+                    let sid = src.info().id
+                    let filtered = Self.filterAndStampArtistTracks(raw, artistName: trimmedName, sourceID: sid, requireMatch: true)
+                    guard !filtered.isEmpty else { continue }
+                    let artistObj = Artist(
+                        id: trimmedID,
+                        name: trimmedName,
+                        imageUrl: filtered.first?.album.imageUrl
+                    )
+                    return ArtistLoadOutcome(
+                        page: ArtistPage(artist: artistObj, tracks: filtered, albums: nil),
+                        resolvedSourceID: sid,
+                        searchMoreOffset: raw.count,
+                        hasMoreSearchTracks: res.more == true
+                    )
+                }
+            }
+
+            // 4) 终极兜底：从当前待播队列与本地源曲目筛选同歌手歌曲（保障演示曲/内存曲目也能跳转浏览）
+            let queueMatched = player.queue.filter { tr in
+                Self.trackMatchesArtist(tr, name: trimmedName, artistID: trimmedID)
+            }
+            if !queueMatched.isEmpty {
+                let sid = queueMatched.first?.source ?? activeSourceID
+                let artistObj = Artist(
+                    id: trimmedID,
+                    name: trimmedName,
+                    imageUrl: queueMatched.first?.album.imageUrl
+                )
+                return ArtistLoadOutcome(
+                    page: ArtistPage(artist: artistObj, tracks: queueMatched, albums: nil),
+                    resolvedSourceID: sid,
+                    searchMoreOffset: 0,
+                    hasMoreSearchTracks: false
+                )
+            }
+        }
+        return nil
+    }
+
+    /// 歌手页加载更多该歌手歌曲（通过对应源分页搜索并过滤去重）
+    public func loadMoreArtistTracks(
+        artistName: String,
+        sourceID: String,
+        offset: Int
+    ) async -> (tracks: [Track], nextOffset: Int, hasMore: Bool) {
+        let trimmed = artistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let src = source(forID: sourceID),
+              src.can("search"),
+              let res = try? await src.search(query: trimmed, kind: .tracks, offset: offset) else {
+            return ([], offset, false)
+        }
+        let raw = res.tracks ?? []
+        let filtered = Self.filterAndStampArtistTracks(raw, artistName: trimmed, sourceID: sourceID)
+        return (filtered, offset + raw.count, res.more == true && !raw.isEmpty)
+    }
+
+    /// 跨源加载专辑详情页（保证从播放器跳转歌手后再进专辑也能精准命中所属音源）
+    public func loadAlbumPage(albumID: String, sourceID: String? = nil) async -> (page: AlbumPage, resolvedSourceID: String)? {
+        let src = sourceID.flatMap { source(forID: $0) } ?? activeSource
+        guard var page = try? await src.album(id: albumID) else { return nil }
+        let sid = src.info().id
+        if let tracks = page.tracks {
+            page.tracks = tracks.map { Self.stampTrack($0, sourceID: sid) }
+        }
+        return (page, sid)
+    }
+
+    private func enrichArtistOutcome(page: ArtistPage, source src: any MusicSource, fallbackName: String) async -> ArtistLoadOutcome {
+        let sid = src.info().id
+        let artistName = page.artist.name.isEmpty ? fallbackName : page.artist.name
+        var updatedPage = page
+        updatedPage.artist.name = artistName
+        var tracks = (page.tracks ?? []).map { Self.stampTrack($0, sourceID: sid) }
+        var searchOffset = 0
+        var hasMoreSearch = false
+
+        if src.can("search") && !artistName.isEmpty {
+            if tracks.isEmpty, let res = try? await src.search(query: artistName, kind: .tracks, offset: 0) {
+                let raw = res.tracks ?? []
+                tracks = Self.filterAndStampArtistTracks(raw, artistName: artistName, sourceID: sid)
+                searchOffset = raw.count
+                hasMoreSearch = res.more == true && !raw.isEmpty
+            } else if !tracks.isEmpty && tracks.count >= 15 {
+                // 在线插件通常默认返回前 20~50 首热门曲，允许在列表底部按需补全搜索其它歌曲
+                hasMoreSearch = true
+                searchOffset = 0
+            }
+        }
+        updatedPage.tracks = tracks
+        return ArtistLoadOutcome(
+            page: updatedPage,
+            resolvedSourceID: sid,
+            searchMoreOffset: searchOffset,
+            hasMoreSearchTracks: hasMoreSearch
+        )
+    }
+
+    private static func artistNameMatches(_ candidate: String, target: String) -> Bool {
+        let a = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a.localizedCaseInsensitiveCompare(b) == .orderedSame
+            || a.localizedCaseInsensitiveContains(b)
+            || b.localizedCaseInsensitiveContains(a)
+    }
+
+    private static func pickBestMatchingArtist(from artists: [Artist], name: String) -> Artist? {
+        if let exact = artists.first(where: { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare(name) == .orderedSame }) {
+            return exact
+        }
+        return artists.first(where: { artistNameMatches($0.name, target: name) })
+    }
+
+    private static func trackMatchesArtist(_ track: Track, name: String, artistID: String = "") -> Bool {
+        if !artistID.isEmpty, (track.artists ?? []).contains(where: { $0.id == artistID }) {
+            return true
+        }
+        return (track.artists ?? []).contains {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare(name) == .orderedSame
+        } || track.artistNames.localizedCaseInsensitiveContains(name)
+    }
+
+    private static func filterAndStampArtistTracks(
+        _ tracks: [Track],
+        artistName: String,
+        sourceID: String,
+        requireMatch: Bool = false
+    ) -> [Track] {
+        let matched = tracks.filter { trackMatchesArtist($0, name: artistName) }
+        if matched.isEmpty && requireMatch {
+            return []
+        }
+        let chosen = matched.isEmpty ? tracks : matched
+        return chosen.map { stampTrack($0, sourceID: sourceID) }
+    }
+
+    private static func stampTrack(_ track: Track, sourceID: String) -> Track {
+        guard track.source == nil || track.source?.isEmpty == true else { return track }
+        var copy = track
+        copy.source = sourceID
+        return copy
     }
 
     public func toggleSavePlaylist(sourceID: String, playlistID: String, currentlySaved: Bool) async -> Bool {
@@ -1454,6 +1735,7 @@ public final class AppModel: ObservableObject {
             return
         }
         Task {
+            await waitUntilStartupReady()
             await installPluginFromGitHub(repoInput: repo)
         }
     }

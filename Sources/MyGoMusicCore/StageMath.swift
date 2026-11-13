@@ -128,7 +128,7 @@ public enum StageMath {
         return 1.0 - inv * inv * inv
     }
 
-    /// 计算单词在指定播放位置的实时动画状态（对应 stageWord）
+    /// 计算单词在指定播放位置的实时动画状态（1:1 还原桌面 ui_stage.go:228-277：未唱先隐，到拍时从虚无凭空弹簧蹦出）
     public static func wordState(word: LyricWord, shape: WordShape, pos: TimeInterval) -> WordRenderState {
         let lookahead: TimeInterval = 0.08
         let start = word.start - lookahead
@@ -137,34 +137,34 @@ public enum StageMath {
         let after = pos - end
         let singing = max(0.08, end - word.start)
 
-        // 手机屏幕较窄：未唱到的字仍保留低亮度，避免整句看起来缺字；入场位移也收敛到字距范围。
-        var x = shape.x + sin(shape.y) * 28.0
-        var y = shape.y + cos(shape.x) * 12.0
-        var scale = 0.88
-        var rotate = shape.rotate + 4.0
-        var opacity = 0.28
-        var blur = 0.5
-        var brightness = 0.58
+        // 待唱：完全隐身在侧方小尺度、微旋与虚化中，等待到拍那一刻凭空弹射显形
+        var x = shape.x + sin(shape.y) * 56.0
+        var y = shape.y + cos(shape.x) * 32.0
+        var scale = 0.50
+        var rotate = shape.rotate + 20.0
+        var opacity = 0.0
+        var blur = 10.0
+        var brightness = 0.50
         var glow = 0.0
 
         if since > 0 {
             let e = springStep(since)
             x = lerp(x, shape.x, e)
             y = lerp(y, shape.y, e)
-            scale = lerp(0.88, shape.scale * 1.12, e)
-            rotate = lerp(shape.rotate + 4.0, shape.rotate, e)
-            opacity = lerp(0.28, 1.0, clamp01(since / 0.1))
-            blur = 0.5 * (1.0 - clamp01(since / 0.16))
-            brightness = lerp(0.5, 1.0, clamp01(since / singing))
-            glow = clamp01(since / max(0.08, 0.3 * singing))
+            scale = lerp(0.50, shape.scale * 1.28, e)
+            rotate = lerp(shape.rotate + 20.0, shape.rotate, e)
+            opacity = clamp01(since / 0.10)
+            blur = 10.0 * (1.0 - clamp01(since / 0.20))
+            brightness = lerp(0.55, 1.0, clamp01(since / singing))
+            glow = clamp01(since / max(0.08, 0.30 * singing))
         }
 
         if after > 0 {
             let q = easeOutCubic(after / 0.5)
-            scale = lerp(shape.scale * 1.12, shape.scale, q)
+            scale = lerp(shape.scale * 1.28, shape.scale, q)
             opacity = lerp(1.0, 0.82, q)
             rotate = shape.rotate + shape.drift * clamp01(after / 5.0)
-            brightness = lerp(1.0, 0.5, easeOutCubic(after / 0.8))
+            brightness = lerp(1.0, 0.50, easeOutCubic(after / 0.8))
             glow = 1.0 - clamp01(after / 0.9)
         }
 
@@ -258,7 +258,7 @@ public enum StageMath {
         return Double(max(1, text.count)) * fontSize * (isCJK ? 1.0 : 0.56)
     }
 
-    /// 词间距补偿（防止放大时重叠，对应 spaceWords，支持按屏幕缩放系数匹配实际散落位移）
+    /// 词间距补偿（防止放大或彼此相向随机偏移时重叠压字，同时避免过宽撑折常规短句）
     public static func spaceWords(_ shapes: inout [WordShape], widths: [Double], gap: Double, spreadScale: Double = 1.0) {
         let clampedSpread = max(0.25, spreadScale)
         for i in shapes.indices {
@@ -269,8 +269,8 @@ public enum StageMath {
                 next = widths[i + 1] * (shapes[i + 1].scale * 1.12 - 1.0) / 2.0
                 toward = (shapes[i].x - shapes[i + 1].x) * clampedSpread
             }
-            let effectiveMargin = max(1.6 * gap, grow + next + toward + gap)
-            shapes[i].margin = i == shapes.count - 1 ? 0.0 : min(gap * 4.5, effectiveMargin)
+            let effectiveMargin = max(gap * 0.85, grow + next + toward + gap * 0.8)
+            shapes[i].margin = i == shapes.count - 1 ? 0.0 : min(gap * 7.5, effectiveMargin)
         }
     }
 
