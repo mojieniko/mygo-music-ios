@@ -2147,6 +2147,17 @@ final class MyGoMusicTests: XCTestCase {
             currentInteracting: false,
             maxOffset: 1000
         ))
+
+        // 验证同帧多次微震 + 快速位移经由累加器合并且 drain 后清空
+        var acc = VerticalScrollDeltaAccumulator()
+        acc.add(12.5)
+        acc.add(-0.3)
+        acc.add(18.0)
+        XCTAssertEqual(acc.drain(), 30.2, accuracy: 0.001)
+        XCTAssertEqual(acc.drain(), 0.0, accuracy: 0.001)
+        acc.add(5.0)
+        acc.reset()
+        XCTAssertEqual(acc.drain(), 0.0, accuracy: 0.001)
     }
 }
 

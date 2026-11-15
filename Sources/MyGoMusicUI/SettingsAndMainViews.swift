@@ -806,27 +806,27 @@ private struct PluginSettingFieldRow: View {
 /// 悬浮液态玻璃在不同外观模式下的投影与透光参数（避免浅色白底出现厚重黑边蒙版）
 public enum LiquidGlassElevationSpec {
     public static func primaryShadowOpacity(isDark: Bool) -> Double {
-        isDark ? 0.44 : 0.042
+        isDark ? 0.48 : 0.048
     }
 
     public static func primaryShadowRadius(isDark: Bool) -> CGFloat {
-        isDark ? 13 : 9
+        isDark ? 14 : 10
     }
 
     public static func primaryShadowOffsetY(isDark: Bool) -> CGFloat {
-        isDark ? 5 : 2.5
+        isDark ? 5 : 3
     }
 
     public static func contactShadowOpacity(isDark: Bool) -> Double {
-        isDark ? 0.22 : 0.022
+        isDark ? 0.24 : 0.024
     }
 
     public static func contactShadowRadius(isDark: Bool) -> CGFloat {
-        isDark ? 3 : 2
+        isDark ? 3.5 : 2.2
     }
 
     public static func contactShadowOffsetY(isDark: Bool) -> CGFloat {
-        isDark ? 1 : 0.5
+        isDark ? 1.5 : 0.8
     }
 }
 
@@ -851,7 +851,7 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
             .clipShape(shape)
             .overlay(
                 shape
-                    .strokeBorder(borderGradient, lineWidth: isDark ? 0.65 : 0.85)
+                    .strokeBorder(borderGradient, lineWidth: isDark ? 0.75 : 0.90)
             )
             .shadow(
                 color: .black.opacity(LiquidGlassElevationSpec.primaryShadowOpacity(isDark: isDark)),
@@ -869,21 +869,21 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
 
     private var tintOverlay: Color {
         if colorScheme == .dark {
-            // 沉稳黑曜石烟熏玻璃：抑制强亮背后内容透出导致的灰白塑料感
-            return Color(red: 0.085, green: 0.085, blue: 0.10).opacity(isHighlighted ? 0.72 : 0.64)
+            // 沉稳黑曜石烟熏玻璃：兼顾通透液态感与抗灰白穿透压制
+            return Color(red: 0.085, green: 0.085, blue: 0.105).opacity(isHighlighted ? 0.64 : 0.54)
         }
-        // 浅色采用清亮薄雾白提亮，既透出背后色彩，又不发灰发暗
-        return Color.white.opacity(isHighlighted ? 0.50 : 0.38)
+        // 浅色采用微带通透银白雾的清亮基底，使高亮白色选中气泡与外缘反光能饱满浮凸而出
+        return Color(white: 0.955).opacity(isHighlighted ? 0.60 : 0.46)
     }
 
     private var specularInnerSheen: LinearGradient {
         if colorScheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.white.opacity(0.065),
-                    Color.white.opacity(0.01),
+                    Color.white.opacity(0.15),
+                    Color.white.opacity(0.035),
                     Color.clear,
-                    Color.white.opacity(0.025)
+                    Color.white.opacity(0.07)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -891,10 +891,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         }
         return LinearGradient(
             colors: [
-                Color.white.opacity(0.58),
-                Color.white.opacity(0.14),
+                Color.white.opacity(0.82),
+                Color.white.opacity(0.24),
                 Color.white.opacity(0.04),
-                Color.white.opacity(0.28)
+                Color.white.opacity(0.42)
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -905,10 +905,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         if colorScheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.white.opacity(0.18),
+                    Color.white.opacity(0.28),
+                    Color.white.opacity(0.085),
                     Color.white.opacity(0.055),
-                    Color.white.opacity(0.035),
-                    Color.white.opacity(0.095)
+                    Color.white.opacity(0.15)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -916,10 +916,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         }
         return LinearGradient(
             colors: [
-                Color.white.opacity(0.95),
-                Color.white.opacity(0.38),
-                Color.white.opacity(0.24),
-                Color.white.opacity(0.78)
+                Color.white.opacity(1.0),
+                Color.white.opacity(0.50),
+                Color.white.opacity(0.36),
+                Color.white.opacity(0.88)
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -930,6 +930,48 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
 private extension View {
     func mygoLiquidGlass<S: InsettableShape>(in shape: S, isHighlighted: Bool = false) -> some View {
         modifier(LiquidGlassSurfaceModifier(shape: shape, isHighlighted: isHighlighted))
+    }
+}
+
+/// 液态玻璃内嵌选中态浮凸气泡（统一主 Tab 胶囊与搜索圆钮的 3D 高光与投影）
+private struct LiquidGlassSelectionBubble<S: InsettableShape>: View {
+    let shape: S
+    var isEmphasized: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let isDark = (colorScheme == .dark)
+        ZStack {
+            shape.fill(fillColor(isDark: isDark))
+            shape.strokeBorder(borderGradient(isDark: isDark), lineWidth: isEmphasized ? 0.95 : 0.75)
+        }
+        .shadow(
+            color: .black.opacity(
+                isEmphasized
+                    ? (isDark ? 0.30 : 0.11)
+                    : (isDark ? 0.22 : 0.06)
+            ),
+            radius: isEmphasized ? 10 : 5,
+            x: 0,
+            y: isEmphasized ? 3 : 1.5
+        )
+    }
+
+    private func fillColor(isDark: Bool) -> Color {
+        if isDark {
+            return Color.white.opacity(isEmphasized ? 0.26 : 0.19)
+        }
+        return Color.white.opacity(isEmphasized ? 0.95 : 0.86)
+    }
+
+    private func borderGradient(isDark: Bool) -> LinearGradient {
+        LinearGradient(
+            colors: isDark
+                ? [Color.white.opacity(0.32), Color.white.opacity(0.08)]
+                : [Color.white.opacity(1.0), Color.black.opacity(0.055)],
+            startPoint: .top,
+            endPoint: .bottom
+        )
     }
 }
 
@@ -953,15 +995,16 @@ public struct MiniPlayerBarView: View {
             let barHeight = isCompact
                 ? FloatingTabBarMetrics.compactBarHeight
                 : FloatingTabBarMetrics.miniExpandedHeight
-            let artworkSize: CGFloat = isCompact ? 32 : 36
-            let artworkRadius: CGFloat = isCompact ? 7 : 8
+            let artworkSlotSize: CGFloat = 38
+            let artworkRadius: CGFloat = 9.5
+            let trailingClusterWidth: CGFloat = isCompact ? 0 : 72
 
             ZStack(alignment: .bottom) {
-                HStack(spacing: isCompact ? 9 : 11) {
+                HStack(spacing: 10) {
                     ArtworkView(
                         urlString: track.album.imageUrl,
                         pixelSize: 160,
-                        size: artworkSize,
+                        size: artworkSlotSize,
                         cornerRadius: artworkRadius
                     )
                     .background(
@@ -969,78 +1012,92 @@ public struct MiniPlayerBarView: View {
                             .fill(MyGoTheme.placeholderFill)
                             .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 1.5)
                     )
+                    .scaleEffect(isCompact ? 0.94 : 1.0)
+                    .geometryGroup()
 
-                    VStack(alignment: .leading, spacing: isCompact ? 1 : 2) {
-                        HStack(spacing: 5) {
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        HStack(spacing: 4) {
                             Text(track.name)
-                                .font(.system(size: isCompact ? 13.5 : 14.5, weight: .semibold))
+                                .font(.system(size: 14.5, weight: .semibold))
                                 .lineLimit(1)
-                            if !isCompact, let radio = app.player.radioName, !radio.isEmpty {
+                            if let radio = app.player.radioName, !radio.isEmpty {
                                 Image(systemName: "dot.radiowaves.left.and.right")
-                                    .font(.system(size: 11))
+                                    .font(.system(size: 10.5))
                                     .foregroundStyle(MyGoTheme.accent)
+                                    .frame(width: isCompact ? 0 : 14)
+                                    .clipped()
+                                    .opacity(isCompact ? 0 : 1)
                             }
                         }
                         if let errMsg = app.player.errorMessage, !errMsg.isEmpty {
                             Text(errMsg)
-                                .font(.system(size: isCompact ? 10.5 : 11.5, weight: .medium))
+                                .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.red)
                                 .lineLimit(1)
                         } else {
                             Text(track.artistNames)
-                                .font(.system(size: isCompact ? 11 : 12))
+                                .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .geometryGroup()
 
-                    if !isCompact {
-                        EqualizerBarsView(
-                            bands: app.player.audioBands,
-                            isPlaying: app.player.isPlaying
-                        )
-                        .transition(.opacity.combined(with: .scale(scale: 0.72)))
-                    }
+                    HStack(spacing: 6) {
+                        HStack(spacing: 8) {
+                            EqualizerBarsView(
+                                bands: app.player.audioBands,
+                                isPlaying: app.player.isPlaying
+                            )
+                            .frame(width: 22)
 
-                    Button {
-                        if app.player.errorMessage != nil {
-                            app.player.retryCurrentTrack()
-                        } else {
-                            app.player.togglePlay()
+                            Button {
+                                app.player.next()
+                            } label: {
+                                Image(systemName: "forward.fill")
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 32, height: 32)
+                            }
+                            .buttonStyle(.plain)
                         }
-                    } label: {
-                        Image(systemName: app.player.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: isCompact ? 17.5 : 19.5, weight: .bold))
-                            .foregroundStyle(.primary)
-                            .frame(width: isCompact ? 32 : 34, height: isCompact ? 32 : 34)
-                    }
-                    .buttonStyle(.plain)
+                        .frame(width: 66, alignment: .trailing)
+                        .opacity(isCompact ? 0 : 1)
+                        .allowsHitTesting(!isCompact)
+                        .frame(width: trailingClusterWidth, alignment: .trailing)
+                        .clipped()
 
-                    if !isCompact {
                         Button {
-                            app.player.next()
+                            if app.player.errorMessage != nil {
+                                app.player.retryCurrentTrack()
+                            } else {
+                                app.player.togglePlay()
+                            }
                         } label: {
-                            Image(systemName: "forward.fill")
-                                .font(.system(size: 17, weight: .semibold))
+                            Image(systemName: app.player.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 18.5, weight: .bold))
                                 .foregroundStyle(.primary)
+                                .scaleEffect(isCompact ? 0.96 : 1.0)
                                 .frame(width: 32, height: 32)
                         }
                         .buttonStyle(.plain)
-                        .transition(.opacity.combined(with: .scale(scale: 0.72)))
                     }
+                    .geometryGroup()
                 }
-                .padding(.leading, isCompact ? 10 : 12)
-                .padding(.trailing, isCompact ? 10 : 14)
+                .padding(.leading, 9)
+                .padding(.trailing, 10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .geometryGroup()
 
                 // 贴合胶囊底缘平直区域的轻柔进度细线与白色拖尾烟雾
                 miniProgressStrip(for: track)
-                    .padding(.horizontal, isCompact ? 24 : 26)
+                    .padding(.horizontal, 24)
                     .padding(.bottom, 1.5)
             }
             .frame(height: barHeight)
             .mygoLiquidGlass(in: capsuleShape)
+            .geometryGroup()
             .contentShape(capsuleShape)
             .onTapGesture {
                 if app.settings.growFromCover {
@@ -1414,24 +1471,24 @@ public extension Notification.Name {
 
 /// 遵循 Apple iOS HIG 与 Apple Music iOS 26 悬浮胶囊规范的底部导航栏尺寸常量
 public enum FloatingTabBarMetrics {
-    public static let barHeight: CGFloat = 66
-    public static let outerInset: CGFloat = 5
+    public static let barHeight: CGFloat = 64
+    public static let outerInset: CGFloat = 4
     public static let activePillHeight: CGFloat = barHeight - outerInset * 2
     public static let itemSpacing: CGFloat = 4
-    public static let horizontalPadding: CGFloat = 16
-    public static let maxWidth: CGFloat = 428
-    public static let iconSize: CGFloat = 21.5
-    public static let iconFrameHeight: CGFloat = 24
-    public static let iconLabelSpacing: CGFloat = 3
+    public static let horizontalPadding: CGFloat = 22
+    public static let maxWidth: CGFloat = 396
+    public static let iconSize: CGFloat = 23
+    public static let iconFrameHeight: CGFloat = 25
+    public static let iconLabelSpacing: CGFloat = 2.5
     public static let labelFontSize: CGFloat = 10.5
     public static let overlaySpacing: CGFloat = 10
     public static let miniExpandedHeight: CGFloat = 56
-    public static let compactBarHeight: CGFloat = 52
+    public static let compactBarHeight: CGFloat = 56
     public static let searchCircleSize: CGFloat = barHeight
-    public static let splitSpacing: CGFloat = 10
-    public static let compactSplitSpacing: CGFloat = 8
-    public static let bottomInsetEmptyPlayer: CGFloat = 88
-    public static let bottomInsetWithMiniPlayer: CGFloat = 160
+    public static let splitSpacing: CGFloat = 12
+    public static let compactSplitSpacing: CGFloat = 10
+    public static let bottomInsetEmptyPlayer: CGFloat = 78
+    public static let bottomInsetWithMiniPlayer: CGFloat = 148
 }
 
 /// 底部导航主浏览页签与独立搜索圆钮之间的槽位映射模型
@@ -1586,6 +1643,27 @@ public enum VerticalScrollProbeFilter {
     }
 }
 
+/// 同帧多笔 KVO 偏移增量累加器，防止高频滚动下后一帧微震覆盖前一帧有效位移
+public struct VerticalScrollDeltaAccumulator: Sendable {
+    public private(set) var pendingDelta: CGFloat = 0
+
+    public init() {}
+
+    public mutating func add(_ delta: CGFloat) {
+        pendingDelta += delta
+    }
+
+    public mutating func drain() -> CGFloat {
+        let value = pendingDelta
+        pendingDelta = 0
+        return value
+    }
+
+    public mutating func reset() {
+        pendingDelta = 0
+    }
+}
+
 /// 持有底栏滚动协同器的无 `@Published` 容器，防止 `isMinimized` / `isUserScrolling` 变化连带触发整棵 Tab 树重建
 @MainActor
 private final class ScrollCoordinatorStore: ObservableObject {
@@ -1649,7 +1727,7 @@ private final class TabBarScrollCoordinator: ObservableObject {
 
     private func setMinimized(_ minimized: Bool) {
         guard isMinimized != minimized else { return }
-        withAnimation(.spring(response: 0.42, dampingFraction: 0.85)) {
+        withAnimation(.spring(response: 0.38, dampingFraction: 0.90)) {
             isMinimized = minimized
         }
     }
@@ -1679,6 +1757,7 @@ private final class VerticalScrollProbeUIView: UIView {
     private var lastReportedNormalizedY: CGFloat?
     private var lastReportedInteracting: Bool?
     private var pendingMetrics: VerticalScrollMetrics?
+    private var deltaAccumulator = VerticalScrollDeltaAccumulator()
     private var isFlushScheduled: Bool = false
 
     override init(frame: CGRect) {
@@ -1735,6 +1814,7 @@ private final class VerticalScrollProbeUIView: UIView {
         lastReportedNormalizedY = nil
         lastReportedInteracting = nil
         pendingMetrics = nil
+        deltaAccumulator.reset()
         isFlushScheduled = false
     }
 
@@ -1758,6 +1838,8 @@ private final class VerticalScrollProbeUIView: UIView {
             let maxOffset = max(0, scrollView.contentSize.height + insetTop + insetBottom - scrollView.bounds.height)
             let isInteracting = scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating
 
+            self.deltaAccumulator.add(delta)
+
             guard VerticalScrollProbeFilter.shouldEmit(
                 lastNormalizedY: self.lastReportedNormalizedY,
                 currentNormalizedY: normalizedY,
@@ -1771,10 +1853,10 @@ private final class VerticalScrollProbeUIView: UIView {
             self.lastReportedNormalizedY = normalizedY
             self.lastReportedInteracting = isInteracting
 
-            // 每帧最多合并派发一次主线程异步回调，兼顾避开 SwiftUI 布局重入与消除闭包堆积
+            // 每帧最多合并派发一次主线程异步回调，直到实际派发时才取出并归零累计偏移，避免同帧连续采样相互覆盖
             self.pendingMetrics = VerticalScrollMetrics(
                 normalizedOffsetY: normalizedY,
-                deltaY: delta,
+                deltaY: 0,
                 maxScrollOffset: maxOffset,
                 isUserInteracting: isInteracting
             )
@@ -1783,9 +1865,16 @@ private final class VerticalScrollProbeUIView: UIView {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isFlushScheduled = false
-                guard let metrics = self.pendingMetrics else { return }
+                guard let snapshot = self.pendingMetrics else { return }
                 self.pendingMetrics = nil
-                self.onScroll?(metrics)
+                let accumulated = self.deltaAccumulator.drain()
+                let resolved = VerticalScrollMetrics(
+                    normalizedOffsetY: snapshot.normalizedOffsetY,
+                    deltaY: accumulated,
+                    maxScrollOffset: snapshot.maxScrollOffset,
+                    isUserInteracting: snapshot.isUserInteracting
+                )
+                self.onScroll?(resolved)
             }
         }
     }
@@ -2017,13 +2106,13 @@ private struct PrimaryTabsCapsuleBar: View {
     let lastPrimaryTab: Int
     let isCompactHeight: Bool
     let isCollapsedToCircle: Bool
+    let expandedWidth: CGFloat
     let targetWidth: CGFloat
     let targetHeight: CGFloat
     let onSelect: (Int) -> Void
     let onExpandFromCircle: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
-    @State private var barWidth: CGFloat = 0
     @State private var pillCenterX: CGFloat? = nil
     @State private var hoveredSlot: Int? = nil
     @State private var pressedSlot: Int? = nil
@@ -2049,7 +2138,10 @@ private struct PrimaryTabsCapsuleBar: View {
         let effectiveSlot = MainTabMapping.slotIndex(for: effectivePrimaryID) ?? 0
         let activeHighlightSlot: Int? = isDraggingPill ? (hoveredSlot ?? selectedSlot) : selectedSlot
 
-        let activeBarWidth = barWidth > 0 ? barWidth : targetWidth
+        let activeBarWidth = max(160, expandedWidth)
+        let fullBarHeight = FloatingTabBarMetrics.barHeight
+        let isCompactOrCollapsed = isCollapsedToCircle || isCompactHeight
+        let showLabels = !isCompactOrCollapsed
         let pillWidth = FloatingTabBarSliderMath.slotWidth(barWidth: activeBarWidth, count: items.count)
         let restCenterX = FloatingTabBarSliderMath.slotCenterX(
             index: selectedSlot ?? effectiveSlot,
@@ -2058,83 +2150,100 @@ private struct PrimaryTabsCapsuleBar: View {
         )
         let displayCenterX = (isDraggingPill ? pillCenterX : nil) ?? restCenterX
         let showActivePill = !isCollapsedToCircle && (selectedSlot != nil || isDraggingPill)
-        let innerHeight = max(36, targetHeight - FloatingTabBarMetrics.outerInset * 2)
+        let innerHeight = max(36, fullBarHeight - FloatingTabBarMetrics.outerInset * 2)
 
-        ZStack {
-            if !isCollapsedToCircle && activeBarWidth > 40 {
-                activeIndicatorPill(width: pillWidth, height: innerHeight)
-                    .position(x: displayCenterX, y: targetHeight * 0.5)
-                    .opacity(showActivePill ? 1 : 0)
-                    .scaleEffect(showActivePill ? 1 : 0.85)
-                    .allowsHitTesting(false)
-            }
+        ZStack(alignment: .leading) {
+            // 高亮滑块仅在展开态显示，收起成圆时提前平稳淡出，避免与左圆高亮竞争
+            activeIndicatorPill(width: pillWidth, height: innerHeight)
+                .position(x: displayCenterX, y: targetHeight * 0.5)
+                .opacity(showActivePill ? 1 : 0)
+                .scaleEffect(showActivePill ? 1 : 0.72)
+                .animation(
+                    isCollapsedToCircle
+                        ? .easeOut(duration: 0.11)
+                        : .easeOut(duration: 0.16),
+                    value: showActivePill
+                )
+                .allowsHitTesting(false)
 
-            HStack(spacing: isCollapsedToCircle ? 0 : FloatingTabBarMetrics.itemSpacing) {
-                ForEach(Array(items.enumerated()), id: \.element.id) { slotIndex, item in
-                    let shouldShowItem = !isCollapsedToCircle || item.id == effectivePrimaryID
-                    if shouldShowItem {
-                        let isSelected = (activeHighlightSlot == slotIndex)
-                        let isPrimaryInCircle = isCollapsedToCircle && (selectedTab == item.id)
-                        let isHighlight = isCollapsedToCircle ? isPrimaryInCircle : isSelected
-                        let isPressingInactive = (!isCollapsedToCircle && !isDraggingPill && pressedSlot == slotIndex && selectedSlot != slotIndex)
+            // 唯一三槽图标与文字实体：不额外叠加第二颗圆心图标，杜绝双影与首页图标残留；
+            // 每个槽以恒定宽度 pillWidth 独立排版，杜绝胶囊缩窄期间文字挤压/省略号抖动。
+            ForEach(Array(items.enumerated()), id: \.element.id) { slotIndex, item in
+                let isPrimarySlot = (slotIndex == effectiveSlot)
+                let isSelected = (activeHighlightSlot == slotIndex)
+                let isPrimaryInCircle = isCollapsedToCircle && (selectedTab == item.id)
+                let isHighlight = isCollapsedToCircle ? isPrimaryInCircle : isSelected
+                let isPressingInactive = (!isCollapsedToCircle && !isDraggingPill && pressedSlot == slotIndex && selectedSlot != slotIndex)
+                let expandedCenterX = FloatingTabBarSliderMath.slotCenterX(
+                    index: slotIndex,
+                    barWidth: activeBarWidth,
+                    count: items.count
+                )
+                let itemCenterX: CGFloat = (isCollapsedToCircle && isPrimarySlot)
+                    ? targetHeight * 0.5
+                    : expandedCenterX
+                let isSlotVisible = !isCollapsedToCircle || isPrimarySlot
+                let iconScale: CGFloat = isCompactOrCollapsed
+                    ? 0.96
+                    : (isHighlight ? (isDraggingPill ? 1.07 : 1.03) : (isPressingInactive ? 0.94 : 1.0))
 
-                        VStack(spacing: isCollapsedToCircle || isCompactHeight ? 0 : FloatingTabBarMetrics.iconLabelSpacing) {
-                            Image(systemName: isHighlight ? item.selectedIcon : item.icon)
-                                .font(.system(
-                                    size: isCollapsedToCircle || isCompactHeight ? 20 : FloatingTabBarMetrics.iconSize,
-                                    weight: isHighlight ? .semibold : .medium
-                                ))
-                                .frame(height: FloatingTabBarMetrics.iconFrameHeight)
-                                .scaleEffect(
-                                    isHighlight
-                                        ? (isDraggingPill ? 1.07 : 1.03)
-                                        : (isPressingInactive ? 0.94 : 1.0)
-                                )
+                ZStack {
+                    Image(systemName: isHighlight ? item.selectedIcon : item.icon)
+                        .font(.system(
+                            size: FloatingTabBarMetrics.iconSize,
+                            weight: isHighlight ? .semibold : .medium
+                        ))
+                        .frame(height: FloatingTabBarMetrics.iconFrameHeight)
+                        .scaleEffect(iconScale)
+                        .offset(y: showLabels ? -7.5 : 0)
 
-                            if !isCollapsedToCircle && !isCompactHeight {
-                                Text(I18n.t(item.titleKey))
-                                    .font(.system(
-                                        size: FloatingTabBarMetrics.labelFontSize,
-                                        weight: isHighlight ? .semibold : .medium
-                                    ))
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.85)
-                                    .transition(.opacity.combined(with: .scale(scale: 0.82)))
-                            }
-                        }
-                        .foregroundStyle(foregroundColor(isSelected: isHighlight))
-                        .opacity(isPressingInactive ? 0.72 : 1.0)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Capsule(style: .continuous))
-                        .transition(.opacity.combined(with: .scale(scale: 0.5)))
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(I18n.t(item.titleKey))
-                        .accessibilityAddTraits(isHighlight ? [.isButton, .isSelected] : [.isButton])
-                        .accessibilityAction {
-                            if isCollapsedToCircle {
-                                onExpandFromCircle()
-                            } else {
-                                onSelect(item.id)
-                            }
-                        }
+                    Text(I18n.t(item.titleKey))
+                        .font(.system(
+                            size: FloatingTabBarMetrics.labelFontSize,
+                            weight: isHighlight ? .semibold : .medium
+                        ))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .scaleEffect(showLabels ? 1.0 : 0.84, anchor: .top)
+                        .offset(y: showLabels ? 13.5 : 8.5)
+                        .opacity(showLabels ? 1 : 0)
+                        .animation(
+                            showLabels
+                                ? .easeOut(duration: 0.16).delay(0.04)
+                                : .easeOut(duration: 0.08),
+                            value: showLabels
+                        )
+                }
+                .frame(width: pillWidth, height: fullBarHeight)
+                .foregroundStyle(foregroundColor(isSelected: isHighlight))
+                .opacity(isPressingInactive ? 0.72 : 1.0)
+                .geometryGroup()
+                .opacity(isSlotVisible ? 1 : 0)
+                .scaleEffect(isSlotVisible ? 1.0 : 0.68)
+                .animation(
+                    isCollapsedToCircle
+                        ? .easeOut(duration: 0.075)
+                        : .easeOut(duration: 0.16).delay(0.05),
+                    value: isSlotVisible
+                )
+                .position(x: itemCenterX, y: targetHeight * 0.5)
+                .contentShape(Rectangle())
+                .allowsHitTesting(!isCollapsedToCircle)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(I18n.t(item.titleKey))
+                .accessibilityAddTraits(isHighlight ? [.isButton, .isSelected] : [.isButton])
+                .accessibilityAction {
+                    if isCollapsedToCircle {
+                        onExpandFromCircle()
+                    } else {
+                        onSelect(item.id)
                     }
                 }
             }
-            .padding(isCollapsedToCircle ? 0 : FloatingTabBarMetrics.outerInset)
         }
         .frame(width: targetWidth, height: targetHeight)
         .mygoLiquidGlass(in: Capsule(style: .continuous), isHighlighted: isCollapsedToCircle && selectedSlot != nil)
-        .background {
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear {
-                        barWidth = proxy.size.width
-                    }
-                    .onChange(of: proxy.size.width) { _, newWidth in
-                        barWidth = newWidth
-                    }
-            }
-        }
+        .geometryGroup()
         .contentShape(Capsule(style: .continuous))
         .onTapGesture {
             guard isCollapsedToCircle else { return }
@@ -2164,20 +2273,12 @@ private struct PrimaryTabsCapsuleBar: View {
     }
 
     private func activeIndicatorPill(width: CGFloat, height: CGFloat) -> some View {
-        ZStack {
-            Capsule(style: .continuous)
-                .fill(isDraggingPill ? draggingPillColor : activePillColor)
-            Capsule(style: .continuous)
-                .strokeBorder(activePillBorderGradient, lineWidth: isDraggingPill ? 0.9 : 0.65)
-        }
+        LiquidGlassSelectionBubble(
+            shape: Capsule(style: .continuous),
+            isEmphasized: isDraggingPill
+        )
         .frame(width: max(40, width), height: height)
         .scaleEffect(x: isDraggingPill ? 1.07 : 1.0, y: isDraggingPill ? 1.11 : 1.0)
-        .shadow(
-            color: .black.opacity(isDraggingPill ? (colorScheme == .dark ? 0.28 : 0.09) : 0),
-            radius: isDraggingPill ? 10 : 0,
-            x: 0,
-            y: isDraggingPill ? 3 : 0
-        )
         .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isDraggingPill)
     }
 
@@ -2340,33 +2441,6 @@ private struct PrimaryTabsCapsuleBar: View {
         hapticCount += 1
     }
 
-    private var activePillColor: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.135)
-            : Color.black.opacity(0.065)
-    }
-
-    private var draggingPillColor: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.22)
-            : Color.white.opacity(0.86)
-    }
-
-    private var activePillBorderGradient: LinearGradient {
-        if colorScheme == .dark {
-            return LinearGradient(
-                colors: [Color.white.opacity(0.16), Color.white.opacity(0.03)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-        return LinearGradient(
-            colors: [Color.white.opacity(0.85), Color.black.opacity(0.04)],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-    }
-
     private func foregroundColor(isSelected: Bool) -> Color {
         if isSelected {
             return MyGoTheme.accent
@@ -2397,20 +2471,16 @@ private struct SearchCircleButton: View {
         Button(action: onTap) {
             ZStack {
                 if isSelected {
-                    Circle()
-                        .fill(
-                            colorScheme == .dark
-                                ? Color.white.opacity(0.135)
-                                : Color.black.opacity(0.06)
-                        )
+                    LiquidGlassSelectionBubble(shape: Circle())
                         .padding(FloatingTabBarMetrics.outerInset)
                 }
 
                 Image(systemName: "magnifyingglass")
                     .font(.system(
-                        size: isCompact ? 19.5 : 22,
+                        size: 22.5,
                         weight: isSelected ? .bold : .medium
                     ))
+                    .scaleEffect(isCompact ? 0.96 : 1.0)
                     .foregroundStyle(
                         isSelected
                             ? MyGoTheme.accent
@@ -2419,6 +2489,7 @@ private struct SearchCircleButton: View {
             }
             .frame(width: size, height: size)
             .mygoLiquidGlass(in: Circle(), isHighlighted: isSelected)
+            .geometryGroup()
         }
         .buttonStyle(ScalePressButtonStyle())
         .accessibilityLabel(I18n.t("Search"))
@@ -2449,8 +2520,11 @@ private struct AdaptiveFloatingBottomChrome: View {
             ? FloatingTabBarMetrics.compactSplitSpacing
             : FloatingTabBarMetrics.splitSpacing
         let searchSize = rowHeight
-        let expandedTabWidth = max(160, measuredWidth - rowSpacing - searchSize)
-        let tabWidth = isCompactRow ? rowHeight : expandedTabWidth
+        let fullExpandedTabWidth = max(
+            160,
+            measuredWidth - FloatingTabBarMetrics.splitSpacing - FloatingTabBarMetrics.barHeight
+        )
+        let tabWidth = isCompactRow ? rowHeight : fullExpandedTabWidth
         let miniWidth = isCompactRow
             ? max(120, measuredWidth - rowHeight * 2 - rowSpacing * 2)
             : measuredWidth
@@ -2476,23 +2550,20 @@ private struct AdaptiveFloatingBottomChrome: View {
             }
 
             ZStack(alignment: .bottom) {
-                HStack(alignment: .bottom, spacing: rowSpacing) {
+                HStack(alignment: .bottom, spacing: 0) {
                     PrimaryTabsCapsuleBar(
                         selectedTab: $selectedTab,
                         lastPrimaryTab: lastPrimaryTab,
                         isCompactHeight: isCompactWithoutTrack,
                         isCollapsedToCircle: isCompactRow,
+                        expandedWidth: fullExpandedTabWidth,
                         targetWidth: tabWidth,
                         targetHeight: rowHeight,
                         onSelect: onSelectTab,
                         onExpandFromCircle: onExpandFromCircle
                     )
 
-                    if isCompactRow {
-                        Color.clear
-                            .frame(width: miniWidth, height: 1)
-                            .allowsHitTesting(false)
-                    }
+                    Spacer(minLength: 0)
 
                     SearchCircleButton(
                         isSelected: selectedTab == MainTabMapping.searchTabID,
@@ -2509,6 +2580,7 @@ private struct AdaptiveFloatingBottomChrome: View {
                         isScrollPaused: scrollCoordinator.isUserScrolling
                     )
                     .frame(width: miniWidth, height: miniHeight)
+                    .geometryGroup()
                     .offset(y: miniBottomOffset)
                 }
             }
@@ -2622,6 +2694,7 @@ public struct MainView: View {
     @State private var lastPrimaryTab: Int = 0
     @State private var activatedTabs: Set<Int> = [0]
     @State private var isKeyboardVisible: Bool = false
+    @State private var bottomSafeAreaInset: CGFloat = 0
 
     public init() {}
 
@@ -2637,9 +2710,12 @@ public struct MainView: View {
         }
     }
 
+    @MainActor
     private var bottomOverlayPadding: CGFloat {
         #if os(iOS)
-        return 8
+        let safeBottom = max(bottomSafeAreaInset, MyGoSystemAppearanceConfigurator.currentBottomSafeAreaInset)
+        // 对齐 iOS 26 原生系统（Files / Apple Music 全面屏下沿距屏幕物理底边 ~22pt）
+        return safeBottom >= 24 ? 22 : 14
         #else
         return 12
         #endif
@@ -2717,6 +2793,24 @@ public struct MainView: View {
             .opacity(isKeyboardVisible ? 0 : 1)
             .allowsHitTesting(!isKeyboardVisible)
             .accessibilityHidden(isKeyboardVisible)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .ignoresSafeArea([.container, .keyboard], edges: .bottom)
+        }
+        .background {
+            GeometryReader { proxy in
+                let safeBottom = proxy.safeAreaInsets.bottom
+                Color.clear
+                    .onAppear {
+                        if abs(bottomSafeAreaInset - safeBottom) > 0.5 {
+                            bottomSafeAreaInset = safeBottom
+                        }
+                    }
+                    .onChange(of: safeBottom) { _, newValue in
+                        if abs(bottomSafeAreaInset - newValue) > 0.5 {
+                            bottomSafeAreaInset = newValue
+                        }
+                    }
+            }
         }
         .environment(\.mygoImageHeadersProvider, headersProvider)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
@@ -2949,6 +3043,13 @@ public struct MainView: View {
 /// 统一同步原生 UIWindow 暗黑模式与 UINavigationBar 磨砂外观（消除首页等界面滚动时顶部出现浑浊脏褐横条的问题）
 @MainActor
 private enum MyGoSystemAppearanceConfigurator {
+    static var currentBottomSafeAreaInset: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        let keyWindow = activeScene?.windows.first(where: { $0.isKeyWindow }) ?? activeScene?.windows.first
+        return keyWindow?.safeAreaInsets.bottom ?? 0
+    }
+
     static func apply(for appearance: AppAppearance) {
         let uiStyle: UIUserInterfaceStyle
         switch appearance {
