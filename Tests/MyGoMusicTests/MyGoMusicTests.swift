@@ -1848,17 +1848,16 @@ final class MyGoMusicTests: XCTestCase {
 
     @MainActor
     func testFloatingTabBarMinimizeMathAndPrimaryTabMapping() {
-        // 1. 左侧主胶囊 3 槽映射与搜索圆形分离一致性校验
-        XCTAssertEqual(MainTabMapping.primaryTabIDs, [0, 2, 3])
+        // 1. 左侧主胶囊 2 槽映射（首页 / 音乐库）与搜索圆形分离一致性校验
+        XCTAssertEqual(MainTabMapping.primaryTabIDs, [0, 2])
         XCTAssertEqual(MainTabMapping.slotIndex(for: 0), 0)
         XCTAssertEqual(MainTabMapping.slotIndex(for: 2), 1)
-        XCTAssertEqual(MainTabMapping.slotIndex(for: 3), 2)
+        XCTAssertNil(MainTabMapping.slotIndex(for: 3))
         XCTAssertNil(MainTabMapping.slotIndex(for: MainTabMapping.searchTabID))
         XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 0), 0)
         XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 1), 2)
-        XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 2), 3)
         XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 2, lastPrimaryTab: 0), 2)
-        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 3), 3)
+        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 2), 2)
         XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 99), 0)
 
         // 2. 内容过短或处于顶部保护区域时绝不误收起

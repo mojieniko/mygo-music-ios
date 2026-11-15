@@ -19,6 +19,7 @@ public enum NavigationTarget: Hashable {
     case savedAlbums
     case stations
     case podcasts
+    case settings
 }
 
 public extension SourceInfo {
@@ -82,7 +83,7 @@ public struct LoadMoreButton: View {
 
 public struct HomeView: View {
     @EnvironmentObject private var app: AppModel
-    @State private var navPath = NavigationPath()
+    @State private var navPath: [NavigationTarget] = []
 
     public init() {}
 
@@ -114,15 +115,38 @@ public struct HomeView: View {
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
-                ToolbarItem(placement: .automatic) {
+                #if os(iOS)
+                ToolbarItem(placement: .topBarLeading) {
                     SourceSwitcherMenu()
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    HomeSettingsToolbarButton(
+                        badgeCount: app.availablePluginUpdateCount
+                    ) {
+                        openSettingsIfNeeded()
+                    }
+                }
+                #else
+                ToolbarItem(placement: .navigation) {
+                    SourceSwitcherMenu()
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    HomeSettingsToolbarButton(
+                        badgeCount: app.availablePluginUpdateCount
+                    ) {
+                        openSettingsIfNeeded()
+                    }
+                }
+                #endif
             }
             .refreshable {
                 await app.refreshActiveSource()
             }
             .navigationDestination(for: NavigationTarget.self) { target in
                 destinationView(for: target)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .mygoOpenSettings)) { _ in
+                openSettingsIfNeeded()
             }
             .environment(\.mygoNavigate) { target in
                 navPath.append(target)
@@ -329,12 +353,20 @@ public struct HomeView: View {
             StationsPageView()
         case .podcasts:
             SubscribedPodcastsPageView()
+        case .settings:
+            SettingsView(embedInNavigationStack: false)
         }
     }
 
     @ViewBuilder
     private func destinationView(for target: NavigationTarget) -> some View {
         Self.buildDestination(for: target)
+    }
+
+    private func openSettingsIfNeeded() {
+        if navPath.last != .settings {
+            navPath.append(.settings)
+        }
     }
 }
 
@@ -388,6 +420,7 @@ public struct SourceSwitcherMenu: View {
                 Text(app.activeSource.info().name)
                     .font(.system(size: 13.5, weight: .semibold))
                     .foregroundStyle(.primary)
+                    .lineLimit(1)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary)
@@ -396,6 +429,36 @@ public struct SourceSwitcherMenu: View {
             .padding(.vertical, 6)
             .mygoPillSurface()
         }
+    }
+}
+
+/// 首页导航栏右上角设置入口按钮（与左上角音源切换药丸保持统一高度与表面材质，支持插件更新红点）
+private struct HomeSettingsToolbarButton: View {
+    let badgeCount: Int
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "gearshape")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 30, height: 30)
+                .mygoCircleSurface()
+                .overlay(alignment: .topTrailing) {
+                    if badgeCount > 0 {
+                        Circle()
+                            .fill(MyGoTheme.accent)
+                            .frame(width: 8, height: 8)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.black.opacity(0.28), lineWidth: 0.8)
+                            )
+                            .offset(x: 1, y: -1)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(I18n.t("Settings"))
     }
 }
 

@@ -120,11 +120,6 @@ public struct SearchView: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
-            .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    SourceSwitcherMenu()
-                }
-            }
             .navigationDestination(for: NavigationTarget.self) { target in
                 HomeView.buildDestination(for: target)
             }
@@ -535,11 +530,6 @@ public struct LibraryView: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
-            .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    SourceSwitcherMenu()
-                }
-            }
             .navigationDestination(for: NavigationTarget.self) { target in
                 HomeView.buildDestination(for: target)
             }

@@ -29,11 +29,24 @@ public struct SettingsView: View {
     @State private var repoLinkInput = ""
     @State private var repoLinkError: String? = nil
     @State private var cacheUsedBytes: Int64 = 0
+    public let embedInNavigationStack: Bool
 
-    public init() {}
+    public init(embedInNavigationStack: Bool = true) {
+        self.embedInNavigationStack = embedInNavigationStack
+    }
 
     public var body: some View {
-        NavigationStack {
+        if embedInNavigationStack {
+            NavigationStack {
+                settingsContent
+            }
+        } else {
+            settingsContent
+        }
+    }
+
+    @ViewBuilder
+    private var settingsContent: some View {
             ScrollViewReader { scrollProxy in
             Form {
                 // 1. 通用与外观
@@ -498,7 +511,6 @@ public struct SettingsView: View {
                     }
                 }
             }
-        }
     }
 
     #if DEBUG
@@ -1882,9 +1894,10 @@ private final class WebSignInCoordinator: NSObject, WKUIDelegate {
 
 // MARK: - 悬浮胶囊底部导航栏（对标 Apple Music iOS 26 分体胶囊 + 随滚动嵌入融合动效）
 
-/// 全局搜索框主动聚焦广播通知
+/// 全局界面触发广播通知（主动聚焦搜索框 / 跳转设置页）
 public extension Notification.Name {
     static let mygoFocusSearchField = Notification.Name("MyGoFocusSearchField")
+    static let mygoOpenSettings = Notification.Name("MyGoOpenSettings")
 }
 
 /// 遵循 Apple iOS HIG 与 Apple Music iOS 26 悬浮胶囊规范的底部导航栏尺寸常量
@@ -1927,9 +1940,9 @@ public enum FloatingTabBarMetrics {
 /// 底部导航主浏览页签与独立搜索圆钮之间的槽位映射模型
 public enum MainTabMapping {
     public static let searchTabID: Int = 1
-    public static let primaryTabIDs: [Int] = [0, 2, 3]
+    public static let primaryTabIDs: [Int] = [0, 2]
 
-    /// 将全局 Tab ID（0 首页 / 2 音乐库 / 3 设置）映射到左侧主胶囊槽位索引
+    /// 将全局 Tab ID（0 首页 / 2 音乐库）映射到左侧主胶囊槽位索引
     public static func slotIndex(for tabID: Int) -> Int? {
         primaryTabIDs.firstIndex(of: tabID)
     }
@@ -2549,7 +2562,6 @@ private struct MainTabItem: Identifiable {
 private struct PrimaryTabsCapsuleBar: View {
     @Binding var selectedTab: Int
     let lastPrimaryTab: Int
-    var settingsBadgeCount: Int = 0
     let isCompactHeight: Bool
     let isCollapsedToCircle: Bool
     let expandedWidth: CGFloat
@@ -2571,8 +2583,7 @@ private struct PrimaryTabsCapsuleBar: View {
 
     private let items: [MainTabItem] = [
         MainTabItem(id: 0, titleKey: "Home", icon: "house", selectedIcon: "house.fill"),
-        MainTabItem(id: 2, titleKey: "Library", icon: "music.note.list", selectedIcon: "music.note.list"),
-        MainTabItem(id: 3, titleKey: "Settings", icon: "gearshape", selectedIcon: "gearshape.fill")
+        MainTabItem(id: 2, titleKey: "Library", icon: "music.note.list", selectedIcon: "music.note.list")
     ]
 
     var body: some View {
@@ -2612,7 +2623,7 @@ private struct PrimaryTabsCapsuleBar: View {
                 )
                 .allowsHitTesting(false)
 
-            // 唯一三槽图标与文字实体：不额外叠加第二颗圆心图标，杜绝双影与首页图标残留；
+            // 主浏览槽位图标与文字实体：不额外叠加第二颗圆心图标，杜绝双影与首页图标残留；
             // 每个槽以恒定宽度 pillWidth 独立排版，杜绝胶囊缩窄期间文字挤压/省略号抖动。
             ForEach(Array(items.enumerated()), id: \.element.id) { slotIndex, item in
                 let isPrimarySlot = (slotIndex == effectiveSlot)
@@ -2640,15 +2651,6 @@ private struct PrimaryTabsCapsuleBar: View {
                             weight: isHighlight ? .semibold : .medium
                         ))
                         .frame(height: FloatingTabBarMetrics.iconFrameHeight)
-                        .overlay(alignment: .topTrailing) {
-                            if item.id == 3 && settingsBadgeCount > 0 {
-                                Circle()
-                                    .fill(Color.red)
-                                    .frame(width: 7, height: 7)
-                                    .overlay(Circle().stroke(Color.black.opacity(0.25), lineWidth: 0.75))
-                                    .offset(x: 4, y: -1)
-                            }
-                        }
                         .scaleEffect(iconScale)
                         .offset(y: showLabels ? -7.5 : 0)
 
@@ -3009,7 +3011,6 @@ private struct AdaptiveFloatingBottomChrome: View {
                     PrimaryTabsCapsuleBar(
                         selectedTab: $selectedTab,
                         lastPrimaryTab: lastPrimaryTab,
-                        settingsBadgeCount: app.availablePluginUpdateCount,
                         isCompactHeight: isCompactWithoutTrack,
                         isCollapsedToCircle: isCompactRow,
                         expandedWidth: fullExpandedTabWidth,
@@ -3159,10 +3160,11 @@ public struct MainView: View {
         let tabArg = args.first(where: { $0.hasPrefix("-MyGoTab:") })?
             .split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_TAB"]
         if let tabArg, let tab = Int(tabArg), (0...3).contains(tab) {
-            _selectedTab = State(initialValue: tab)
-            _activatedTabs = State(initialValue: [tab])
-            if MainTabMapping.slotIndex(for: tab) != nil {
-                _lastPrimaryTab = State(initialValue: tab)
+            let resolvedTab = (tab == 3) ? 0 : tab
+            _selectedTab = State(initialValue: resolvedTab)
+            _activatedTabs = State(initialValue: [resolvedTab])
+            if MainTabMapping.slotIndex(for: resolvedTab) != nil {
+                _lastPrimaryTab = State(initialValue: resolvedTab)
             }
         }
         #endif
@@ -3229,7 +3231,6 @@ public struct MainView: View {
                 tabViewport(index: 0) { HomeView() }
                 tabViewport(index: 1) { SearchView() }
                 tabViewport(index: 2) { LibraryView() }
-                tabViewport(index: 3) { SettingsView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .environment(\.mygoBottomOverlayInset, bottomScrollExtraInset)
@@ -3429,11 +3430,7 @@ public struct MainView: View {
         Task { @MainActor in
             await app.waitUntilStartupReady()
             if let tabArg, let tab = Int(tabArg), (0...3).contains(tab) {
-                activatedTabs.insert(tab)
-                selectedTab = tab
-                if MainTabMapping.slotIndex(for: tab) != nil {
-                    lastPrimaryTab = tab
-                }
+                applyDebugTabSelection(tab)
             }
             guard shouldOpen else { return }
             // 等待 UIWindowScene 首帧完全挂载，避免 fullScreenCover 被吞掉
@@ -3474,13 +3471,27 @@ public struct MainView: View {
         return true
     }
 
+    private func applyDebugTabSelection(_ tab: Int) {
+        if tab == 3 {
+            activatedTabs.insert(0)
+            selectedTab = 0
+            lastPrimaryTab = 0
+            // 推入首页 NavigationStack 中的设置页，兼容原有 DEBUG tab=3 联调参数
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .mygoOpenSettings, object: nil)
+            }
+            return
+        }
+        activatedTabs.insert(tab)
+        selectedTab = tab
+        if MainTabMapping.slotIndex(for: tab) != nil {
+            lastPrimaryTab = tab
+        }
+    }
+
     private func applyDebugQuery(_ query: [String: String]) {
         if let tabStr = query["tab"], let tab = Int(tabStr), (0...3).contains(tab) {
-            activatedTabs.insert(tab)
-            selectedTab = tab
-            if MainTabMapping.slotIndex(for: tab) != nil {
-                lastPrimaryTab = tab
-            }
+            applyDebugTabSelection(tab)
         }
         if let minStr = query["minimized"]?.lowercased() {
             if minStr == "1" || minStr == "true" {
