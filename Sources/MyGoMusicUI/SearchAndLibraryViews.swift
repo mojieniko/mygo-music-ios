@@ -104,9 +104,13 @@ public struct SearchView: View {
                     .padding(.vertical, 10)
                 }
                 .scrollDismissesKeyboard(.interactively)
+                .mygoTrackVerticalScroll()
             }
             .onChange(of: app.activeSourceID) { _, _ in
                 dismissSearchKeyboard()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .mygoFocusSearchField)) { _ in
+                isSearchFieldFocused = true
             }
             .onDisappear {
                 dismissSearchKeyboard()
@@ -529,6 +533,7 @@ public struct LibraryView: View {
                     }
                 }
             }
+            .mygoTrackVerticalScroll()
             .navigationTitle(I18n.t("Library"))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

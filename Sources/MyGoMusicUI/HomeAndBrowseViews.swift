@@ -107,6 +107,7 @@ public struct HomeView: View {
                 }
                 .padding(.vertical, 16)
             }
+            .mygoTrackVerticalScroll()
             .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "home") ?? I18n.t("Home"))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -649,6 +650,7 @@ public struct BrowsePageView: View {
             }
             .padding(.vertical, 12)
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(browseData?.title ?? fallbackTitle ?? I18n.t("Discover"))
         .task {
             isLoading = true
@@ -725,6 +727,7 @@ public struct SectionTracksPageView: View {
             }
             .padding(.vertical, 12)
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(title)
     }
 }
@@ -828,6 +831,7 @@ public struct AlbumDetailView: View {
                 }
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(albumPage?.album.name ?? fallbackName)
         .task {
             isLoading = true
@@ -1047,6 +1051,7 @@ public struct ArtistDetailView: View {
                 .frame(maxWidth: .infinity, minHeight: 260)
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(artistPage?.artist.name ?? fallbackName)
         .task {
             await loadArtistDetails()
@@ -1209,6 +1214,7 @@ public struct PlaylistDetailView: View {
                 }
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(playlistData?.name ?? fallbackName)
         .toolbar {
             if let pl = playlistData, pl.mine == true,
@@ -1333,6 +1339,7 @@ public struct PodcastShowDetailView: View {
                 }
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(showPage?.show.name ?? fallbackName)
         .task {
             isLoading = true
@@ -1411,6 +1418,7 @@ public struct SavedAlbumsPageView: View {
                 .padding(16)
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "savedAlbums") ?? I18n.t("Saved Albums"))
     }
 }
@@ -1444,6 +1452,7 @@ public struct StationsPageView: View {
                 .padding(16)
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "stations") ?? I18n.t("Stations"))
     }
 }
@@ -1474,6 +1483,7 @@ public struct SubscribedPodcastsPageView: View {
                 .padding(16)
             }
         }
+        .mygoTrackVerticalScroll()
         .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "shows") ?? I18n.t("Podcasts"))
     }
 }

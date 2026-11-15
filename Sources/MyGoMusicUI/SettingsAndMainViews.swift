@@ -329,6 +329,7 @@ public struct SettingsView: View {
                     }
                 }
             }
+            .mygoTrackVerticalScroll()
             .navigationTitle(I18n.t("Settings"))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -799,32 +800,145 @@ private struct PluginSettingFieldRow: View {
     }
 }
 
-// MARK: - 底部悬浮迷你播放条（对应 ui_player.go 中的 playerBar）
+// MARK: - Liquid Glass 通透玻璃表面（对标 Apple Music iOS 26 悬浮胶囊光学质感）
+
+private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
+    let shape: S
+    let isHighlighted: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                ZStack {
+                    shape
+                        .fill(.ultraThinMaterial)
+                    shape
+                        .fill(tintOverlay)
+                    shape
+                        .fill(specularInnerSheen)
+                }
+            }
+            .clipShape(shape)
+            .overlay(
+                shape
+                    .strokeBorder(borderGradient, lineWidth: colorScheme == .dark ? 0.9 : 1.0)
+            )
+            .shadow(
+                color: .black.opacity(colorScheme == .dark ? 0.36 : 0.095),
+                radius: 18,
+                x: 0,
+                y: 7
+            )
+            .shadow(
+                color: .black.opacity(colorScheme == .dark ? 0.16 : 0.04),
+                radius: 3.5,
+                x: 0,
+                y: 1.5
+            )
+    }
+
+    private var tintOverlay: Color {
+        if colorScheme == .dark {
+            return Color(white: 0.15).opacity(isHighlighted ? 0.32 : 0.24)
+        }
+        return Color.white.opacity(isHighlighted ? 0.36 : 0.22)
+    }
+
+    private var specularInnerSheen: LinearGradient {
+        if colorScheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color.white.opacity(0.14),
+                    Color.white.opacity(0.015),
+                    Color.clear,
+                    Color.white.opacity(0.07)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        return LinearGradient(
+            colors: [
+                Color.white.opacity(0.48),
+                Color.white.opacity(0.08),
+                Color.clear,
+                Color.white.opacity(0.26)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private var borderGradient: LinearGradient {
+        if colorScheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color.white.opacity(0.44),
+                    Color.white.opacity(0.11),
+                    Color.white.opacity(0.06),
+                    Color.white.opacity(0.26)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        return LinearGradient(
+            colors: [
+                Color.white.opacity(0.95),
+                Color.white.opacity(0.35),
+                Color.white.opacity(0.20),
+                Color.white.opacity(0.75)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
+
+private extension View {
+    func mygoLiquidGlass<S: InsettableShape>(in shape: S, isHighlighted: Bool = false) -> some View {
+        modifier(LiquidGlassSurfaceModifier(shape: shape, isHighlighted: isHighlighted))
+    }
+}
+
+// MARK: - 底部悬浮迷你播放条（对应 ui_player.go 中的 playerBar，支持 iOS 26 随滚动嵌合形态）
 
 public struct MiniPlayerBarView: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.colorScheme) private var colorScheme
 
-    public init() {}
+    public let isCompact: Bool
+
+    public init(isCompact: Bool = false) {
+        self.isCompact = isCompact
+    }
 
     public var body: some View {
         if let track = app.player.currentTrack {
-            VStack(spacing: 0) {
-                HStack(spacing: 12) {
+            let capsuleShape = Capsule(style: .continuous)
+            let barHeight = isCompact
+                ? FloatingTabBarMetrics.compactBarHeight
+                : FloatingTabBarMetrics.miniExpandedHeight
+            let artworkSize: CGFloat = isCompact ? 32 : 36
+            let artworkRadius: CGFloat = isCompact ? 7 : 8
+
+            ZStack(alignment: .bottom) {
+                HStack(spacing: isCompact ? 9 : 11) {
                     ArtworkView(
                         urlString: track.album.imageUrl,
                         pixelSize: 160,
-                        size: 44,
-                        cornerRadius: 8
+                        size: artworkSize,
+                        cornerRadius: artworkRadius
                     )
-                    .shadow(color: .black.opacity(0.18), radius: 5, x: 0, y: 2)
+                    .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 1.5)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: isCompact ? 1 : 2) {
+                        HStack(spacing: 5) {
                             Text(track.name)
-                                .font(.system(size: 14.5, weight: .semibold))
+                                .font(.system(size: isCompact ? 13.5 : 14.5, weight: .semibold))
                                 .lineLimit(1)
-                            if let radio = app.player.radioName, !radio.isEmpty {
+                            if !isCompact, let radio = app.player.radioName, !radio.isEmpty {
                                 Image(systemName: "dot.radiowaves.left.and.right")
                                     .font(.system(size: 11))
                                     .foregroundStyle(MyGoTheme.accent)
@@ -832,22 +946,25 @@ public struct MiniPlayerBarView: View {
                         }
                         if let errMsg = app.player.errorMessage, !errMsg.isEmpty {
                             Text(errMsg)
-                                .font(.system(size: 11.5, weight: .medium))
+                                .font(.system(size: isCompact ? 10.5 : 11.5, weight: .medium))
                                 .foregroundStyle(.red)
                                 .lineLimit(1)
                         } else {
                             Text(track.artistNames)
-                                .font(.system(size: 12))
+                                .font(.system(size: isCompact ? 11 : 12))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                    EqualizerBarsView(
-                        bands: app.player.audioBands,
-                        isPlaying: app.player.isPlaying
-                    )
+                    if !isCompact {
+                        EqualizerBarsView(
+                            bands: app.player.audioBands,
+                            isPlaying: app.player.isPlaying
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.72)))
+                    }
 
                     Button {
                         if app.player.errorMessage != nil {
@@ -857,113 +974,37 @@ public struct MiniPlayerBarView: View {
                         }
                     } label: {
                         Image(systemName: app.player.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 20, weight: .bold))
+                            .font(.system(size: isCompact ? 17.5 : 19.5, weight: .bold))
                             .foregroundStyle(.primary)
-                            .frame(width: 36, height: 36)
+                            .frame(width: isCompact ? 32 : 34, height: isCompact ? 32 : 34)
                     }
                     .buttonStyle(.plain)
 
-                    Button {
-                        app.player.next()
-                    } label: {
-                        Image(systemName: "forward.fill")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .frame(width: 34, height: 34)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-
-                // 迷你播放条底部的播放进度细线
-                GeometryReader { geo in
-                    let dur = max(app.player.duration, track.durationSeconds, 1)
-                    let livePos = app.player.isPlaying ? app.player.livePlaybackPosition() : app.player.position
-                    let ratio = min(max(livePos / dur, 0), 1)
-                    let rhythm = app.player.sampleAudioRhythm(at: livePos, lines: app.player.lyrics, isScrubbing: false)
-                    let miniLevel = CGFloat(min(1.0, max(0.15, rhythm.bass * 0.7 + rhythm.beatPulse * 0.4)))
-                    ZStack(alignment: .leading) {
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.08))
-                        Rectangle()
-                            .fill(
-                                LinearGradient(
-                                    colors: colorScheme == .dark
-                                        ? [.white.opacity(0.35), .white.opacity(0.90)]
-                                        : [Color.primary.opacity(0.24), Color.primary.opacity(0.54)],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            )
-                            .frame(width: geo.size.width * ratio)
-                    }
-                    .overlay(alignment: .leading) {
-                        if app.settings.smoke && app.player.isPlaying && !app.player.isLoading {
-                            let miniSmokeHeight: CGFloat = 82
-                            ProgressSmokeView(
-                                progress: ratio,
-                                level: miniLevel,
-                                horizontalInset: 0,
-                                scale: 0.56,
-                                useAdditiveBlend: colorScheme == .dark,
-                                tintColor: .white,
-                                isActive: true,
-                                lightSurfaceMode: colorScheme == .light
-                            )
-                            .frame(height: miniSmokeHeight)
-                            .mask {
-                                HStack(spacing: 0) {
-                                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
-                                        .frame(width: 14)
-                                    Rectangle().fill(.black)
-                                }
-                            }
-                            .offset(y: -(miniSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.56)))
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
+                    if !isCompact {
+                        Button {
+                            app.player.next()
+                        } label: {
+                            Image(systemName: "forward.fill")
+                                .font(.system(size: 17, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 32, height: 32)
                         }
+                        .buttonStyle(.plain)
+                        .transition(.opacity.combined(with: .scale(scale: 0.72)))
                     }
                 }
-                .frame(height: 2.5)
+                .padding(.leading, isCompact ? 10 : 12)
+                .padding(.trailing, isCompact ? 10 : 14)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                // 贴合胶囊底缘平直区域的轻柔进度细线与白色拖尾烟雾
+                miniProgressStrip(for: track)
+                    .padding(.horizontal, isCompact ? 24 : 26)
+                    .padding(.bottom, 1.5)
             }
-            .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(.thinMaterial)
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(colorScheme == .dark ? Color(white: 0.15).opacity(0.68) : Color.white.opacity(0.72))
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: colorScheme == .dark
-                                ? [Color.white.opacity(0.24), Color.white.opacity(0.06)]
-                                : [Color.white.opacity(0.92), Color.black.opacity(0.07)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 0.75
-                    )
-            )
-            .shadow(
-                color: .black.opacity(colorScheme == .dark ? 0.32 : 0.08),
-                radius: 18,
-                x: 0,
-                y: 6
-            )
-            .shadow(
-                color: .black.opacity(colorScheme == .dark ? 0.16 : 0.035),
-                radius: 3,
-                x: 0,
-                y: 1
-            )
-            .frame(maxWidth: FloatingTabBarMetrics.maxWidth)
-            .padding(.horizontal, FloatingTabBarMetrics.horizontalPadding)
-            .contentShape(Rectangle())
+            .frame(height: barHeight)
+            .mygoLiquidGlass(in: capsuleShape)
+            .contentShape(capsuleShape)
             .onTapGesture {
                 if app.settings.growFromCover {
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.86)) {
@@ -974,6 +1015,60 @@ public struct MiniPlayerBarView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func miniProgressStrip(for track: Track) -> some View {
+        GeometryReader { geo in
+            let dur = max(app.player.duration, track.durationSeconds, 1)
+            let livePos = app.player.isPlaying ? app.player.livePlaybackPosition() : app.player.position
+            let ratio = min(max(livePos / dur, 0), 1)
+            let rhythm = app.player.sampleAudioRhythm(at: livePos, lines: app.player.lyrics, isScrubbing: false)
+            let miniLevel = CGFloat(min(1.0, max(0.15, rhythm.bass * 0.7 + rhythm.beatPulse * 0.4)))
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(isCompact ? 0.045 : 0.06))
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: colorScheme == .dark
+                                ? [.white.opacity(0.28), .white.opacity(isCompact ? 0.65 : 0.85)]
+                                : [Color.primary.opacity(0.18), Color.primary.opacity(isCompact ? 0.36 : 0.46)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: geo.size.width * ratio)
+            }
+            .overlay(alignment: .leading) {
+                if !isCompact && app.settings.smoke && app.player.isPlaying && !app.player.isLoading {
+                    let miniSmokeHeight: CGFloat = 74
+                    ProgressSmokeView(
+                        progress: ratio,
+                        level: miniLevel,
+                        horizontalInset: 0,
+                        scale: 0.52,
+                        useAdditiveBlend: colorScheme == .dark,
+                        tintColor: .white,
+                        isActive: true,
+                        lightSurfaceMode: colorScheme == .light
+                    )
+                    .frame(height: miniSmokeHeight)
+                    .mask {
+                        HStack(spacing: 0) {
+                            LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                                .frame(width: 14)
+                            Rectangle().fill(.black)
+                        }
+                    }
+                    .offset(y: -(miniSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.52)))
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
+            }
+        }
+        .frame(height: isCompact ? 1.5 : 2)
+        .allowsHitTesting(false)
     }
 }
 
@@ -1268,23 +1363,443 @@ private final class WebSignInCoordinator: NSObject, WKUIDelegate {
     }
 }
 
-// MARK: - 悬浮胶囊底部导航栏（对标现代 iOS 悬浮胶囊底栏与同心选中指示器）
+// MARK: - 悬浮胶囊底部导航栏（对标 Apple Music iOS 26 分体胶囊 + 随滚动嵌入融合动效）
 
-/// 遵循 Apple iOS HIG 与 Liquid Glass 悬浮胶囊规范的底部导航栏尺寸常量
+/// 全局搜索框主动聚焦广播通知
+public extension Notification.Name {
+    static let mygoFocusSearchField = Notification.Name("MyGoFocusSearchField")
+}
+
+/// 遵循 Apple iOS HIG 与 Apple Music iOS 26 悬浮胶囊规范的底部导航栏尺寸常量
 public enum FloatingTabBarMetrics {
     public static let barHeight: CGFloat = 66
     public static let outerInset: CGFloat = 5
     public static let activePillHeight: CGFloat = barHeight - outerInset * 2
     public static let itemSpacing: CGFloat = 4
-    public static let horizontalPadding: CGFloat = 20
+    public static let horizontalPadding: CGFloat = 16
     public static let maxWidth: CGFloat = 428
     public static let iconSize: CGFloat = 21.5
     public static let iconFrameHeight: CGFloat = 24
     public static let iconLabelSpacing: CGFloat = 3
     public static let labelFontSize: CGFloat = 10.5
     public static let overlaySpacing: CGFloat = 10
+    public static let miniExpandedHeight: CGFloat = 56
+    public static let compactBarHeight: CGFloat = 52
+    public static let searchCircleSize: CGFloat = barHeight
+    public static let splitSpacing: CGFloat = 10
+    public static let compactSplitSpacing: CGFloat = 8
     public static let bottomInsetEmptyPlayer: CGFloat = 88
-    public static let bottomInsetWithMiniPlayer: CGFloat = 164
+    public static let bottomInsetWithMiniPlayer: CGFloat = 160
+}
+
+/// 底部导航主浏览页签与独立搜索圆钮之间的槽位映射模型
+public enum MainTabMapping {
+    public static let searchTabID: Int = 1
+    public static let primaryTabIDs: [Int] = [0, 2, 3]
+
+    /// 将全局 Tab ID（0 首页 / 2 音乐库 / 3 设置）映射到左侧主胶囊槽位索引
+    public static func slotIndex(for tabID: Int) -> Int? {
+        primaryTabIDs.firstIndex(of: tabID)
+    }
+
+    /// 将左侧主胶囊槽位索引还原为全局 Tab ID
+    public static func tabID(forSlotIndex slot: Int) -> Int {
+        guard !primaryTabIDs.isEmpty else { return 0 }
+        let clamped = min(max(0, slot), primaryTabIDs.count - 1)
+        return primaryTabIDs[clamped]
+    }
+
+    /// 计算收起至左下角圆形按钮时应当展示的代表性主页签 ID
+    public static func effectivePrimaryTab(selectedTab: Int, lastPrimaryTab: Int) -> Int {
+        if slotIndex(for: selectedTab) != nil {
+            return selectedTab
+        }
+        return slotIndex(for: lastPrimaryTab) != nil ? lastPrimaryTab : (primaryTabIDs.first ?? 0)
+    }
+}
+
+/// 垂直滚动触发底部导航栏折叠/展开状态机（含顶部滞留、方向防抖与触底橡皮筋回弹保护）
+public enum FloatingTabBarMinimizeMath {
+    public static let topAlwaysExpandedOffset: CGFloat = 14
+    public static let minScrollableSpanForCollapse: CGFloat = 60
+    public static let collapseDeltaThreshold: CGFloat = 20
+    public static let expandDeltaThreshold: CGFloat = 16
+    public static let bottomBounceTolerance: CGFloat = 3
+
+    public struct StepResult: Equatable, Sendable {
+        public let isMinimized: Bool
+        public let accumulatedDelta: CGFloat
+
+        public init(isMinimized: Bool, accumulatedDelta: CGFloat) {
+            self.isMinimized = isMinimized
+            self.accumulatedDelta = accumulatedDelta
+        }
+    }
+
+    /// 根据当前垂直偏移与手指交互步进，计算下一时刻导航栏是否收起以及累积偏移量
+    public static func evaluateScrollStep(
+        currentlyMinimized: Bool,
+        accumulatedDelta: CGFloat,
+        normalizedOffsetY: CGFloat,
+        deltaY: CGFloat,
+        maxScrollOffset: CGFloat,
+        isUserInteracting: Bool
+    ) -> StepResult {
+        guard maxScrollOffset >= minScrollableSpanForCollapse,
+              normalizedOffsetY > topAlwaysExpandedOffset else {
+            return StepResult(isMinimized: false, accumulatedDelta: 0)
+        }
+        guard isUserInteracting else {
+            return StepResult(isMinimized: currentlyMinimized, accumulatedDelta: accumulatedDelta)
+        }
+        let isBottomRubberBanding = normalizedOffsetY >= (maxScrollOffset - bottomBounceTolerance) && deltaY < 0
+        if isBottomRubberBanding {
+            return StepResult(isMinimized: currentlyMinimized, accumulatedDelta: 0)
+        }
+        guard abs(deltaY) > 0.25 else {
+            return StepResult(isMinimized: currentlyMinimized, accumulatedDelta: accumulatedDelta)
+        }
+
+        let nextAccum: CGFloat
+        if (accumulatedDelta > 0 && deltaY < 0) || (accumulatedDelta < 0 && deltaY > 0) {
+            nextAccum = deltaY
+        } else {
+            nextAccum = accumulatedDelta + deltaY
+        }
+
+        if !currentlyMinimized && nextAccum >= collapseDeltaThreshold {
+            return StepResult(isMinimized: true, accumulatedDelta: 0)
+        }
+        if currentlyMinimized && nextAccum <= -expandDeltaThreshold {
+            return StepResult(isMinimized: false, accumulatedDelta: 0)
+        }
+        return StepResult(isMinimized: currentlyMinimized, accumulatedDelta: nextAccum)
+    }
+}
+
+/// 垂直滚动偏移采样载荷
+public struct VerticalScrollMetrics: Sendable {
+    public let normalizedOffsetY: CGFloat
+    public let deltaY: CGFloat
+    public let maxScrollOffset: CGFloat
+    public let isUserInteracting: Bool
+
+    public init(
+        normalizedOffsetY: CGFloat,
+        deltaY: CGFloat,
+        maxScrollOffset: CGFloat,
+        isUserInteracting: Bool
+    ) {
+        self.normalizedOffsetY = normalizedOffsetY
+        self.deltaY = deltaY
+        self.maxScrollOffset = maxScrollOffset
+        self.isUserInteracting = isUserInteracting
+    }
+}
+
+private struct VerticalScrollReportKey: EnvironmentKey {
+    static let defaultValue: @MainActor (VerticalScrollMetrics) -> Void = { _ in }
+}
+
+private struct VerticalScrollResetKey: EnvironmentKey {
+    static let defaultValue: @MainActor () -> Void = {}
+}
+
+public extension EnvironmentValues {
+    var mygoReportVerticalScroll: @MainActor (VerticalScrollMetrics) -> Void {
+        get { self[VerticalScrollReportKey.self] }
+        set { self[VerticalScrollReportKey.self] = newValue }
+    }
+
+    var mygoResetScrollTracker: @MainActor () -> Void {
+        get { self[VerticalScrollResetKey.self] }
+        set { self[VerticalScrollResetKey.self] = newValue }
+    }
+}
+
+@MainActor
+private final class TabBarScrollCoordinator: ObservableObject {
+    @Published var isMinimized: Bool = false
+    private var accumulatedDelta: CGFloat = 0
+
+    func handleScroll(_ metrics: VerticalScrollMetrics) {
+        // 过滤瞬间尺寸重构造成的大跨度跳变
+        guard abs(metrics.deltaY) < 220 else {
+            if metrics.normalizedOffsetY <= FloatingTabBarMinimizeMath.topAlwaysExpandedOffset {
+                setMinimized(false)
+            }
+            accumulatedDelta = 0
+            return
+        }
+        let step = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: isMinimized,
+            accumulatedDelta: accumulatedDelta,
+            normalizedOffsetY: metrics.normalizedOffsetY,
+            deltaY: metrics.deltaY,
+            maxScrollOffset: metrics.maxScrollOffset,
+            isUserInteracting: metrics.isUserInteracting
+        )
+        accumulatedDelta = step.accumulatedDelta
+        setMinimized(step.isMinimized)
+    }
+
+    func expand() {
+        accumulatedDelta = 0
+        setMinimized(false)
+    }
+
+    func resetAccumulatorAndExpand() {
+        accumulatedDelta = 0
+        setMinimized(false)
+    }
+
+    private func setMinimized(_ minimized: Bool) {
+        guard isMinimized != minimized else { return }
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.85)) {
+            isMinimized = minimized
+        }
+    }
+}
+
+#if canImport(UIKit)
+private struct VerticalScrollProbeRepresentable: UIViewRepresentable {
+    let onScroll: @MainActor (VerticalScrollMetrics) -> Void
+
+    func makeUIView(context: Context) -> VerticalScrollProbeUIView {
+        let view = VerticalScrollProbeUIView()
+        view.onScroll = onScroll
+        return view
+    }
+
+    func updateUIView(_ uiView: VerticalScrollProbeUIView, context: Context) {
+        uiView.onScroll = onScroll
+        uiView.scheduleAttachIfNeeded()
+    }
+}
+
+private final class VerticalScrollProbeUIView: UIView {
+    var onScroll: (@MainActor (VerticalScrollMetrics) -> Void)?
+    private weak var observedScrollView: UIScrollView?
+    private var contentOffsetObservation: NSKeyValueObservation?
+    private var retryGeneration: Int = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        contentOffsetObservation?.invalidate()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            detach()
+        } else {
+            scheduleAttachIfNeeded()
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scheduleAttachIfNeeded()
+    }
+
+    func scheduleAttachIfNeeded() {
+        guard observedScrollView == nil, window != nil else { return }
+        attachNow()
+        guard observedScrollView == nil else { return }
+
+        retryGeneration += 1
+        let gen = retryGeneration
+        for delay in [0.05, 0.20, 0.50, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      self.retryGeneration == gen,
+                      self.observedScrollView == nil,
+                      self.window != nil else { return }
+                self.attachNow()
+            }
+        }
+    }
+
+    private func detach() {
+        retryGeneration += 1
+        contentOffsetObservation?.invalidate()
+        contentOffsetObservation = nil
+        observedScrollView = nil
+    }
+
+    private func attachNow() {
+        guard observedScrollView == nil, let sv = findTargetVerticalScrollView() else { return }
+        observedScrollView = sv
+        contentOffsetObservation = sv.observe(\.contentOffset, options: [.new, .old]) { [weak self] scrollView, change in
+            guard let self,
+                  self.window != nil,
+                  scrollView.window != nil,
+                  self.isViewVisibleInHierarchy(self),
+                  scrollView.bounds.height > 0 else { return }
+
+            let oldY = change.oldValue?.y ?? scrollView.contentOffset.y
+            let newY = change.newValue?.y ?? scrollView.contentOffset.y
+            let delta = newY - oldY
+            let insetTop = scrollView.adjustedContentInset.top
+            let insetBottom = scrollView.adjustedContentInset.bottom
+            let normalizedY = newY + insetTop
+            let maxOffset = max(0, scrollView.contentSize.height + insetTop + insetBottom - scrollView.bounds.height)
+            let isInteracting = scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating
+            let metrics = VerticalScrollMetrics(
+                normalizedOffsetY: normalizedY,
+                deltaY: delta,
+                maxScrollOffset: maxOffset,
+                isUserInteracting: isInteracting
+            )
+            DispatchQueue.main.async { [weak self] in
+                self?.onScroll?(metrics)
+            }
+        }
+    }
+
+    private func isViewVisibleInHierarchy(_ target: UIView) -> Bool {
+        var current: UIView? = target
+        while let v = current {
+            if v.isHidden || v.alpha < 0.05 {
+                return false
+            }
+            if v is UIWindow {
+                break
+            }
+            current = v.superview
+        }
+        return true
+    }
+
+    private func nearestViewController() -> UIViewController? {
+        var responder: UIResponder? = self
+        while let next = responder?.next {
+            if let vc = next as? UIViewController {
+                return vc
+            }
+            responder = next
+        }
+        return nil
+    }
+
+    private func findTargetVerticalScrollView() -> UIScrollView? {
+        // 1. 优先沿父视图链上溯查找自身直接嵌套于其中的纵向 ScrollView
+        var ancestor = superview
+        while let current = ancestor {
+            if let sv = current as? UIScrollView, isPrimaryVerticalScrollView(sv) {
+                return sv
+            }
+            ancestor = current.superview
+        }
+
+        // 2. 在当前页面级 ViewController 子树中做广度优先与坐标重合匹配（仅忽略明显隐身分支）
+        let probeFrame = convert(bounds, to: window)
+        if let vc = nearestViewController(),
+           !(vc.parent == nil && vc.presentingViewController == nil && type(of: vc).description().contains("UIHostingController")),
+           let vcRoot = vc.view,
+           let match = bestVerticalScrollView(in: vcRoot, matchingFrameInWindow: probeFrame, requireVisible: false) {
+            return match
+        }
+
+        // 3. 当退回到跨 Tab 共享的根托管视图控制器时，严格过滤隐藏 Tab 分支后按区域重叠寻找主纵向滚动视图
+        var searchRoot: UIView? = superview
+        for _ in 0..<8 {
+            guard let root = searchRoot else { break }
+            if let match = bestVerticalScrollView(in: root, matchingFrameInWindow: probeFrame, requireVisible: true) {
+                return match
+            }
+            if root === window { break }
+            searchRoot = root.superview
+        }
+        return nil
+    }
+
+    private func bestVerticalScrollView(
+        in root: UIView,
+        matchingFrameInWindow probeFrame: CGRect,
+        requireVisible: Bool
+    ) -> UIScrollView? {
+        if requireVisible && (root.isHidden || root.alpha < 0.05) {
+            return nil
+        }
+        var queue: [UIView] = [root]
+        var index = 0
+        var bestMatch: UIScrollView?
+        var bestScore: CGFloat = -1
+
+        while index < queue.count {
+            let current = queue[index]
+            index += 1
+            if requireVisible && (current.isHidden || current.alpha < 0.05) {
+                continue
+            }
+            if let sv = current as? UIScrollView,
+               isPrimaryVerticalScrollView(sv),
+               (!requireVisible || isViewVisibleInHierarchy(sv)) {
+                let svFrame = sv.convert(sv.bounds, to: window)
+                if probeFrame.isEmpty || probeFrame.width < 4 || probeFrame.height < 4 {
+                    return sv
+                }
+                let overlap = svFrame.intersection(probeFrame)
+                if !overlap.isNull && overlap.width > 10 && overlap.height > 10 {
+                    let area = overlap.width * overlap.height
+                    if area > bestScore {
+                        bestScore = area
+                        bestMatch = sv
+                    }
+                }
+            }
+            queue.append(contentsOf: current.subviews)
+        }
+        return bestMatch
+    }
+
+    private func isPrimaryVerticalScrollView(_ sv: UIScrollView) -> Bool {
+        if sv.alwaysBounceHorizontal && !sv.alwaysBounceVertical {
+            return false
+        }
+        if sv.contentSize.width > sv.bounds.width + 8 && sv.contentSize.height <= sv.bounds.height + 2 {
+            return false
+        }
+        return sv.bounds.height >= 160
+    }
+}
+#endif
+
+private struct VerticalScrollTrackingModifier: ViewModifier {
+    @Environment(\.mygoReportVerticalScroll) private var reportVerticalScroll
+    @Environment(\.mygoResetScrollTracker) private var resetScrollTracker
+
+    func body(content: Content) -> some View {
+        content
+            #if canImport(UIKit)
+            .background(
+                VerticalScrollProbeRepresentable { metrics in
+                    reportVerticalScroll(metrics)
+                }
+                .allowsHitTesting(false)
+            )
+            #endif
+            .onAppear {
+                resetScrollTracker()
+            }
+    }
+}
+
+public extension View {
+    /// 追踪当前页面主纵向滚动视图的上下滑动方向，驱动底部胶囊与迷你播放条自动融合/展开
+    func mygoTrackVerticalScroll() -> some View {
+        modifier(VerticalScrollTrackingModifier())
+    }
 }
 
 /// 悬浮胶囊导航栏滑块几何与手势切换计算模型
@@ -1373,89 +1888,118 @@ private struct MainTabItem: Identifiable {
     let selectedIcon: String
 }
 
-private struct FloatingCapsuleTabBar: View {
+private struct PrimaryTabsCapsuleBar: View {
     @Binding var selectedTab: Int
+    let lastPrimaryTab: Int
+    let isCompactHeight: Bool
+    let isCollapsedToCircle: Bool
+    let targetWidth: CGFloat
+    let targetHeight: CGFloat
     let onSelect: (Int) -> Void
+    let onExpandFromCircle: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var barWidth: CGFloat = 0
     @State private var pillCenterX: CGFloat? = nil
-    @State private var hoveredTab: Int? = nil
-    @State private var pressedTab: Int? = nil
+    @State private var hoveredSlot: Int? = nil
+    @State private var pressedSlot: Int? = nil
     @State private var isDraggingPill: Bool = false
     @State private var grabOffset: CGFloat = 0
     @State private var didLockStartState: Bool = false
     @State private var cancelledGesture: Bool = false
     @State private var hapticCount: Int = 0
-    @State private var lastHapticTab: Int? = nil
+    @State private var lastHapticSlot: Int? = nil
 
     private let items: [MainTabItem] = [
         MainTabItem(id: 0, titleKey: "Home", icon: "house", selectedIcon: "house.fill"),
-        MainTabItem(id: 1, titleKey: "Search", icon: "magnifyingglass", selectedIcon: "magnifyingglass"),
         MainTabItem(id: 2, titleKey: "Library", icon: "music.note.list", selectedIcon: "music.note.list"),
         MainTabItem(id: 3, titleKey: "Settings", icon: "gearshape", selectedIcon: "gearshape.fill")
     ]
 
     var body: some View {
-        let activeHighlightTab = isDraggingPill ? (hoveredTab ?? selectedTab) : selectedTab
-        let pillWidth = FloatingTabBarSliderMath.slotWidth(barWidth: barWidth, count: items.count)
+        let effectivePrimaryID = MainTabMapping.effectivePrimaryTab(
+            selectedTab: selectedTab,
+            lastPrimaryTab: lastPrimaryTab
+        )
+        let selectedSlot = MainTabMapping.slotIndex(for: selectedTab)
+        let effectiveSlot = MainTabMapping.slotIndex(for: effectivePrimaryID) ?? 0
+        let activeHighlightSlot: Int? = isDraggingPill ? (hoveredSlot ?? selectedSlot) : selectedSlot
+
+        let activeBarWidth = barWidth > 0 ? barWidth : targetWidth
+        let pillWidth = FloatingTabBarSliderMath.slotWidth(barWidth: activeBarWidth, count: items.count)
         let restCenterX = FloatingTabBarSliderMath.slotCenterX(
-            index: selectedTab,
-            barWidth: barWidth,
+            index: selectedSlot ?? effectiveSlot,
+            barWidth: activeBarWidth,
             count: items.count
         )
         let displayCenterX = (isDraggingPill ? pillCenterX : nil) ?? restCenterX
+        let showActivePill = !isCollapsedToCircle && (selectedSlot != nil || isDraggingPill)
+        let innerHeight = max(36, targetHeight - FloatingTabBarMetrics.outerInset * 2)
 
-        HStack(spacing: FloatingTabBarMetrics.itemSpacing) {
-            ForEach(items) { item in
-                let isSelected = (activeHighlightTab == item.id)
-                let isPressingInactive = (!isDraggingPill && pressedTab == item.id && item.id != selectedTab)
-                VStack(spacing: FloatingTabBarMetrics.iconLabelSpacing) {
-                    Image(systemName: isSelected ? item.selectedIcon : item.icon)
-                        .font(.system(size: FloatingTabBarMetrics.iconSize, weight: isSelected ? .semibold : .medium))
-                        .frame(height: FloatingTabBarMetrics.iconFrameHeight)
-                        .scaleEffect(isSelected ? (isDraggingPill ? 1.07 : 1.03) : (isPressingInactive ? 0.94 : 1.0))
+        ZStack {
+            if !isCollapsedToCircle && activeBarWidth > 40 {
+                activeIndicatorPill(width: pillWidth, height: innerHeight)
+                    .position(x: displayCenterX, y: targetHeight * 0.5)
+                    .opacity(showActivePill ? 1 : 0)
+                    .scaleEffect(showActivePill ? 1 : 0.85)
+                    .allowsHitTesting(false)
+            }
 
-                    Text(I18n.t(item.titleKey))
-                        .font(.system(size: FloatingTabBarMetrics.labelFontSize, weight: isSelected ? .semibold : .medium))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.85)
-                }
-                .foregroundStyle(foregroundColor(isSelected: isSelected))
-                .opacity(isPressingInactive ? 0.72 : 1.0)
-                .frame(maxWidth: .infinity)
-                .frame(height: FloatingTabBarMetrics.activePillHeight)
-                .contentShape(Capsule(style: .continuous))
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel(I18n.t(item.titleKey))
-                .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
-                .accessibilityAction {
-                    onSelect(item.id)
+            HStack(spacing: isCollapsedToCircle ? 0 : FloatingTabBarMetrics.itemSpacing) {
+                ForEach(Array(items.enumerated()), id: \.element.id) { slotIndex, item in
+                    let shouldShowItem = !isCollapsedToCircle || item.id == effectivePrimaryID
+                    if shouldShowItem {
+                        let isSelected = (activeHighlightSlot == slotIndex)
+                        let isPrimaryInCircle = isCollapsedToCircle && (selectedTab == item.id)
+                        let isHighlight = isCollapsedToCircle ? isPrimaryInCircle : isSelected
+                        let isPressingInactive = (!isCollapsedToCircle && !isDraggingPill && pressedSlot == slotIndex && selectedSlot != slotIndex)
+
+                        VStack(spacing: isCollapsedToCircle || isCompactHeight ? 0 : FloatingTabBarMetrics.iconLabelSpacing) {
+                            Image(systemName: isHighlight ? item.selectedIcon : item.icon)
+                                .font(.system(
+                                    size: isCollapsedToCircle || isCompactHeight ? 20 : FloatingTabBarMetrics.iconSize,
+                                    weight: isHighlight ? .semibold : .medium
+                                ))
+                                .frame(height: FloatingTabBarMetrics.iconFrameHeight)
+                                .scaleEffect(
+                                    isHighlight
+                                        ? (isDraggingPill ? 1.07 : 1.03)
+                                        : (isPressingInactive ? 0.94 : 1.0)
+                                )
+
+                            if !isCollapsedToCircle && !isCompactHeight {
+                                Text(I18n.t(item.titleKey))
+                                    .font(.system(
+                                        size: FloatingTabBarMetrics.labelFontSize,
+                                        weight: isHighlight ? .semibold : .medium
+                                    ))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.82)))
+                            }
+                        }
+                        .foregroundStyle(foregroundColor(isSelected: isHighlight))
+                        .opacity(isPressingInactive ? 0.72 : 1.0)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Capsule(style: .continuous))
+                        .transition(.opacity.combined(with: .scale(scale: 0.5)))
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(I18n.t(item.titleKey))
+                        .accessibilityAddTraits(isHighlight ? [.isButton, .isSelected] : [.isButton])
+                        .accessibilityAction {
+                            if isCollapsedToCircle {
+                                onExpandFromCircle()
+                            } else {
+                                onSelect(item.id)
+                            }
+                        }
+                    }
                 }
             }
+            .padding(isCollapsedToCircle ? 0 : FloatingTabBarMetrics.outerInset)
         }
-        .padding(FloatingTabBarMetrics.outerInset)
-        .frame(height: FloatingTabBarMetrics.barHeight)
-        .background {
-            ZStack {
-                Capsule(style: .continuous)
-                    .fill(.thinMaterial)
-                Capsule(style: .continuous)
-                    .fill(capsuleSurfaceColor)
-
-                // 跟手可滑动的 Liquid Glass 选中胶囊药丸
-                if barWidth > 0 {
-                    activeIndicatorPill(width: pillWidth)
-                        .position(x: displayCenterX, y: FloatingTabBarMetrics.barHeight * 0.5)
-                        .clipShape(Capsule(style: .continuous))
-                        .allowsHitTesting(false)
-                }
-            }
-        }
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(capsuleBorderGradient, lineWidth: 0.85)
-        )
+        .frame(width: targetWidth, height: targetHeight)
+        .mygoLiquidGlass(in: Capsule(style: .continuous), isHighlighted: isCollapsedToCircle && selectedSlot != nil)
         .background {
             GeometryReader { proxy in
                 Color.clear
@@ -1468,40 +2012,41 @@ private struct FloatingCapsuleTabBar: View {
             }
         }
         .contentShape(Capsule(style: .continuous))
-        .gesture(
+        .onTapGesture {
+            guard isCollapsedToCircle else { return }
+            hapticCount += 1
+            onExpandFromCircle()
+        }
+        .simultaneousGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
                 .onChanged { value in
-                    handleDragChanged(value)
+                    guard !isCollapsedToCircle else { return }
+                    handleDragChanged(value, selectedSlot: selectedSlot, activeBarWidth: activeBarWidth)
                 }
                 .onEnded { value in
-                    handleDragEnded(value)
+                    guard !isCollapsedToCircle else {
+                        resetDragTransientState()
+                        return
+                    }
+                    handleDragEnded(value, selectedSlot: selectedSlot, activeBarWidth: activeBarWidth)
                 }
         )
+        .onChange(of: isCollapsedToCircle) { _, collapsed in
+            if collapsed {
+                resetDragTransientState()
+            }
+        }
         .sensoryFeedback(.selection, trigger: hapticCount)
-        .shadow(
-            color: .black.opacity(colorScheme == .dark ? 0.36 : 0.085),
-            radius: 22,
-            x: 0,
-            y: 8
-        )
-        .shadow(
-            color: .black.opacity(colorScheme == .dark ? 0.18 : 0.04),
-            radius: 4,
-            x: 0,
-            y: 1.5
-        )
-        .frame(maxWidth: FloatingTabBarMetrics.maxWidth)
-        .padding(.horizontal, FloatingTabBarMetrics.horizontalPadding)
     }
 
-    private func activeIndicatorPill(width: CGFloat) -> some View {
+    private func activeIndicatorPill(width: CGFloat, height: CGFloat) -> some View {
         ZStack {
             Capsule(style: .continuous)
                 .fill(isDraggingPill ? draggingPillColor : activePillColor)
             Capsule(style: .continuous)
-                .strokeBorder(activePillBorderGradient, lineWidth: isDraggingPill ? 0.9 : 0.6)
+                .strokeBorder(activePillBorderGradient, lineWidth: isDraggingPill ? 0.9 : 0.65)
         }
-        .frame(width: max(40, width), height: FloatingTabBarMetrics.activePillHeight)
+        .frame(width: max(40, width), height: height)
         .scaleEffect(x: isDraggingPill ? 1.07 : 1.0, y: isDraggingPill ? 1.11 : 1.0)
         .shadow(
             color: .black.opacity(isDraggingPill ? (colorScheme == .dark ? 0.28 : 0.09) : 0),
@@ -1512,22 +2057,32 @@ private struct FloatingCapsuleTabBar: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isDraggingPill)
     }
 
-    private func handleDragChanged(_ value: DragGesture.Value) {
-        guard barWidth > 0 else { return }
+    private func resetDragTransientState() {
+        didLockStartState = false
+        cancelledGesture = false
+        pressedSlot = nil
+        lastHapticSlot = nil
+        isDraggingPill = false
+        pillCenterX = nil
+        hoveredSlot = nil
+    }
+
+    private func handleDragChanged(_ value: DragGesture.Value, selectedSlot: Int?, activeBarWidth: CGFloat) {
+        guard activeBarWidth > 0 else { return }
         if !didLockStartState {
             didLockStartState = true
             cancelledGesture = false
-            lastHapticTab = nil
-            let startTab = FloatingTabBarSliderMath.tabIndex(
+            lastHapticSlot = nil
+            let startSlot = FloatingTabBarSliderMath.tabIndex(
                 forX: value.startLocation.x,
-                barWidth: barWidth,
+                barWidth: activeBarWidth,
                 count: items.count
             )
-            pressedTab = startTab
-            if startTab == selectedTab {
+            pressedSlot = startSlot
+            if let currentSlot = selectedSlot, startSlot == currentSlot {
                 grabOffset = FloatingTabBarSliderMath.slotCenterX(
-                    index: selectedTab,
-                    barWidth: barWidth,
+                    index: currentSlot,
+                    barWidth: activeBarWidth,
                     count: items.count
                 ) - value.startLocation.x
             } else {
@@ -1538,168 +2093,151 @@ private struct FloatingCapsuleTabBar: View {
         guard !cancelledGesture else { return }
 
         if !isDraggingPill {
-            // 未进入横向滑动前若明显竖向滑出，视为取消
             if abs(value.translation.height) > 36 && abs(value.translation.height) > abs(value.translation.width) * 1.3 {
                 cancelledGesture = true
-                pressedTab = nil
+                pressedSlot = nil
                 return
             }
             if abs(value.translation.width) >= 6 {
                 isDraggingPill = true
-                pressedTab = nil
+                pressedSlot = nil
                 let rawCenter = value.location.x + grabOffset
                 let clamped = FloatingTabBarSliderMath.clampedPillCenterX(
                     rawX: rawCenter,
-                    barWidth: barWidth,
+                    barWidth: activeBarWidth,
                     count: items.count
                 )
                 let initialHover = FloatingTabBarSliderMath.tabIndex(
                     forX: clamped,
-                    barWidth: barWidth,
+                    barWidth: activeBarWidth,
                     count: items.count
                 )
                 withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.84)) {
                     pillCenterX = clamped
-                    hoveredTab = initialHover
+                    hoveredSlot = initialHover
                 }
-                if initialHover != selectedTab {
-                    emitHapticIfNeeded(for: initialHover)
+                if initialHover != selectedSlot {
+                    emitHapticIfNeeded(forSlot: initialHover)
                 }
             }
             return
         }
 
-        // 已进入滑块拖动状态后容忍单指自然弧线抖动，仅极端偏离时取消
         if abs(value.translation.height) > 100 {
             cancelledGesture = true
             withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
                 isDraggingPill = false
                 pillCenterX = nil
-                hoveredTab = nil
+                hoveredSlot = nil
             }
             return
         }
 
         let clamped = FloatingTabBarSliderMath.clampedPillCenterX(
             rawX: value.location.x + grabOffset,
-            barWidth: barWidth,
+            barWidth: activeBarWidth,
             count: items.count
         )
         let nextHover = FloatingTabBarSliderMath.tabIndex(
             forX: clamped,
-            barWidth: barWidth,
+            barWidth: activeBarWidth,
             count: items.count
         )
         pillCenterX = clamped
-        if nextHover != hoveredTab {
+        if nextHover != hoveredSlot {
             withAnimation(.snappy(duration: 0.16)) {
-                hoveredTab = nextHover
+                hoveredSlot = nextHover
             }
-            emitHapticIfNeeded(for: nextHover)
+            emitHapticIfNeeded(forSlot: nextHover)
         }
     }
 
-    private func handleDragEnded(_ value: DragGesture.Value) {
+    private func handleDragEnded(_ value: DragGesture.Value, selectedSlot: Int?, activeBarWidth: CGFloat) {
         let wasDragging = isDraggingPill
         let wasCancelled = cancelledGesture
-        let previousHapticTab = lastHapticTab
+        let previousHapticSlot = lastHapticSlot
+        let currentBaseSlot = selectedSlot ?? FloatingTabBarSliderMath.tabIndex(
+            forX: value.startLocation.x,
+            barWidth: activeBarWidth,
+            count: items.count
+        )
         let fallbackCenter = pillCenterX ?? FloatingTabBarSliderMath.slotCenterX(
-            index: selectedTab,
-            barWidth: barWidth,
+            index: currentBaseSlot,
+            barWidth: activeBarWidth,
             count: items.count
         )
         didLockStartState = false
         cancelledGesture = false
-        pressedTab = nil
-        lastHapticTab = nil
+        pressedSlot = nil
+        lastHapticSlot = nil
 
         guard !wasCancelled else {
             withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
                 isDraggingPill = false
                 pillCenterX = nil
-                hoveredTab = nil
+                hoveredSlot = nil
             }
             return
         }
 
-        let targetTab: Int
+        let targetSlot: Int
         if wasDragging {
-            targetTab = FloatingTabBarSliderMath.resolvedTargetTab(
-                selectedTab: selectedTab,
+            targetSlot = FloatingTabBarSliderMath.resolvedTargetTab(
+                selectedTab: currentBaseSlot,
                 pillCenterX: fallbackCenter,
                 translationWidth: value.translation.width,
                 predictedEndTranslationWidth: value.predictedEndTranslation.width,
-                barWidth: barWidth,
+                barWidth: activeBarWidth,
                 count: items.count
             )
         } else {
-            targetTab = FloatingTabBarSliderMath.tabIndex(
+            targetSlot = FloatingTabBarSliderMath.tabIndex(
                 forX: value.location.x,
-                barWidth: barWidth,
+                barWidth: activeBarWidth,
                 count: items.count
             )
         }
 
-        if targetTab != selectedTab && previousHapticTab != targetTab {
+        let targetTabID = MainTabMapping.tabID(forSlotIndex: targetSlot)
+        if targetTabID != selectedTab && previousHapticSlot != targetSlot {
             hapticCount += 1
         }
         withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
             isDraggingPill = false
             pillCenterX = nil
-            hoveredTab = nil
+            hoveredSlot = nil
         }
-        onSelect(targetTab)
+        onSelect(targetTabID)
     }
 
-    private func emitHapticIfNeeded(for tab: Int) {
-        guard lastHapticTab != tab else { return }
-        lastHapticTab = tab
+    private func emitHapticIfNeeded(forSlot slot: Int) {
+        guard lastHapticSlot != slot else { return }
+        lastHapticSlot = slot
         hapticCount += 1
-    }
-
-    private var capsuleSurfaceColor: Color {
-        colorScheme == .dark
-            ? Color(white: 0.14).opacity(0.68)
-            : Color.white.opacity(0.72)
     }
 
     private var activePillColor: Color {
         colorScheme == .dark
             ? Color.white.opacity(0.15)
-            : Color.black.opacity(0.055)
+            : Color.black.opacity(0.065)
     }
 
     private var draggingPillColor: Color {
         colorScheme == .dark
             ? Color.white.opacity(0.24)
-            : Color.white.opacity(0.88)
+            : Color.white.opacity(0.86)
     }
 
     private var activePillBorderGradient: LinearGradient {
         if colorScheme == .dark {
             return LinearGradient(
-                colors: [Color.white.opacity(0.22), Color.white.opacity(0.04)],
+                colors: [Color.white.opacity(0.24), Color.white.opacity(0.05)],
                 startPoint: .top,
                 endPoint: .bottom
             )
         }
         return LinearGradient(
-            colors: [Color.white.opacity(0.80), Color.black.opacity(0.03)],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-    }
-
-    private var capsuleBorderGradient: LinearGradient {
-        if colorScheme == .dark {
-            return LinearGradient(
-                colors: [Color.white.opacity(0.32), Color.white.opacity(0.12), Color.white.opacity(0.05)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-        return LinearGradient(
-            colors: [Color.white.opacity(0.96), Color.white.opacity(0.45), Color.black.opacity(0.08)],
+            colors: [Color.white.opacity(0.85), Color.black.opacity(0.04)],
             startPoint: .top,
             endPoint: .bottom
         )
@@ -1710,8 +2248,158 @@ private struct FloatingCapsuleTabBar: View {
             return MyGoTheme.accent
         }
         return colorScheme == .dark
-            ? Color.white.opacity(0.72)
-            : Color(white: 0.18)
+            ? Color.white.opacity(0.76)
+            : Color(white: 0.16)
+    }
+}
+
+private struct ScalePressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.91 : 1.0)
+            .animation(.spring(response: 0.24, dampingFraction: 0.72), value: configuration.isPressed)
+    }
+}
+
+private struct SearchCircleButton: View {
+    let isSelected: Bool
+    let size: CGFloat
+    let isCompact: Bool
+    let onTap: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                if isSelected {
+                    Circle()
+                        .fill(
+                            colorScheme == .dark
+                                ? Color.white.opacity(0.15)
+                                : Color.black.opacity(0.06)
+                        )
+                        .padding(FloatingTabBarMetrics.outerInset)
+                }
+
+                Image(systemName: "magnifyingglass")
+                    .font(.system(
+                        size: isCompact ? 19.5 : 22,
+                        weight: isSelected ? .bold : .medium
+                    ))
+                    .foregroundStyle(
+                        isSelected
+                            ? MyGoTheme.accent
+                            : (colorScheme == .dark ? Color.white.opacity(0.88) : Color(white: 0.14))
+                    )
+            }
+            .frame(width: size, height: size)
+            .mygoLiquidGlass(in: Circle(), isHighlighted: isSelected)
+        }
+        .buttonStyle(ScalePressButtonStyle())
+        .accessibilityLabel(I18n.t("Search"))
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
+    }
+}
+
+private struct AdaptiveFloatingBottomChrome: View {
+    @EnvironmentObject private var app: AppModel
+    @Binding var selectedTab: Int
+    let lastPrimaryTab: Int
+    let isMinimized: Bool
+    let onSelectTab: (Int) -> Void
+    let onExpandFromCircle: () -> Void
+    let onSearchTap: () -> Void
+
+    @State private var measuredWidth: CGFloat = 360
+
+    var body: some View {
+        let hasTrack = (app.player.currentTrack != nil)
+        let isCompactRow = isMinimized && hasTrack
+        let isCompactWithoutTrack = isMinimized && !hasTrack
+        let rowHeight: CGFloat = isMinimized
+            ? FloatingTabBarMetrics.compactBarHeight
+            : FloatingTabBarMetrics.barHeight
+        let rowSpacing: CGFloat = isCompactRow
+            ? FloatingTabBarMetrics.compactSplitSpacing
+            : FloatingTabBarMetrics.splitSpacing
+        let searchSize = rowHeight
+        let expandedTabWidth = max(160, measuredWidth - rowSpacing - searchSize)
+        let tabWidth = isCompactRow ? rowHeight : expandedTabWidth
+        let miniWidth = isCompactRow
+            ? max(120, measuredWidth - rowHeight * 2 - rowSpacing * 2)
+            : measuredWidth
+        let miniHeight = isCompactRow
+            ? FloatingTabBarMetrics.compactBarHeight
+            : FloatingTabBarMetrics.miniExpandedHeight
+        let miniBottomOffset: CGFloat = isCompactRow
+            ? 0
+            : -(FloatingTabBarMetrics.barHeight + FloatingTabBarMetrics.overlaySpacing)
+        let chromeHeight: CGFloat = hasTrack
+            ? (isCompactRow ? rowHeight : FloatingTabBarMetrics.barHeight + FloatingTabBarMetrics.overlaySpacing + FloatingTabBarMetrics.miniExpandedHeight)
+            : rowHeight
+
+        VStack(spacing: FloatingTabBarMetrics.overlaySpacing) {
+            if let toast = app.toastMessage {
+                Text(toast)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.black.opacity(0.82), in: Capsule())
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            ZStack(alignment: .bottom) {
+                HStack(alignment: .bottom, spacing: rowSpacing) {
+                    PrimaryTabsCapsuleBar(
+                        selectedTab: $selectedTab,
+                        lastPrimaryTab: lastPrimaryTab,
+                        isCompactHeight: isCompactWithoutTrack,
+                        isCollapsedToCircle: isCompactRow,
+                        targetWidth: tabWidth,
+                        targetHeight: rowHeight,
+                        onSelect: onSelectTab,
+                        onExpandFromCircle: onExpandFromCircle
+                    )
+
+                    if isCompactRow {
+                        Color.clear
+                            .frame(width: miniWidth, height: 1)
+                            .allowsHitTesting(false)
+                    }
+
+                    SearchCircleButton(
+                        isSelected: selectedTab == MainTabMapping.searchTabID,
+                        size: searchSize,
+                        isCompact: isMinimized,
+                        onTap: onSearchTap
+                    )
+                }
+                .frame(width: measuredWidth, height: rowHeight, alignment: .bottom)
+
+                if hasTrack {
+                    MiniPlayerBarView(isCompact: isCompactRow)
+                        .frame(width: miniWidth, height: miniHeight)
+                        .offset(y: miniBottomOffset)
+                }
+            }
+            .frame(width: measuredWidth, height: chromeHeight, alignment: .bottom)
+        }
+        .frame(maxWidth: FloatingTabBarMetrics.maxWidth)
+        .padding(.horizontal, FloatingTabBarMetrics.horizontalPadding)
+        .background {
+            GeometryReader { proxy in
+                let innerW = max(240, proxy.size.width - FloatingTabBarMetrics.horizontalPadding * 2)
+                Color.clear
+                    .onAppear {
+                        measuredWidth = innerW
+                    }
+                    .onChange(of: innerW) { _, newW in
+                        measuredWidth = newW
+                    }
+            }
+        }
     }
 }
 
@@ -1719,7 +2407,9 @@ private struct FloatingCapsuleTabBar: View {
 
 public struct MainView: View {
     @EnvironmentObject private var app: AppModel
+    @StateObject private var scrollCoordinator = TabBarScrollCoordinator()
     @State private var selectedTab: Int = 0
+    @State private var lastPrimaryTab: Int = 0
     @State private var activatedTabs: Set<Int> = [0]
     @State private var isKeyboardVisible: Bool = false
 
@@ -1777,29 +2467,32 @@ public struct MainView: View {
                 tabViewport(index: 3) { SettingsView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            // 悬浮于安全区上方的提示胶囊、Mini Player Bar 与悬浮胶囊导航栏（输入法弹起时平滑避让，不遮挡搜索结果）
-            VStack(spacing: FloatingTabBarMetrics.overlaySpacing) {
-                if let toast = app.toastMessage {
-                    Text(toast)
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(.black.opacity(0.82), in: Capsule())
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-
-                MiniPlayerBarView()
-
-                FloatingCapsuleTabBar(selectedTab: $selectedTab) { targetTab in
-                    MyGoKeyboard.dismiss()
-                    activatedTabs.insert(targetTab)
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.78)) {
-                        selectedTab = targetTab
-                    }
-                }
+            .environment(\.mygoReportVerticalScroll) { metrics in
+                scrollCoordinator.handleScroll(metrics)
             }
+            .environment(\.mygoResetScrollTracker) {
+                scrollCoordinator.resetAccumulatorAndExpand()
+            }
+
+            // Apple Music iOS 26 分体悬浮液态玻璃底栏（支持上滑内容后音乐条自动融进底部一行，输入法弹起时平滑避让）
+            AdaptiveFloatingBottomChrome(
+                selectedTab: $selectedTab,
+                lastPrimaryTab: lastPrimaryTab,
+                isMinimized: scrollCoordinator.isMinimized,
+                onSelectTab: { targetTab in
+                    switchToTab(targetTab)
+                },
+                onExpandFromCircle: {
+                    if selectedTab == MainTabMapping.searchTabID {
+                        switchToTab(lastPrimaryTab)
+                    } else {
+                        scrollCoordinator.expand()
+                    }
+                },
+                onSearchTap: {
+                    handleSearchCircleTap()
+                }
+            )
             .padding(.bottom, bottomOverlayPadding)
             .frame(height: isKeyboardVisible ? 0 : nil, alignment: .bottom)
             .opacity(isKeyboardVisible ? 0 : 1)
@@ -1819,8 +2512,12 @@ public struct MainView: View {
             }
         }
         #endif
-        .onChange(of: selectedTab) { _, _ in
+        .onChange(of: selectedTab) { _, newTab in
             MyGoKeyboard.dismiss()
+            if MainTabMapping.slotIndex(for: newTab) != nil {
+                lastPrimaryTab = newTab
+            }
+            scrollCoordinator.resetAccumulatorAndExpand()
         }
         .onChange(of: app.isNowPlayingPresented) { _, presented in
             if presented {
@@ -1861,6 +2558,29 @@ public struct MainView: View {
             }
             #endif
             app.handleDeepLink(url)
+        }
+    }
+
+    private func switchToTab(_ targetTab: Int) {
+        MyGoKeyboard.dismiss()
+        activatedTabs.insert(targetTab)
+        if MainTabMapping.slotIndex(for: targetTab) != nil {
+            lastPrimaryTab = targetTab
+        }
+        scrollCoordinator.resetAccumulatorAndExpand()
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.80)) {
+            selectedTab = targetTab
+        }
+    }
+
+    private func handleSearchCircleTap() {
+        let searchTab = MainTabMapping.searchTabID
+        if selectedTab != searchTab {
+            switchToTab(searchTab)
+        } else if scrollCoordinator.isMinimized {
+            scrollCoordinator.expand()
+        } else {
+            NotificationCenter.default.post(name: .mygoFocusSearchField, object: nil)
         }
     }
 
@@ -1938,6 +2658,18 @@ public struct MainView: View {
         if let tabStr = query["tab"], let tab = Int(tabStr), (0...3).contains(tab) {
             activatedTabs.insert(tab)
             selectedTab = tab
+            if MainTabMapping.slotIndex(for: tab) != nil {
+                lastPrimaryTab = tab
+            }
+        }
+        if let minStr = query["minimized"]?.lowercased() {
+            if minStr == "1" || minStr == "true" {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.85)) {
+                    scrollCoordinator.isMinimized = true
+                }
+            } else if minStr == "0" || minStr == "false" {
+                scrollCoordinator.expand()
+            }
         }
         switch query["appearance"]?.lowercased() {
         case "light": app.settings.appearance = .light

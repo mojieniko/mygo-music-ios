@@ -1688,6 +1688,98 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: 0.35), 0.125, accuracy: 0.01)
         XCTAssertEqual(BackdropFogMath.beforeLayerOpacity(elapsedSinceFadeStart: 0.70), 0.0, accuracy: 0.001)
     }
+
+    @MainActor
+    func testFloatingTabBarMinimizeMathAndPrimaryTabMapping() {
+        // 1. 左侧主胶囊 3 槽映射与搜索圆形分离一致性校验
+        XCTAssertEqual(MainTabMapping.primaryTabIDs, [0, 2, 3])
+        XCTAssertEqual(MainTabMapping.slotIndex(for: 0), 0)
+        XCTAssertEqual(MainTabMapping.slotIndex(for: 2), 1)
+        XCTAssertEqual(MainTabMapping.slotIndex(for: 3), 2)
+        XCTAssertNil(MainTabMapping.slotIndex(for: MainTabMapping.searchTabID))
+        XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 0), 0)
+        XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 1), 2)
+        XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 2), 3)
+        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 2, lastPrimaryTab: 0), 2)
+        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 3), 3)
+        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 99), 0)
+
+        // 2. 内容过短或处于顶部保护区域时绝不误收起
+        let shortContent = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: false,
+            accumulatedDelta: 0,
+            normalizedOffsetY: 32,
+            deltaY: 40,
+            maxScrollOffset: 40,
+            isUserInteracting: true
+        )
+        XCTAssertFalse(shortContent.isMinimized)
+
+        let topRegion = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: true,
+            accumulatedDelta: 10,
+            normalizedOffsetY: 8,
+            deltaY: 6,
+            maxScrollOffset: 600,
+            isUserInteracting: true
+        )
+        XCTAssertFalse(topRegion.isMinimized)
+        XCTAssertEqual(topRegion.accumulatedDelta, 0)
+
+        // 3. 向下浏览累积超过阈值后平滑收起
+        let step1 = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: false,
+            accumulatedDelta: 0,
+            normalizedOffsetY: 48,
+            deltaY: 12,
+            maxScrollOffset: 600,
+            isUserInteracting: true
+        )
+        XCTAssertFalse(step1.isMinimized)
+        XCTAssertEqual(step1.accumulatedDelta, 12, accuracy: 0.01)
+
+        let step2 = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: step1.isMinimized,
+            accumulatedDelta: step1.accumulatedDelta,
+            normalizedOffsetY: 60,
+            deltaY: 12,
+            maxScrollOffset: 600,
+            isUserInteracting: true
+        )
+        XCTAssertTrue(step2.isMinimized)
+        XCTAssertEqual(step2.accumulatedDelta, 0, accuracy: 0.01)
+
+        // 4. 触底橡皮筋回弹期间保持折叠态，不被误判为向上回看
+        let rubberBounce = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: true,
+            accumulatedDelta: 0,
+            normalizedOffsetY: 599,
+            deltaY: -25,
+            maxScrollOffset: 600,
+            isUserInteracting: true
+        )
+        XCTAssertTrue(rubberBounce.isMinimized)
+
+        // 5. 在正常内容区向下拉动回看超越恢复阈值后平滑展开
+        let pullDownExpand = FloatingTabBarMinimizeMath.evaluateScrollStep(
+            currentlyMinimized: true,
+            accumulatedDelta: -6,
+            normalizedOffsetY: 220,
+            deltaY: -12,
+            maxScrollOffset: 600,
+            isUserInteracting: true
+        )
+        XCTAssertFalse(pullDownExpand.isMinimized)
+        XCTAssertEqual(pullDownExpand.accumulatedDelta, 0, accuracy: 0.01)
+
+        // 6. 验证展开与嵌合紧凑模式 MiniPlayerBarView 双态均能正常构建
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-mini-compact-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let model = AppModel(baseDataDir: tmpRoot)
+        _ = MiniPlayerBarView(isCompact: false).environmentObject(model)
+        _ = MiniPlayerBarView(isCompact: true).environmentObject(model)
+    }
 }
 
 /// 测试用最小内存音源，用于精确返回流信息或无权限错误
