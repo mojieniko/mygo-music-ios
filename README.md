@@ -19,12 +19,10 @@
 ## 界面预览
 
 <p align="center">
-  <img src="./home.jpg" width="150" alt="首页">
-  <img src="./library.jpg" width="150" alt="本地音乐库">
-</p>
-<p align="center">
-  <img src="./player.jpg" width="150" alt="播放界面">
-  <img src="./lyrics.jpg" width="150" alt="歌词界面">
+  <img src="./home.jpg" width="320" alt="首页">
+  <img src="./library.jpg" width="320" alt="本地音乐库">
+  <img src="./player.jpg" width="320" alt="播放界面">
+  <img src="./lyrics.jpg" width="320" alt="歌词界面">
 </p>
 <p align="center"><sub>iPhone 17 Pro 模拟器截图 · 展示本地音乐界面</sub></p>
 
