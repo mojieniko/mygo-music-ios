@@ -468,17 +468,17 @@ public struct SettingsView: View {
                     get: { app.pendingPluginUpdateApproval != nil },
                     set: { isPresented in
                         if !isPresented {
-                            app.cancelPendingPluginUpdate()
+                            app.handlePendingPluginUpdateAlertDismissed()
                         }
                     }
                 ),
                 presenting: app.pendingPluginUpdateApproval
-            ) { _ in
+            ) { approval in
                 Button(I18n.t("Confirm & Update")) {
-                    Task { await app.confirmPendingPluginUpdate() }
+                    app.approvePendingPluginUpdate(approval)
                 }
                 Button(I18n.t("Cancel"), role: .cancel) {
-                    app.cancelPendingPluginUpdate()
+                    app.cancelPendingPluginUpdate(approval)
                 }
             } message: { approval in
                 Text(formatPermissionApprovalMessage(approval))

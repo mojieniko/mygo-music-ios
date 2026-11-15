@@ -2697,6 +2697,120 @@ final class MyGoMusicTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testAppModelPluginUpdateAlertDismissRaceAndQueuedBatchApprovals() async throws {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-alert-race-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+        let model = AppModel(baseDataDir: workDir)
+
+        @MainActor
+        func installLocalFixture(id: String, repo: String) async throws {
+            let folder = workDir.appendingPathComponent("fixture-\(id)", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data("""
+            {
+              "id": "\(id)",
+              "name": "Plugin \(id)",
+              "version": "1.0.0",
+              "main": "index.js",
+              "repository": "\(repo)",
+              "permissions": { "network": ["base.example.com"], "process": false }
+            }
+            """.utf8).write(to: folder.appendingPathComponent("plugin.json"))
+            try Data("export function home() { return { title: '\(id)-v1', sections: [] }; }\n".utf8)
+                .write(to: folder.appendingPathComponent("index.js"))
+            await model.importLocalPlugin(from: folder)
+        }
+
+        try await installLocalFixture(id: "race-plugin", repo: "test-org/race-plugin")
+        try await installLocalFixture(id: "batch-second", repo: "test-org/batch-second")
+
+        func makeV2Zip(id: String, extraHost: String) -> Data {
+            Self.makeStoredZipData(entries: [
+                ("plugin.json", Data("""
+                {
+                  "id": "\(id)",
+                  "name": "Plugin \(id)",
+                  "version": "2.0.0",
+                  "main": "index.js",
+                  "repository": "test-org/\(id)",
+                  "permissions": { "network": ["base.example.com", "\(extraHost)"], "process": false }
+                }
+                """.utf8)),
+                ("index.js", Data("export function home() { return { title: '\(id)-v2', sections: [] }; }\n".utf8))
+            ])
+        }
+
+        let zips: [String: Data] = [
+            "race-plugin": makeV2Zip(id: "race-plugin", extraHost: "new-a.example.com"),
+            "batch-second": makeV2Zip(id: "batch-second", extraHost: "new-b.example.com")
+        ]
+
+        let transport: PluginHTTPTransport = { req in
+            let urlStr = req.url?.absoluteString ?? ""
+            for id in ["race-plugin", "batch-second"] where urlStr.contains("test-org/\(id)") {
+                if urlStr.hasSuffix("/releases/latest") {
+                    return Self.mockHTTPResponse(url: req.url!, statusCode: 200, json: """
+                    {
+                      "tag_name": "v2.0.0",
+                      "zipball_url": "https://api.github.com/repos/test-org/\(id)/zipball/v2.0.0",
+                      "assets": []
+                    }
+                    """)
+                }
+                if urlStr.contains("/zipball/v2.0.0"), let data = zips[id] {
+                    return Self.mockHTTPResponse(url: req.url!, statusCode: 200, data: data)
+                }
+            }
+            return Self.mockHTTPResponse(url: req.url!, statusCode: 404, data: Data())
+        }
+
+        // 1. 复现 SwiftUI `.alert` 关闭先触发 `isPresented = false`，紧接着触发确认按钮动作的竞态
+        await model.checkForPluginUpdates(manual: true, transport: transport)
+        XCTAssertEqual(model.availablePluginUpdateCount, 2)
+
+        let startedRace = await model.updatePlugin(id: "race-plugin", transport: transport)
+        XCTAssertFalse(startedRace)
+        let capturedRaceApproval = try XCTUnwrap(model.pendingPluginUpdateApproval)
+        XCTAssertEqual(capturedRaceApproval.id, "race-plugin")
+
+        model.handlePendingPluginUpdateAlertDismissed()
+        XCTAssertNil(model.pendingPluginUpdateApproval)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: capturedRaceApproval.pending.sourcePath.path))
+
+        let installTask = model.approvePendingPluginUpdate(capturedRaceApproval)
+        await installTask.value
+        XCTAssertEqual(model.pluginSources.first(where: { $0.manifest.id == "race-plugin" })?.manifest.version, "2.0.0")
+        XCTAssertNil(model.settings.pluginUpdates["race-plugin"])
+        XCTAssertEqual(model.pluginCheckStates["race-plugin"], .upToDate)
+
+        // 2. 多插件批量更新同时需要权限确认时应按队列依次弹出，不得相互覆盖
+        try await installLocalFixture(id: "race-plugin", repo: "test-org/race-plugin")
+        await model.checkForPluginUpdates(manual: true, transport: transport)
+        XCTAssertEqual(model.availablePluginUpdateCount, 2)
+
+        await model.updateAllPlugins(transport: transport)
+        let firstQueued = try XCTUnwrap(model.pendingPluginUpdateApproval)
+        let firstTask = model.approvePendingPluginUpdate(firstQueued)
+        await firstTask.value
+
+        // 等待队列切换弹出第二个待确认弹窗
+        for _ in 0..<25 where model.pendingPluginUpdateApproval == nil {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let secondQueued = try XCTUnwrap(model.pendingPluginUpdateApproval)
+        XCTAssertNotEqual(firstQueued.id, secondQueued.id)
+        let secondTask = model.approvePendingPluginUpdate(secondQueued)
+        await secondTask.value
+
+        XCTAssertEqual(model.availablePluginUpdateCount, 0)
+        XCTAssertEqual(model.pluginSources.first(where: { $0.manifest.id == "race-plugin" })?.manifest.version, "2.0.0")
+        XCTAssertEqual(model.pluginSources.first(where: { $0.manifest.id == "batch-second" })?.manifest.version, "2.0.0")
+    }
+
     private static func mockHTTPResponse(
         url: URL,
         statusCode: Int,

@@ -22,6 +22,7 @@ public enum PluginUpdateCheckState: Hashable, Sendable {
 
 /// 插件升级请求新增敏感权限时，等待用户二次确认的挂起任务
 public struct PendingPluginUpdateApproval: Identifiable, Sendable {
+    public let requestID: UUID
     public var id: String { pending.manifest.id }
     public var pluginName: String
     public var targetVersion: String
@@ -29,11 +30,13 @@ public struct PendingPluginUpdateApproval: Identifiable, Sendable {
     public var pending: PendingPlugin
 
     public init(
+        requestID: UUID = UUID(),
         pluginName: String,
         targetVersion: String,
         addedPermissions: PluginPermissions,
         pending: PendingPlugin
     ) {
+        self.requestID = requestID
         self.pluginName = pluginName
         self.targetVersion = targetVersion
         self.addedPermissions = addedPermissions
@@ -203,6 +206,10 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isLoadingCommunityPlugins: Bool = false
     @Published public private(set) var communityPluginsError: String? = nil
     private var cachedPluginReleases: [String: PluginReleaseInfo] = [:]
+    private var pendingPluginUpdateQueue: [PendingPluginUpdateApproval] = []
+    private var confirmedPluginUpdateRequestIDs: Set<UUID> = []
+    private var deferredPluginUpdateCleanupTasks: [UUID: Task<Void, Never>] = [:]
+    private var nextQueuedApprovalTask: Task<Void, Never>? = nil
 
     /// 当前有可用更新的已安装插件数量（仅计仍存在于本地列表中的插件）
     public var availablePluginUpdateCount: Int {
@@ -1872,11 +1879,13 @@ public final class AppModel: ObservableObject {
                    to: pending.manifest.permissions
                ) {
                 let displayVer = PluginInstaller.displayVersion(pending.version ?? (pending.manifest.version ?? ""))
-                pendingPluginUpdateApproval = PendingPluginUpdateApproval(
-                    pluginName: pending.manifest.name ?? target.info().name,
-                    targetVersion: displayVer,
-                    addedPermissions: added,
-                    pending: pending
+                enqueuePluginUpdateApproval(
+                    PendingPluginUpdateApproval(
+                        pluginName: pending.manifest.name ?? target.info().name,
+                        targetVersion: displayVer,
+                        addedPermissions: added,
+                        pending: pending
+                    )
                 )
                 return false
             }
@@ -1907,25 +1916,121 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    private func enqueuePluginUpdateApproval(_ approval: PendingPluginUpdateApproval) {
+        if let active = pendingPluginUpdateApproval {
+            if active.id == approval.id {
+                deferredPluginUpdateCleanupTasks.removeValue(forKey: active.requestID)?.cancel()
+                cleanupTemporaryPendingSource(active.pending.sourcePath)
+                pendingPluginUpdateApproval = approval
+                return
+            }
+            if let idx = pendingPluginUpdateQueue.firstIndex(where: { $0.id == approval.id }) {
+                cleanupTemporaryPendingSource(pendingPluginUpdateQueue[idx].pending.sourcePath)
+                pendingPluginUpdateQueue[idx] = approval
+            } else {
+                pendingPluginUpdateQueue.append(approval)
+            }
+            return
+        }
+        nextQueuedApprovalTask?.cancel()
+        nextQueuedApprovalTask = nil
+        pendingPluginUpdateApproval = approval
+    }
+
+    private func scheduleNextQueuedPluginUpdateIfNeeded() {
+        guard pendingPluginUpdateApproval == nil, !pendingPluginUpdateQueue.isEmpty else { return }
+        nextQueuedApprovalTask?.cancel()
+        nextQueuedApprovalTask = Task { @MainActor [weak self] in
+            // 等待上一个 UIAlertController 完成退场动画，避免 SwiftUI 吞掉连续弹窗
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.nextQueuedApprovalTask = nil
+            guard self.pendingPluginUpdateApproval == nil, !self.pendingPluginUpdateQueue.isEmpty else { return }
+            self.pendingPluginUpdateApproval = self.pendingPluginUpdateQueue.removeFirst()
+        }
+    }
+
+    /// 供 UI 按钮同步确认权限变更并启动安装，规避 `.alert` 关闭时 `isPresented` 置 `false` 与 `Task` 调度之间的竞态
+    @discardableResult
+    public func approvePendingPluginUpdate(_ approval: PendingPluginUpdateApproval) -> Task<Void, Never> {
+        let reqID = approval.requestID
+        guard !confirmedPluginUpdateRequestIDs.contains(reqID) else {
+            return Task {}
+        }
+        confirmedPluginUpdateRequestIDs.insert(reqID)
+        deferredPluginUpdateCleanupTasks.removeValue(forKey: reqID)?.cancel()
+        if pendingPluginUpdateApproval?.requestID == reqID {
+            pendingPluginUpdateApproval = nil
+        }
+        pendingPluginUpdateQueue.removeAll { $0.requestID == reqID }
+
+        let pid = approval.pending.manifest.id
+        updatingPluginIDs.insert(pid)
+        isInstallingPlugin = true
+        installErrorMessage = nil
+
+        return Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performApprovedPluginUpdate(approval)
+        }
+    }
+
     public func confirmPendingPluginUpdate() async {
         guard let approval = pendingPluginUpdateApproval else { return }
-        pendingPluginUpdateApproval = nil
+        let task = approvePendingPluginUpdate(approval)
+        await task.value
+    }
+
+    private func performApprovedPluginUpdate(_ approval: PendingPluginUpdateApproval) async {
+        let pid = approval.pending.manifest.id
+        let reqID = approval.requestID
+        updatingPluginIDs.insert(pid)
         isInstallingPlugin = true
-        defer { isInstallingPlugin = false }
+        defer {
+            confirmedPluginUpdateRequestIDs.remove(reqID)
+            updatingPluginIDs.remove(pid)
+            isInstallingPlugin = !updatingPluginIDs.isEmpty
+            scheduleNextQueuedPluginUpdateIfNeeded()
+        }
         do {
             let installed = try await finalizeInstalledPending(approval.pending, switchActive: false)
             let ver = PluginInstaller.displayVersion(approval.pending.version ?? (installed.manifest.version ?? ""))
             showToast(I18n.tf("Updated %@ %@", installed.info().name, ver))
         } catch {
             installErrorMessage = error.localizedDescription
+            pluginCheckStates[pid] = .failed(error.localizedDescription)
             showToast(error.localizedDescription)
         }
     }
 
-    public func cancelPendingPluginUpdate() {
+    /// 仅由 SwiftUI `.alert` 的 `isPresented` 置 `false` 回调使用：延迟回收未确认临时包，避免抢在确认按钮前删除文件
+    public func handlePendingPluginUpdateAlertDismissed() {
         guard let approval = pendingPluginUpdateApproval else { return }
         pendingPluginUpdateApproval = nil
-        cleanupTemporaryPendingSource(approval.pending.sourcePath)
+        let reqID = approval.requestID
+        guard !confirmedPluginUpdateRequestIDs.contains(reqID) else { return }
+        deferredPluginUpdateCleanupTasks[reqID]?.cancel()
+        deferredPluginUpdateCleanupTasks[reqID] = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.deferredPluginUpdateCleanupTasks.removeValue(forKey: reqID)
+            guard !self.confirmedPluginUpdateRequestIDs.contains(reqID) else { return }
+            self.cleanupTemporaryPendingSource(approval.pending.sourcePath)
+            self.scheduleNextQueuedPluginUpdateIfNeeded()
+        }
+    }
+
+    public func cancelPendingPluginUpdate(_ approval: PendingPluginUpdateApproval? = nil) {
+        guard let target = approval ?? pendingPluginUpdateApproval else { return }
+        let reqID = target.requestID
+        guard !confirmedPluginUpdateRequestIDs.contains(reqID) else { return }
+        deferredPluginUpdateCleanupTasks.removeValue(forKey: reqID)?.cancel()
+        if pendingPluginUpdateApproval?.requestID == reqID {
+            pendingPluginUpdateApproval = nil
+        }
+        pendingPluginUpdateQueue.removeAll { $0.requestID == reqID }
+        cleanupTemporaryPendingSource(target.pending.sourcePath)
+        scheduleNextQueuedPluginUpdateIfNeeded()
     }
 
     @discardableResult
@@ -1996,6 +2101,16 @@ public final class AppModel: ObservableObject {
         pluginCheckStates.removeValue(forKey: id)
         cachedPluginReleases.removeValue(forKey: id)
         updatingPluginIDs.remove(id)
+        if pendingPluginUpdateApproval?.id == id, let active = pendingPluginUpdateApproval {
+            cancelPendingPluginUpdate(active)
+        }
+        let queuedForRemoved = pendingPluginUpdateQueue.filter { $0.id == id }
+        if !queuedForRemoved.isEmpty {
+            pendingPluginUpdateQueue.removeAll { $0.id == id }
+            for item in queuedForRemoved {
+                cleanupTemporaryPendingSource(item.pending.sourcePath)
+            }
+        }
         reloadPlugins()
         if activeSourceID == id {
             switchSource(to: enabledSources.first?.info().id ?? LocalMusicSource.sourceID)
