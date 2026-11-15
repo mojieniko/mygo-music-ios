@@ -68,7 +68,7 @@ public struct SearchView: View {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
-                    .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .mygoElevatedSurface(cornerRadius: 12)
 
                     searchKindChips
                         .onChange(of: app.searchKind) { _, _ in
@@ -82,7 +82,7 @@ public struct SearchView: View {
                 .padding(.vertical, 10)
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
+                    LazyVStack(alignment: .leading, spacing: 20) {
                         if app.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
                             recentSearchHistorySection
                         } else if app.isSearching {
@@ -106,6 +106,7 @@ public struct SearchView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .mygoTrackVerticalScroll()
             }
+            .background(MyGoTheme.pageBackground.ignoresSafeArea())
             .onChange(of: app.activeSourceID) { _, _ in
                 dismissSearchKeyboard()
             }
@@ -155,10 +156,7 @@ public struct SearchView: View {
                             .foregroundStyle(isSelected ? .white : .primary)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 7)
-                            .background(
-                                isSelected ? AnyShapeStyle(MyGoTheme.accent) : AnyShapeStyle(Color.primary.opacity(0.08)),
-                                in: Capsule()
-                            )
+                            .mygoPillSurface(isHighlighted: isSelected)
                     }
                     .buttonStyle(.plain)
                 }
@@ -198,7 +196,7 @@ public struct SearchView: View {
                                     .font(.system(size: 13.5, weight: .medium))
                                     .padding(.horizontal, 14)
                                     .padding(.vertical, 7)
-                                    .background(Color.primary.opacity(0.07), in: Capsule())
+                                    .mygoPillSurface()
                             }
                             .buttonStyle(.plain)
                         }
@@ -259,14 +257,9 @@ public struct SearchView: View {
             if tracks.isEmpty {
                 emptyResultView
             } else {
-                VStack(spacing: 2) {
-                    ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
-                        TrackRowView(track: tr, index: idx) {
-                            dismissSearchKeyboard()
-                            app.player.playTrack(tracks, at: idx)
-                        }
-                        .padding(.horizontal, 8)
-                    }
+                LazyTrackRowsView(tracks: tracks) { list, idx in
+                    dismissSearchKeyboard()
+                    app.player.playTrack(list, at: idx)
                 }
             }
         case .albums:
@@ -390,49 +383,46 @@ public struct LibraryView: View {
         let info = app.activeSource.info()
         NavigationStack(path: $navPath) {
             List {
-                // 当前音源内置与自定义导航入口（遵循插件 navigation 的自定义标题/图标）
+                // 当前音源内置与自定义导航入口（统一 Apple Music 绯红左侧图标语义，对齐深/浅色层次）
                 SwiftUI.Section(info.name) {
                     if app.activeSource.can("liked") {
-                        NavigationLink(value: NavigationTarget.likedSongs) {
-                            Label(
-                                info.customTitle(forBuiltin: "liked") ?? I18n.t("Liked Songs"),
-                                systemImage: info.customIcon(forBuiltin: "liked").map { sfSymbol(for: $0) } ?? "heart.fill"
-                            )
-                            .foregroundStyle(.primary)
-                        }
+                        libraryNavRow(
+                            title: info.customTitle(forBuiltin: "liked") ?? I18n.t("Liked Songs"),
+                            systemImage: info.customIcon(forBuiltin: "liked").map { MyGoNavIconKind.sfSymbol(for: $0) } ?? "heart.fill",
+                            value: .likedSongs
+                        )
                     }
                     if app.activeSource.can("savedAlbums") {
-                        NavigationLink(value: NavigationTarget.savedAlbums) {
-                            Label(
-                                info.customTitle(forBuiltin: "savedAlbums") ?? I18n.t("Saved Albums"),
-                                systemImage: info.customIcon(forBuiltin: "savedAlbums").map { sfSymbol(for: $0) } ?? "square.stack.fill"
-                            )
-                        }
+                        libraryNavRow(
+                            title: info.customTitle(forBuiltin: "savedAlbums") ?? I18n.t("Saved Albums"),
+                            systemImage: info.customIcon(forBuiltin: "savedAlbums").map { MyGoNavIconKind.sfSymbol(for: $0) } ?? "square.stack.fill",
+                            value: .savedAlbums
+                        )
                     }
                     if app.activeSource.can("stations") {
-                        NavigationLink(value: NavigationTarget.stations) {
-                            Label(
-                                info.customTitle(forBuiltin: "stations") ?? I18n.t("Stations"),
-                                systemImage: info.customIcon(forBuiltin: "stations").map { sfSymbol(for: $0) } ?? "dot.radiowaves.left.and.right"
-                            )
-                        }
+                        libraryNavRow(
+                            title: info.customTitle(forBuiltin: "stations") ?? I18n.t("Stations"),
+                            systemImage: info.customIcon(forBuiltin: "stations").map { MyGoNavIconKind.sfSymbol(for: $0) } ?? "dot.radiowaves.left.and.right",
+                            value: .stations
+                        )
                     }
                     if app.activeSource.can("shows") {
-                        NavigationLink(value: NavigationTarget.podcasts) {
-                            Label(
-                                info.customTitle(forBuiltin: "shows") ?? I18n.t("Podcasts"),
-                                systemImage: info.customIcon(forBuiltin: "shows").map { sfSymbol(for: $0) } ?? "mic.fill"
-                            )
-                        }
+                        libraryNavRow(
+                            title: info.customTitle(forBuiltin: "shows") ?? I18n.t("Podcasts"),
+                            systemImage: info.customIcon(forBuiltin: "shows").map { MyGoNavIconKind.sfSymbol(for: $0) } ?? "mic.fill",
+                            value: .podcasts
+                        )
                     }
 
                     // 插件自定义导航页（如 Songs, Albums, Artists, Charts 等）
                     if let navItems = info.navigation {
                         ForEach(Array(navItems.enumerated()), id: \.offset) { _, item in
                             if let page = item.page, !page.isEmpty, item.builtin == nil {
-                                NavigationLink(value: NavigationTarget.browse(page: page, title: item.title)) {
-                                    Label(item.title ?? page, systemImage: sfSymbol(for: item.icon))
-                                }
+                                libraryNavRow(
+                                    title: item.title ?? page,
+                                    systemImage: MyGoNavIconKind.sfSymbol(for: item.icon),
+                                    value: .browse(page: page, title: item.title)
+                                )
                             }
                         }
                     }
@@ -441,8 +431,15 @@ public struct LibraryView: View {
                         Button {
                             showFileImporter = true
                         } label: {
-                            Label(I18n.t("Import Audio Files…"), systemImage: "folder.badge.plus")
-                                .foregroundStyle(MyGoTheme.accent)
+                            Label {
+                                Text(I18n.t("Import Audio Files…"))
+                                    .foregroundStyle(.primary)
+                            } icon: {
+                                Image(systemName: "folder.badge.plus")
+                                    .font(.system(size: 15.5, weight: .semibold))
+                                    .foregroundStyle(MyGoTheme.accent)
+                                    .frame(width: 24)
+                            }
                         }
                     }
                 }
@@ -591,21 +588,18 @@ public struct LibraryView: View {
         }
     }
 
-    private func sfSymbol(for iconName: String?) -> String {
-        switch iconName {
-        case "home": return "house"
-        case "note": return "music.note"
-        case "album": return "opticaldisc"
-        case "artist": return "person.wave.2"
-        case "playlist": return "music.note.list"
-        case "radio": return "dot.radiowaves.left.and.right"
-        case "podcast": return "mic"
-        case "chart": return "chart.bar.fill"
-        case "calendar": return "calendar"
-        case "heart": return "heart"
-        case "search": return "magnifyingglass"
-        case "star": return "star"
-        default: return "music.note.list"
+    @ViewBuilder
+    private func libraryNavRow(title: String, systemImage: String, value: NavigationTarget) -> some View {
+        NavigationLink(value: value) {
+            Label {
+                Text(title)
+                    .foregroundStyle(.primary)
+            } icon: {
+                Image(systemName: systemImage)
+                    .font(.system(size: 15.5, weight: .semibold))
+                    .foregroundStyle(MyGoTheme.accent)
+                    .frame(width: 24)
+            }
         }
     }
 }

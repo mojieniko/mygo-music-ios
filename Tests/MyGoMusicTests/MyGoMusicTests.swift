@@ -4,7 +4,11 @@
 #if canImport(XCTest)
 import AVFoundation
 import Compression
+import CoreGraphics
 import Foundation
+import ImageIO
+import SwiftUI
+import UniformTypeIdentifiers
 import XCTest
 @testable import MyGoMusicCore
 @testable import MyGoMusicUI
@@ -1779,6 +1783,370 @@ final class MyGoMusicTests: XCTestCase {
         let model = AppModel(baseDataDir: tmpRoot)
         _ = MiniPlayerBarView(isCompact: false).environmentObject(model)
         _ = MiniPlayerBarView(isCompact: true).environmentObject(model)
+    }
+
+    @MainActor
+    func testBrowseLinkIconKindResolution() {
+        // 1. 插件显式 navigation.icon 优先
+        XCTAssertEqual(
+            MyGoNavIconKind.resolve(linkPage: "charts", linkTitle: "排行榜", navigationIcon: "chart"),
+            .chart
+        )
+        XCTAssertEqual(
+            MyGoNavIconKind.resolve(linkPage: "custom", linkTitle: "自定义", navigationIcon: "radio"),
+            .radio
+        )
+
+        // 2. page 路径规范语义推断（如酷狗首页 发现 -> 排行榜 / 私人FM）
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "charts", linkTitle: "排行榜"), .chart)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "rank:8888", linkTitle: "TOP500"), .chart)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "fm", linkTitle: "私人FM"), .radio)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "stations", linkTitle: "电台"), .radio)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "daily", linkTitle: "每日推荐"), .calendar)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "vip", linkTitle: "再次领取今日 VIP"), .vip)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "recent", linkTitle: "最近播放"), .recent)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "cloud", linkTitle: "音乐云盘"), .cloud)
+
+        // 3. 标题关键词兜底与未知回退
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "hot", linkTitle: "热歌榜单"), .chart)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "live", linkTitle: "深夜电台"), .radio)
+        XCTAssertEqual(MyGoNavIconKind.resolve(linkPage: "mystery", linkTitle: "探索更多"), .discover)
+
+        // 4. 列表 SF Symbol 映射一致性
+        XCTAssertEqual(MyGoNavIconKind.sfSymbol(for: "chart"), "chart.bar.fill")
+        XCTAssertEqual(MyGoNavIconKind.sfSymbol(for: "radio"), "dot.radiowaves.left.and.right")
+        XCTAssertEqual(MyGoNavIconKind.sfSymbol(for: "calendar"), "calendar")
+        XCTAssertEqual(MyGoNavIconKind.sfSymbol(for: nil), "music.note.list")
+
+        // 5. BrowseLinkIconView 有图 / 无图双态视图构建不崩溃
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-link-icon-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let model = AppModel(baseDataDir: tmpRoot)
+        _ = BrowseLinkIconView(urlString: nil, page: "charts", title: "排行榜", navigationIcon: "chart")
+            .environmentObject(model)
+        _ = BrowseLinkIconView(urlString: "https://imge.kugou.com/mcommon/400/test.png", page: "rank:8888", title: "TOP500")
+            .environmentObject(model)
+    }
+
+    func testAdaptiveThemeTokensLightAndDarkContrast() {
+        let light = MyGoTheme.tokens(isDark: false)
+        let dark = MyGoTheme.tokens(isDark: true)
+
+        // 1. 深色模式画布为 OLED 纯黑 #000000，卡片层级提升至 #1C1C1E 家族色
+        XCTAssertEqual(dark.pageBackground.r, 0.0, accuracy: 0.001)
+        XCTAssertEqual(dark.pageBackground.g, 0.0, accuracy: 0.001)
+        XCTAssertEqual(dark.pageBackground.b, 0.0, accuracy: 0.001)
+        XCTAssertGreaterThan(dark.elevatedSurface.r, dark.pageBackground.r + 0.08)
+        XCTAssertGreaterThan(dark.pillSurface.r, dark.elevatedSurface.r)
+
+        // 2. 深色模式主强调红对标 Apple Music #FF375F，亮度/通透感高于浅色 #FA233B
+        XCTAssertGreaterThan(dark.accent.r, light.accent.r)
+        XCTAssertGreaterThan(dark.accent.g, light.accent.g)
+        XCTAssertGreaterThan(dark.accent.b, light.accent.b)
+
+        // 3. 深色当前播放行高亮改为中性微光浮层（R/G/B 等值），杜绝红透明叠纯黑发棕
+        XCTAssertEqual(dark.currentTrackFill.r, dark.currentTrackFill.g, accuracy: 0.001)
+        XCTAssertEqual(dark.currentTrackFill.g, dark.currentTrackFill.b, accuracy: 0.001)
+        XCTAssertLessThan(dark.currentTrackFill.a, 0.15)
+        XCTAssertGreaterThan(dark.currentTrackFill.a, 0.05)
+
+        // 4. 动态色板属性及页面 Surface 修饰符可无异常构建
+        _ = Text("Light & Dark")
+            .mygoPillSurface(isHighlighted: false)
+            .mygoElevatedSurface(cornerRadius: 14)
+            .mygoCircleSurface()
+            .background(MyGoTheme.pageBackground)
+            .overlay(Rectangle().fill(MyGoTheme.placeholderFill))
+            .overlay(Rectangle().strokeBorder(MyGoTheme.artworkBorder, lineWidth: 0.5))
+    }
+
+    func testLiquidGlassElevationLightModeAvoidsHeavyBlackMask() {
+        // 1. 浅色白底/浅灰底下悬浮玻璃的投影必须极其克制，防止迷你条/导航栏下方及缝隙积出一整层黑灰蒙版
+        let lightPrimaryOpacity = LiquidGlassElevationSpec.primaryShadowOpacity(isDark: false)
+        let lightContactOpacity = LiquidGlassElevationSpec.contactShadowOpacity(isDark: false)
+        let lightRadius = LiquidGlassElevationSpec.primaryShadowRadius(isDark: false)
+        let lightOffsetY = LiquidGlassElevationSpec.primaryShadowOffsetY(isDark: false)
+
+        XCTAssertLessThanOrEqual(lightPrimaryOpacity, 0.05)
+        XCTAssertLessThanOrEqual(lightContactOpacity, 0.03)
+        XCTAssertLessThanOrEqual(lightPrimaryOpacity + lightContactOpacity, 0.075)
+        // 半径保持紧凑，不溢出到 16pt 屏幕左右边缘与安全区外
+        XCTAssertLessThanOrEqual(lightRadius, 10)
+        XCTAssertLessThanOrEqual(lightOffsetY, 3)
+
+        // 2. 深色模式下保持足够的黑曜石悬浮层次感
+        XCTAssertGreaterThan(LiquidGlassElevationSpec.primaryShadowOpacity(isDark: true), lightPrimaryOpacity)
+        XCTAssertGreaterThan(LiquidGlassElevationSpec.primaryShadowRadius(isDark: true), lightRadius)
+    }
+
+    func testPluginHTTPUtilitiesSkipsBase64ForUTF8JSONTextPayload() {
+        let jsonData = Data("{\"songs\":[{\"id\":\"1001\",\"name\":\"Haruhikage\"}]}".utf8)
+        XCTAssertTrue(PluginHTTPUtilities.isLikelyTextPayload(contentType: "application/json; charset=utf-8", data: jsonData))
+        XCTAssertTrue(PluginHTTPUtilities.isLikelyTextPayload(contentType: "text/plain", data: Data("ok".utf8)))
+
+        let binaryPNG = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        XCTAssertFalse(PluginHTTPUtilities.isLikelyTextPayload(contentType: "image/png", data: binaryPNG))
+        XCTAssertFalse(PluginHTTPUtilities.isLikelyTextPayload(contentType: nil, data: jsonData))
+        XCTAssertFalse(PluginHTTPUtilities.isLikelyTextPayload(contentType: "application/json", data: Data([0x7B, 0x00, 0x7D])))
+
+        let url = URL(string: "https://nas.local/api/playlist")!
+        let jsonResp = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json; charset=utf-8"]
+        )
+        let jsonPayload = PluginHTTPUtilities.buildFetchResponsePayload(
+            urlString: url.absoluteString,
+            data: jsonData,
+            httpResp: jsonResp
+        )
+        XCTAssertEqual(jsonPayload["text"] as? String, String(data: jsonData, encoding: .utf8))
+        XCTAssertNil(jsonPayload["base64"], "UTF-8 JSON 文本响应不应重复做高开销的全量 Base64 编码")
+
+        let binResp = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/octet-stream"]
+        )
+        let binPayload = PluginHTTPUtilities.buildFetchResponsePayload(
+            urlString: url.absoluteString,
+            data: binaryPNG,
+            httpResp: binResp
+        )
+        XCTAssertEqual(binPayload["base64"] as? String, binaryPNG.base64EncodedString())
+    }
+
+    @MainActor
+    func testAppModelCheckLikesDeduplicatesIDsAndComputesDeltaOnly() {
+        let tracks = [
+            Track(id: "t1", source: "feiniu", name: "Song 1"),
+            Track(id: "t2", source: "feiniu", name: "Song 2"),
+            Track(id: "t1", source: "feiniu", name: "Song 1 Dup"),
+            Track(id: "t3", source: nil, name: "Song 3 Fallback"),
+            Track(id: "k1", source: "kugou", name: "Song K1"),
+            Track(id: "t3", source: "feiniu", name: "Song 3 Dup")
+        ]
+        let grouped = AppModel.uniqueTrackIDsBySource(tracks: tracks, fallbackSourceID: "feiniu")
+        XCTAssertEqual(grouped["feiniu"], ["t1", "t2", "t3"], "同一音源去重时应保持原始顺序")
+        XCTAssertEqual(grouped["kugou"], ["k1"])
+
+        let existing: [String: Bool] = [
+            "feiniu:t1": true,
+            "feiniu:t2": false
+        ]
+        // 无任何实际变更时返回空 diff，避免无意义触发 ObservableObject 全局重绘
+        let unchanged = AppModel.diffLikedUpdates(
+            existing: existing,
+            incoming: ["t1": true, "t2": false],
+            sourceID: "feiniu"
+        )
+        XCTAssertTrue(unchanged.isEmpty)
+
+        // 仅变更或新增键出现在 diff 中
+        let changed = AppModel.diffLikedUpdates(
+            existing: existing,
+            incoming: ["t1": true, "t2": true, "t3": true],
+            sourceID: "feiniu"
+        )
+        XCTAssertEqual(changed, ["feiniu:t2": true, "feiniu:t3": true])
+    }
+
+    func testLazyTrackRowsViewGeneratesUniqueIDsForDuplicateTracks() {
+        let duplicateTracks = [
+            Track(id: "101", source: "feiniu", name: "Track A"),
+            Track(id: "101", source: "feiniu", name: "Track A Again"),
+            Track(id: "102", source: "feiniu", name: "Track B"),
+            Track(id: "101", source: "feiniu", name: "Track A Third")
+        ]
+        let entries = LazyTrackRowsView.buildRowEntries(for: duplicateTracks)
+        XCTAssertEqual(entries.count, 4)
+        XCTAssertEqual(entries.map(\.index), [0, 1, 2, 3])
+        XCTAssertEqual(Set(entries.map(\.id)).count, 4, "重复曲目在 LazyVStack 中必须拥有唯一行 ID")
+        XCTAssertEqual(entries[0].id, "feiniu:101")
+        XCTAssertEqual(entries[1].id, "feiniu:101#1")
+        XCTAssertEqual(entries[3].id, "feiniu:101#2")
+    }
+
+    @MainActor
+    func testArtworkImageLoaderCachesDecodedMemoryCoalescesConcurrentRequestsAndCompactsOversizedDiskImage() async throws {
+        ArtworkImageLoader.clearMemoryCache()
+        ArtworkImageLoader.clearDiskCacheForTesting()
+        defer {
+            ArtworkImageLoader.clearMemoryCache()
+            ArtworkImageLoader.clearDiskCacheForTesting()
+        }
+
+        // 1. 生成一张 800x800 高熵噪点不透明 PNG 大图（> 128KB），验证降采样与磁盘紧凑压缩
+        let width = 800
+        let height = 800
+        var rgba = [UInt8](repeating: 255, count: width * height * 4)
+        var state: UInt32 = 0x1234_5678
+        for idx in stride(from: 0, to: rgba.count, by: 4) {
+            state = state &* 1664525 &+ 1013904223
+            rgba[idx] = UInt8((state >> 16) & 0xFF)
+            rgba[idx + 1] = UInt8((state >> 8) & 0xFF)
+            rgba[idx + 2] = UInt8(state & 0xFF)
+            rgba[idx + 3] = 255
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+        let ctx = rgba.withUnsafeMutableBytes { ptr -> CGContext? in
+            CGContext(
+                data: ptr.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo.rawValue
+            )
+        }
+        let cg = try XCTUnwrap(ctx?.makeImage())
+        let pngMutable = NSMutableData()
+        let pngDest = try XCTUnwrap(CGImageDestinationCreateWithData(pngMutable, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(pngDest, cg, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(pngDest))
+        let largePNGData = pngMutable as Data
+        XCTAssertGreaterThan(largePNGData.count, 128 * 1024)
+
+        let compactCheck = ArtworkImageLoader.decodeAndCompactIfNeeded(
+            data: largePNGData,
+            maxPixelSize: 320,
+            extractDominantColor: true
+        )
+        let sampledCG = try XCTUnwrap(compactCheck.cgImage)
+        XCTAssertLessThanOrEqual(sampledCG.width, 320)
+        XCTAssertLessThanOrEqual(sampledCG.height, 320)
+        let compacted = try XCTUnwrap(compactCheck.compactedDiskData, "超过 128KB 且 maxPixelSize <= 640 的大图应生成紧凑磁盘缓存")
+        XCTAssertLessThan(compacted.count, largePNGData.count / 2)
+        XCTAssertNotNil(compactCheck.dominantRGB)
+
+        // 2. 并发 6 次相同 URL 请求必须合并为单次网络请求
+        actor FetchCounter {
+            var count = 0
+            func increment() { count += 1 }
+        }
+        let counter = FetchCounter()
+        let testURL = "https://nas.example.local/cover/large-album-\(UUID().uuidString).png"
+        let fetcher: ArtworkImageLoader.NetworkDataFetcher = { req in
+            await counter.increment()
+            try await Task.sleep(nanoseconds: 25_000_000)
+            let resp = HTTPURLResponse(
+                url: req.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "image/png"]
+            )!
+            return (largePNGData, resp)
+        }
+
+        let loaders = (0..<6).map { _ in ArtworkImageLoader() }
+        await withTaskGroup(of: Void.self) { group in
+            for loader in loaders {
+                group.addTask { @MainActor in
+                    await loader.load(
+                        rawURLString: testURL,
+                        pixelSize: 160,
+                        extractDominantColor: true,
+                        networkFetcher: fetcher,
+                        headersProvider: nil
+                    )
+                }
+            }
+        }
+        let fetchCount = await counter.count
+        XCTAssertEqual(fetchCount, 1, "并发请求同一封面地址与尺寸时应合并为 1 次网络拉取")
+        for loader in loaders {
+            XCTAssertNotNil(loader.image)
+            XCTAssertNotNil(loader.dominantRGB)
+        }
+        XCTAssertNotNil(ArtworkImageLoader.cachedSwiftUIImage(rawURLString: testURL, pixelSize: 160))
+
+        // 3. 第二次加载（新 loader 实例）应零网络直接命中内存缓存
+        let failingFetcher: ArtworkImageLoader.NetworkDataFetcher = { _ in
+            throw URLError(.notConnectedToInternet)
+        }
+        let memLoader = ArtworkImageLoader()
+        await memLoader.load(
+            rawURLString: testURL,
+            pixelSize: 160,
+            extractDominantColor: true,
+            networkFetcher: failingFetcher,
+            headersProvider: nil
+        )
+        XCTAssertNotNil(memLoader.image)
+        XCTAssertNotNil(memLoader.dominantRGB)
+
+        // 4. 清空内存缓存后，应无需网络直接从磁盘紧凑缩略图恢复
+        ArtworkImageLoader.clearMemoryCache()
+        let diskLoader = ArtworkImageLoader()
+        await diskLoader.load(
+            rawURLString: testURL,
+            pixelSize: 160,
+            extractDominantColor: false,
+            networkFetcher: failingFetcher,
+            headersProvider: nil
+        )
+        XCTAssertNotNil(diskLoader.image)
+    }
+
+    func testVerticalScrollProbeFilterSuppressesSubpixelJitterWhilePreservingBoundaries() {
+        // 首次采样必放行
+        XCTAssertTrue(VerticalScrollProbeFilter.shouldEmit(
+            lastNormalizedY: nil,
+            currentNormalizedY: 200,
+            lastInteracting: nil,
+            currentInteracting: true,
+            maxOffset: 1000
+        ))
+
+        // 中段 < 1pt 亚像素抖动屏蔽
+        XCTAssertFalse(VerticalScrollProbeFilter.shouldEmit(
+            lastNormalizedY: 200.0,
+            currentNormalizedY: 200.6,
+            lastInteracting: true,
+            currentInteracting: true,
+            maxOffset: 1000
+        ))
+
+        // >= 1pt 正常放行
+        XCTAssertTrue(VerticalScrollProbeFilter.shouldEmit(
+            lastNormalizedY: 200.0,
+            currentNormalizedY: 201.1,
+            lastInteracting: true,
+            currentInteracting: true,
+            maxOffset: 1000
+        ))
+
+        // 交互状态变化即使 0pt 位移也必须放行
+        XCTAssertTrue(VerticalScrollProbeFilter.shouldEmit(
+            lastNormalizedY: 200.0,
+            currentNormalizedY: 200.0,
+            lastInteracting: true,
+            currentInteracting: false,
+            maxOffset: 1000
+        ))
+
+        // 顶部安全区 >= 0.4pt 精确放行
+        XCTAssertTrue(VerticalScrollProbeFilter.shouldEmit(
+            lastNormalizedY: 0.6,
+            currentNormalizedY: 0.0,
+            lastInteracting: false,
+            currentInteracting: false,
+            maxOffset: 1000
+        ))
+
+        // 底部边界 >= 0.4pt 精确放行
+        XCTAssertTrue(VerticalScrollProbeFilter.shouldEmit(
+            lastNormalizedY: 999.0,
+            currentNormalizedY: 999.5,
+            lastInteracting: false,
+            currentInteracting: false,
+            maxOffset: 1000
+        ))
     }
 }
 

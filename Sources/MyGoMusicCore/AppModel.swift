@@ -209,8 +209,9 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var isSearching: Bool = false
     @Published public private(set) var isLoadingMoreSearch: Bool = false
 
-    // 插件安装、二维码/提示登录与 WebView 登录状态
+    // 插件安装、二维码/提示登录、加入歌单与 WebView 登录状态
     @Published public var toastMessage: String? = nil
+    @Published public var pendingAddToPlaylistTrack: Track? = nil
     @Published public var isSignInSheetPresented: Bool = false
     @Published public var signInTargetSourceID: String? = nil
     @Published public var isSigningIn: Bool = false
@@ -538,7 +539,13 @@ public final class AppModel: ObservableObject {
         var merged: [String: String] = [
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) mygo-music/0.1"
         ]
-        for p in pluginSources where isSourceEnabled(p.manifest.id) {
+        guard !pluginSources.isEmpty else { return merged }
+        let disabled = Set(settings.disabledPlugins)
+        for p in pluginSources {
+            guard !disabled.contains(p.manifest.id),
+                  !(p.manifest.requestHeaders?.isEmpty ?? true) else {
+                continue
+            }
             if let rules = p.headersFor(url: url, kind: PluginRequestHeaders.kindImage) {
                 for (k, v) in rules where merged[k] == nil {
                     merged[k] = v
@@ -643,7 +650,7 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    /// 刷新当前音源的首页、歌单、喜欢、电台、播客与账号数据
+    /// 刷新当前音源的首页、歌单、喜欢、电台、播客与账号数据（采用分级并发策略大幅缩短首屏阻塞）
     public func refreshActiveSource() async {
         sourceRefreshGeneration &+= 1
         let generation = sourceRefreshGeneration
@@ -652,9 +659,24 @@ public final class AppModel: ObservableObject {
         isLoadingHome = true
         homeError = nil
 
+        // 第一阶段：并发拉取账号状态与首页区块，拿到首页即刻释放加载遮罩供用户交互
+        async let fetchedAccount: Account? = {
+            guard src.can("account") else { return nil }
+            return try? await src.account()
+        }()
+        async let fetchedHome: Result<Browse?, Error> = {
+            guard src.can("home") else { return .success(nil) }
+            do {
+                return .success(try await src.home())
+            } catch {
+                return .failure(error)
+            }
+        }()
+
+        let (acc, homeOutcome) = await (fetchedAccount, fetchedHome)
+        guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
+
         if src.can("account") {
-            let acc = try? await src.account()
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             currentAccount = acc
             if let acc {
                 accountsBySource[srcID] = acc
@@ -666,37 +688,71 @@ public final class AppModel: ObservableObject {
             accountsBySource.removeValue(forKey: srcID)
         }
 
-        if src.can("home") {
-            do {
-                let b = try await src.home()
-                guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
-                self.homeBrowse = b
-                if let sections = b.sections {
-                    let allTracks = sections.flatMap { $0.tracks ?? [] }
-                    await checkLikes(for: allTracks)
+        var likeCheckPool: [Track] = []
+        switch homeOutcome {
+        case .success(let b):
+            self.homeBrowse = b
+            if let sections = b?.sections {
+                for sec in sections {
+                    if let tracks = sec.tracks {
+                        likeCheckPool.append(contentsOf: tracks)
+                    }
                 }
-            } catch {
-                guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
-                self.homeError = error.localizedDescription
             }
-        } else {
-            self.homeBrowse = nil
+        case .failure(let error):
+            self.homeError = error.localizedDescription
         }
 
+        if src.can("home") {
+            isLoadingHome = false
+        }
+
+        // 第二阶段：并发拉取其余资料库数据并合并更新，避免多次串行 RTT 与连续全屏重绘
+        async let fetchedRecent: [Track]? = {
+            guard src.can("recent") else { return nil }
+            return try? await src.recent()
+        }()
+        async let fetchedPlaylists: [Playlist]? = {
+            guard src.can("playlists") else { return nil }
+            return try? await src.playlists()
+        }()
+        async let fetchedLiked: TrackPage? = {
+            guard src.can("liked") else { return nil }
+            return try? await src.liked(offset: 0)
+        }()
+        async let fetchedAlbums: AlbumList? = {
+            guard src.can("savedAlbums") else { return nil }
+            return try? await src.savedAlbums(offset: 0)
+        }()
+        async let fetchedStations: [Station]? = {
+            guard src.can("stations") else { return nil }
+            return try? await src.stations()
+        }()
+        async let fetchedShows: [Show]? = {
+            guard src.can("shows") else { return nil }
+            return try? await src.shows()
+        }()
+
+        let (rec, pls, likedPage, albumsList, st, sh) = await (
+            fetchedRecent,
+            fetchedPlaylists,
+            fetchedLiked,
+            fetchedAlbums,
+            fetchedStations,
+            fetchedShows
+        )
+        guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
+
         if src.can("recent") {
-            let rec = try? await src.recent()
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             if let rec {
                 self.recentTracks = rec
-                await checkLikes(for: rec)
+                likeCheckPool.append(contentsOf: rec)
             }
         } else {
             self.recentTracks = []
         }
 
         if src.can("playlists") {
-            let pls = try? await src.playlists()
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             if let pls {
                 self.myPlaylists = pls.filter { $0.mine == true }
                 self.savedPlaylists = pls.filter { $0.mine != true }
@@ -707,12 +763,11 @@ public final class AppModel: ObservableObject {
         }
 
         if src.can("liked") {
-            let page = try? await src.liked(offset: 0)
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
-            if let page {
-                self.likedTracks = page.tracks ?? []
-                self.likedHasMore = page.more == true
-                await checkLikes(for: self.likedTracks)
+            if let likedPage {
+                let tracks = likedPage.tracks ?? []
+                self.likedTracks = tracks
+                self.likedHasMore = likedPage.more == true
+                likeCheckPool.append(contentsOf: tracks)
             } else {
                 self.likedHasMore = false
             }
@@ -722,11 +777,9 @@ public final class AppModel: ObservableObject {
         }
 
         if src.can("savedAlbums") {
-            let list = try? await src.savedAlbums(offset: 0)
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
-            if let list {
-                self.savedAlbums = list.albums ?? []
-                self.savedAlbumsHasMore = list.more == true
+            if let albumsList {
+                self.savedAlbums = albumsList.albums ?? []
+                self.savedAlbumsHasMore = albumsList.more == true
             } else {
                 self.savedAlbumsHasMore = false
             }
@@ -736,8 +789,6 @@ public final class AppModel: ObservableObject {
         }
 
         if src.can("stations") {
-            let st = try? await src.stations()
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             if let st {
                 self.stations = st
             }
@@ -746,8 +797,6 @@ public final class AppModel: ObservableObject {
         }
 
         if src.can("shows") {
-            let sh = try? await src.shows()
-            guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
             if let sh {
                 self.subscribedShows = sh
             }
@@ -755,8 +804,11 @@ public final class AppModel: ObservableObject {
             self.subscribedShows = []
         }
 
-        guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
         isLoadingHome = false
+
+        if !likeCheckPool.isEmpty {
+            await checkLikes(for: likeCheckPool)
+        }
     }
 
     // MARK: - 喜欢、歌单与评论操作
@@ -765,21 +817,55 @@ public final class AppModel: ObservableObject {
         likedMap[track.compositeKey] ?? false
     }
 
+    /// 按音源分组并保序去重曲目 ID，避免大曲库下对同一首歌重复查询喜欢状态
+    public static func uniqueTrackIDsBySource(tracks: [Track], fallbackSourceID: String) -> [String: [String]] {
+        var bySource: [String: [String]] = [:]
+        var seenKeys = Set<String>()
+        for t in tracks {
+            let sid = t.source ?? fallbackSourceID
+            let composite = "\(sid):\(t.id)"
+            if seenKeys.insert(composite).inserted {
+                bySource[sid, default: []].append(t.id)
+            }
+        }
+        return bySource
+    }
+
+    /// 仅计算与现有 `likedMap` 有差异的条目，消除无变化的冗余视图刷新
+    public static func diffLikedUpdates(
+        existing: [String: Bool],
+        incoming: [String: Bool],
+        sourceID: String
+    ) -> [String: Bool] {
+        var delta: [String: Bool] = [:]
+        for (id, liked) in incoming {
+            let key = "\(sourceID):\(id)"
+            if existing[key] != liked {
+                delta[key] = liked
+            }
+        }
+        return delta
+    }
+
     public func checkLikes(for tracks: [Track]) async {
         guard !tracks.isEmpty else { return }
-        var bySource: [String: [String]] = [:]
-        for t in tracks {
-            let sid = t.source ?? activeSourceID
-            bySource[sid, default: []].append(t.id)
-        }
+        let bySource = Self.uniqueTrackIDsBySource(tracks: tracks, fallbackSourceID: activeSourceID)
+        var pendingUpdates: [String: Bool] = [:]
         for (sid, ids) in bySource {
-            guard let src = source(forID: sid), src.can("isLiked") else { continue }
+            guard !ids.isEmpty, let src = source(forID: sid), src.can("isLiked") else { continue }
             if let map = try? await src.isLiked(ids: ids) {
-                for (id, liked) in map {
-                    likedMap["\(sid):\(id)"] = liked
+                let delta = Self.diffLikedUpdates(existing: likedMap, incoming: map, sourceID: sid)
+                for (key, value) in delta {
+                    pendingUpdates[key] = value
                 }
             }
         }
+        guard !pendingUpdates.isEmpty else { return }
+        var nextMap = likedMap
+        for (key, value) in pendingUpdates {
+            nextMap[key] = value
+        }
+        likedMap = nextMap
     }
 
     public func toggleLike(_ track: Track) async {

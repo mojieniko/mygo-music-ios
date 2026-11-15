@@ -15,6 +15,7 @@ import WebKit
 
 public struct SettingsView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.mygoIsViewVisible) private var isViewVisible
     @State private var showInstallSheet = false
     @State private var showPluginImporter = false
     @State private var githubRepoInput = ""
@@ -175,7 +176,7 @@ public struct SettingsView: View {
                                             scale: 0.78,
                                             useAdditiveBlend: true,
                                             tintColor: .white,
-                                            isActive: true
+                                            isActive: isViewVisible
                                         )
                                         .frame(height: previewSmokeHeight)
                                         .offset(y: -(previewSmokeHeight / 2 - ProgressSmokeView.anchorOffsetFromBottom(scale: 0.78)))
@@ -455,7 +456,7 @@ private struct PluginSourceRowView: View {
                                 .font(.system(size: 10, weight: .semibold))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(Color.primary.opacity(0.08), in: Capsule())
+                                .background(MyGoTheme.pillSurface, in: Capsule())
                         } else if let ver = info.version, !ver.isEmpty {
                             Text("v\(ver)")
                                 .font(.system(size: 11))
@@ -776,7 +777,7 @@ private struct PluginSettingFieldRow: View {
                             .foregroundStyle(.primary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
-                            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            .background(MyGoTheme.pillSurface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
                     .buttonStyle(.borderless)
                 }
@@ -802,12 +803,40 @@ private struct PluginSettingFieldRow: View {
 
 // MARK: - Liquid Glass 通透玻璃表面（对标 Apple Music iOS 26 悬浮胶囊光学质感）
 
+/// 悬浮液态玻璃在不同外观模式下的投影与透光参数（避免浅色白底出现厚重黑边蒙版）
+public enum LiquidGlassElevationSpec {
+    public static func primaryShadowOpacity(isDark: Bool) -> Double {
+        isDark ? 0.44 : 0.042
+    }
+
+    public static func primaryShadowRadius(isDark: Bool) -> CGFloat {
+        isDark ? 13 : 9
+    }
+
+    public static func primaryShadowOffsetY(isDark: Bool) -> CGFloat {
+        isDark ? 5 : 2.5
+    }
+
+    public static func contactShadowOpacity(isDark: Bool) -> Double {
+        isDark ? 0.22 : 0.022
+    }
+
+    public static func contactShadowRadius(isDark: Bool) -> CGFloat {
+        isDark ? 3 : 2
+    }
+
+    public static func contactShadowOffsetY(isDark: Bool) -> CGFloat {
+        isDark ? 1 : 0.5
+    }
+}
+
 private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
     let shape: S
     let isHighlighted: Bool
     @Environment(\.colorScheme) private var colorScheme
 
     func body(content: Content) -> some View {
+        let isDark = (colorScheme == .dark)
         content
             .background {
                 ZStack {
@@ -822,37 +851,39 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
             .clipShape(shape)
             .overlay(
                 shape
-                    .strokeBorder(borderGradient, lineWidth: colorScheme == .dark ? 0.9 : 1.0)
+                    .strokeBorder(borderGradient, lineWidth: isDark ? 0.65 : 0.85)
             )
             .shadow(
-                color: .black.opacity(colorScheme == .dark ? 0.36 : 0.095),
-                radius: 18,
+                color: .black.opacity(LiquidGlassElevationSpec.primaryShadowOpacity(isDark: isDark)),
+                radius: LiquidGlassElevationSpec.primaryShadowRadius(isDark: isDark),
                 x: 0,
-                y: 7
+                y: LiquidGlassElevationSpec.primaryShadowOffsetY(isDark: isDark)
             )
             .shadow(
-                color: .black.opacity(colorScheme == .dark ? 0.16 : 0.04),
-                radius: 3.5,
+                color: .black.opacity(LiquidGlassElevationSpec.contactShadowOpacity(isDark: isDark)),
+                radius: LiquidGlassElevationSpec.contactShadowRadius(isDark: isDark),
                 x: 0,
-                y: 1.5
+                y: LiquidGlassElevationSpec.contactShadowOffsetY(isDark: isDark)
             )
     }
 
     private var tintOverlay: Color {
         if colorScheme == .dark {
-            return Color(white: 0.15).opacity(isHighlighted ? 0.32 : 0.24)
+            // 沉稳黑曜石烟熏玻璃：抑制强亮背后内容透出导致的灰白塑料感
+            return Color(red: 0.085, green: 0.085, blue: 0.10).opacity(isHighlighted ? 0.72 : 0.64)
         }
-        return Color.white.opacity(isHighlighted ? 0.36 : 0.22)
+        // 浅色采用清亮薄雾白提亮，既透出背后色彩，又不发灰发暗
+        return Color.white.opacity(isHighlighted ? 0.50 : 0.38)
     }
 
     private var specularInnerSheen: LinearGradient {
         if colorScheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.white.opacity(0.14),
-                    Color.white.opacity(0.015),
+                    Color.white.opacity(0.065),
+                    Color.white.opacity(0.01),
                     Color.clear,
-                    Color.white.opacity(0.07)
+                    Color.white.opacity(0.025)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -860,10 +891,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         }
         return LinearGradient(
             colors: [
-                Color.white.opacity(0.48),
-                Color.white.opacity(0.08),
-                Color.clear,
-                Color.white.opacity(0.26)
+                Color.white.opacity(0.58),
+                Color.white.opacity(0.14),
+                Color.white.opacity(0.04),
+                Color.white.opacity(0.28)
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -874,10 +905,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         if colorScheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.white.opacity(0.44),
-                    Color.white.opacity(0.11),
-                    Color.white.opacity(0.06),
-                    Color.white.opacity(0.26)
+                    Color.white.opacity(0.18),
+                    Color.white.opacity(0.055),
+                    Color.white.opacity(0.035),
+                    Color.white.opacity(0.095)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -886,9 +917,9 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         return LinearGradient(
             colors: [
                 Color.white.opacity(0.95),
-                Color.white.opacity(0.35),
-                Color.white.opacity(0.20),
-                Color.white.opacity(0.75)
+                Color.white.opacity(0.38),
+                Color.white.opacity(0.24),
+                Color.white.opacity(0.78)
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -909,9 +940,11 @@ public struct MiniPlayerBarView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     public let isCompact: Bool
+    public var isScrollPaused: Bool = false
 
-    public init(isCompact: Bool = false) {
+    public init(isCompact: Bool = false, isScrollPaused: Bool = false) {
         self.isCompact = isCompact
+        self.isScrollPaused = isScrollPaused
     }
 
     public var body: some View {
@@ -931,7 +964,11 @@ public struct MiniPlayerBarView: View {
                         size: artworkSize,
                         cornerRadius: artworkRadius
                     )
-                    .shadow(color: .black.opacity(0.18), radius: 4, x: 0, y: 1.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: artworkRadius, style: .continuous)
+                            .fill(MyGoTheme.placeholderFill)
+                            .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 1.5)
+                    )
 
                     VStack(alignment: .leading, spacing: isCompact ? 1 : 2) {
                         HStack(spacing: 5) {
@@ -1027,7 +1064,11 @@ public struct MiniPlayerBarView: View {
             let miniLevel = CGFloat(min(1.0, max(0.15, rhythm.bass * 0.7 + rhythm.beatPulse * 0.4)))
             ZStack(alignment: .leading) {
                 Capsule()
-                    .fill(Color.primary.opacity(isCompact ? 0.045 : 0.06))
+                    .fill(
+                        colorScheme == .dark
+                            ? Color.white.opacity(isCompact ? 0.08 : 0.11)
+                            : Color.black.opacity(isCompact ? 0.05 : 0.065)
+                    )
                 Capsule()
                     .fill(
                         LinearGradient(
@@ -1050,8 +1091,9 @@ public struct MiniPlayerBarView: View {
                         scale: 0.52,
                         useAdditiveBlend: colorScheme == .dark,
                         tintColor: .white,
-                        isActive: true,
-                        lightSurfaceMode: colorScheme == .light
+                        isActive: !isScrollPaused && !app.isNowPlayingPresented,
+                        lightSurfaceMode: colorScheme == .light,
+                        frameRate: 30.0
                     )
                     .frame(height: miniSmokeHeight)
                     .mask {
@@ -1517,12 +1559,62 @@ public extension EnvironmentValues {
     }
 }
 
+/// 120Hz 滚动监听降噪过滤器：避免亚像素微震在主线程上触发高频无意义回调
+public enum VerticalScrollProbeFilter {
+    public static func shouldEmit(
+        lastNormalizedY: CGFloat?,
+        currentNormalizedY: CGFloat,
+        lastInteracting: Bool?,
+        currentInteracting: Bool,
+        maxOffset: CGFloat
+    ) -> Bool {
+        guard let prevY = lastNormalizedY, let prevInteracting = lastInteracting else {
+            return true
+        }
+        if currentInteracting != prevInteracting {
+            return true
+        }
+        // 顶/底安全区间必须精确传达以触发底栏边界复位或触底回弹
+        let nearTop = currentNormalizedY <= FloatingTabBarMinimizeMath.topAlwaysExpandedOffset + 24
+            || prevY <= FloatingTabBarMinimizeMath.topAlwaysExpandedOffset + 24
+        let nearBottom = maxOffset > 0
+            && (currentNormalizedY >= maxOffset - 24 || prevY >= maxOffset - 24)
+        if nearTop || nearBottom {
+            return abs(currentNormalizedY - prevY) >= 0.4
+        }
+        return abs(currentNormalizedY - prevY) >= 1.0
+    }
+}
+
+/// 持有底栏滚动协同器的无 `@Published` 容器，防止 `isMinimized` / `isUserScrolling` 变化连带触发整棵 Tab 树重建
+@MainActor
+private final class ScrollCoordinatorStore: ObservableObject {
+    let coordinator = TabBarScrollCoordinator()
+}
+
 @MainActor
 private final class TabBarScrollCoordinator: ObservableObject {
     @Published var isMinimized: Bool = false
+    @Published var isUserScrolling: Bool = false
     private var accumulatedDelta: CGFloat = 0
+    private var scrollIdleTask: Task<Void, Never>?
 
     func handleScroll(_ metrics: VerticalScrollMetrics) {
+        if metrics.isUserInteracting && abs(metrics.deltaY) >= 0.5 {
+            if !isUserScrolling {
+                isUserScrolling = true
+            }
+            scrollIdleTask?.cancel()
+            scrollIdleTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 220_000_000)
+                guard !Task.isCancelled else { return }
+                self?.isUserScrolling = false
+            }
+        } else if !metrics.isUserInteracting && isUserScrolling {
+            scrollIdleTask?.cancel()
+            isUserScrolling = false
+        }
+
         // 过滤瞬间尺寸重构造成的大跨度跳变
         guard abs(metrics.deltaY) < 220 else {
             if metrics.normalizedOffsetY <= FloatingTabBarMinimizeMath.topAlwaysExpandedOffset {
@@ -1549,6 +1641,8 @@ private final class TabBarScrollCoordinator: ObservableObject {
     }
 
     func resetAccumulatorAndExpand() {
+        scrollIdleTask?.cancel()
+        isUserScrolling = false
         accumulatedDelta = 0
         setMinimized(false)
     }
@@ -1582,6 +1676,10 @@ private final class VerticalScrollProbeUIView: UIView {
     private weak var observedScrollView: UIScrollView?
     private var contentOffsetObservation: NSKeyValueObservation?
     private var retryGeneration: Int = 0
+    private var lastReportedNormalizedY: CGFloat?
+    private var lastReportedInteracting: Bool?
+    private var pendingMetrics: VerticalScrollMetrics?
+    private var isFlushScheduled: Bool = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1634,6 +1732,10 @@ private final class VerticalScrollProbeUIView: UIView {
         contentOffsetObservation?.invalidate()
         contentOffsetObservation = nil
         observedScrollView = nil
+        lastReportedNormalizedY = nil
+        lastReportedInteracting = nil
+        pendingMetrics = nil
+        isFlushScheduled = false
     }
 
     private func attachNow() {
@@ -1643,8 +1745,9 @@ private final class VerticalScrollProbeUIView: UIView {
             guard let self,
                   self.window != nil,
                   scrollView.window != nil,
-                  self.isViewVisibleInHierarchy(self),
-                  scrollView.bounds.height > 0 else { return }
+                  !self.isHidden,
+                  scrollView.bounds.height > 0,
+                  self.isViewVisibleInHierarchy(self) else { return }
 
             let oldY = change.oldValue?.y ?? scrollView.contentOffset.y
             let newY = change.newValue?.y ?? scrollView.contentOffset.y
@@ -1654,14 +1757,35 @@ private final class VerticalScrollProbeUIView: UIView {
             let normalizedY = newY + insetTop
             let maxOffset = max(0, scrollView.contentSize.height + insetTop + insetBottom - scrollView.bounds.height)
             let isInteracting = scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating
-            let metrics = VerticalScrollMetrics(
+
+            guard VerticalScrollProbeFilter.shouldEmit(
+                lastNormalizedY: self.lastReportedNormalizedY,
+                currentNormalizedY: normalizedY,
+                lastInteracting: self.lastReportedInteracting,
+                currentInteracting: isInteracting,
+                maxOffset: maxOffset
+            ) else {
+                return
+            }
+
+            self.lastReportedNormalizedY = normalizedY
+            self.lastReportedInteracting = isInteracting
+
+            // 每帧最多合并派发一次主线程异步回调，兼顾避开 SwiftUI 布局重入与消除闭包堆积
+            self.pendingMetrics = VerticalScrollMetrics(
                 normalizedOffsetY: normalizedY,
                 deltaY: delta,
                 maxScrollOffset: maxOffset,
                 isUserInteracting: isInteracting
             )
+            guard !self.isFlushScheduled else { return }
+            self.isFlushScheduled = true
             DispatchQueue.main.async { [weak self] in
-                self?.onScroll?(metrics)
+                guard let self else { return }
+                self.isFlushScheduled = false
+                guard let metrics = self.pendingMetrics else { return }
+                self.pendingMetrics = nil
+                self.onScroll?(metrics)
             }
         }
     }
@@ -2218,20 +2342,20 @@ private struct PrimaryTabsCapsuleBar: View {
 
     private var activePillColor: Color {
         colorScheme == .dark
-            ? Color.white.opacity(0.15)
+            ? Color.white.opacity(0.135)
             : Color.black.opacity(0.065)
     }
 
     private var draggingPillColor: Color {
         colorScheme == .dark
-            ? Color.white.opacity(0.24)
+            ? Color.white.opacity(0.22)
             : Color.white.opacity(0.86)
     }
 
     private var activePillBorderGradient: LinearGradient {
         if colorScheme == .dark {
             return LinearGradient(
-                colors: [Color.white.opacity(0.24), Color.white.opacity(0.05)],
+                colors: [Color.white.opacity(0.16), Color.white.opacity(0.03)],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -2276,7 +2400,7 @@ private struct SearchCircleButton: View {
                     Circle()
                         .fill(
                             colorScheme == .dark
-                                ? Color.white.opacity(0.15)
+                                ? Color.white.opacity(0.135)
                                 : Color.black.opacity(0.06)
                         )
                         .padding(FloatingTabBarMetrics.outerInset)
@@ -2304,9 +2428,9 @@ private struct SearchCircleButton: View {
 
 private struct AdaptiveFloatingBottomChrome: View {
     @EnvironmentObject private var app: AppModel
+    @ObservedObject var scrollCoordinator: TabBarScrollCoordinator
     @Binding var selectedTab: Int
     let lastPrimaryTab: Int
-    let isMinimized: Bool
     let onSelectTab: (Int) -> Void
     let onExpandFromCircle: () -> Void
     let onSearchTap: () -> Void
@@ -2314,6 +2438,7 @@ private struct AdaptiveFloatingBottomChrome: View {
     @State private var measuredWidth: CGFloat = 360
 
     var body: some View {
+        let isMinimized = scrollCoordinator.isMinimized
         let hasTrack = (app.player.currentTrack != nil)
         let isCompactRow = isMinimized && hasTrack
         let isCompactWithoutTrack = isMinimized && !hasTrack
@@ -2379,9 +2504,12 @@ private struct AdaptiveFloatingBottomChrome: View {
                 .frame(width: measuredWidth, height: rowHeight, alignment: .bottom)
 
                 if hasTrack {
-                    MiniPlayerBarView(isCompact: isCompactRow)
-                        .frame(width: miniWidth, height: miniHeight)
-                        .offset(y: miniBottomOffset)
+                    MiniPlayerBarView(
+                        isCompact: isCompactRow,
+                        isScrollPaused: scrollCoordinator.isUserScrolling
+                    )
+                    .frame(width: miniWidth, height: miniHeight)
+                    .offset(y: miniBottomOffset)
                 }
             }
             .frame(width: measuredWidth, height: chromeHeight, alignment: .bottom)
@@ -2403,17 +2531,103 @@ private struct AdaptiveFloatingBottomChrome: View {
     }
 }
 
+private struct AddToPlaylistSheetView: View {
+    @EnvironmentObject private var app: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let track: Track
+
+    var body: some View {
+        let playlists = app.myPlaylists.filter { $0.fixed != true }
+        NavigationStack {
+            List {
+                SwiftUI.Section {
+                    HStack(spacing: 12) {
+                        ArtworkView(
+                            urlString: track.album.imageUrl,
+                            pixelSize: 120,
+                            size: 44,
+                            cornerRadius: 8
+                        )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(track.name)
+                                .font(.system(size: 15, weight: .semibold))
+                                .lineLimit(1)
+                            Text(track.artistNames)
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+
+                SwiftUI.Section(I18n.t("Add to Playlist")) {
+                    if playlists.isEmpty {
+                        Text(I18n.t("Nothing here yet"))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(playlists) { pl in
+                            Button {
+                                dismiss()
+                                Task { await app.addTrack(track, toPlaylist: pl.id) }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ArtworkView(
+                                        urlString: pl.imageUrl,
+                                        pixelSize: 120,
+                                        size: 38,
+                                        cornerRadius: 8,
+                                        systemIcon: "music.note.list"
+                                    )
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(pl.name)
+                                            .font(.system(size: 15, weight: .medium))
+                                            .foregroundStyle(.primary)
+                                        if let count = pl.trackCount {
+                                            Text(I18n.songs(count))
+                                                .font(.system(size: 12))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(I18n.t("Add to Playlist"))
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(I18n.t("Cancel")) {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
 // MARK: - iOS 应用根视图（对应 ui_main.go 中的 view）
 
 public struct MainView: View {
     @EnvironmentObject private var app: AppModel
-    @StateObject private var scrollCoordinator = TabBarScrollCoordinator()
+    @Environment(\.colorScheme) private var colorScheme
+    @StateObject private var scrollStore = ScrollCoordinatorStore()
     @State private var selectedTab: Int = 0
     @State private var lastPrimaryTab: Int = 0
     @State private var activatedTabs: Set<Int> = [0]
     @State private var isKeyboardVisible: Bool = false
 
     public init() {}
+
+    private var scrollCoordinator: TabBarScrollCoordinator {
+        scrollStore.coordinator
+    }
 
     private var preferredScheme: ColorScheme? {
         switch app.settings.appearance {
@@ -2451,6 +2665,7 @@ public struct MainView: View {
         let isActive = (selectedTab == index)
         if activatedTabs.contains(index) || isActive {
             tabWithBottomOverlayInset(content: content)
+                .environment(\.mygoIsViewVisible, isActive && !app.isNowPlayingPresented)
                 .opacity(isActive ? 1 : 0)
                 .allowsHitTesting(isActive)
                 .accessibilityHidden(!isActive)
@@ -2459,6 +2674,9 @@ public struct MainView: View {
     }
 
     public var body: some View {
+        let headersProvider: @MainActor (URL) -> [String: String] = { url in
+            app.imageHeaders(for: url)
+        }
         ZStack(alignment: .bottom) {
             ZStack {
                 tabViewport(index: 0) { HomeView() }
@@ -2474,11 +2692,11 @@ public struct MainView: View {
                 scrollCoordinator.resetAccumulatorAndExpand()
             }
 
-            // Apple Music iOS 26 分体悬浮液态玻璃底栏（支持上滑内容后音乐条自动融进底部一行，输入法弹起时平滑避让）
+            // Apple Music iOS 26 分体悬浮液态玻璃底栏（仅底栏独立订阅滚动折叠状态，完全避免重绘四页内容树）
             AdaptiveFloatingBottomChrome(
+                scrollCoordinator: scrollCoordinator,
                 selectedTab: $selectedTab,
                 lastPrimaryTab: lastPrimaryTab,
-                isMinimized: scrollCoordinator.isMinimized,
                 onSelectTab: { targetTab in
                     switchToTab(targetTab)
                 },
@@ -2494,12 +2712,30 @@ public struct MainView: View {
                 }
             )
             .padding(.bottom, bottomOverlayPadding)
-            .frame(height: isKeyboardVisible ? 0 : nil, alignment: .bottom)
+            // 不使用 .clipped()，避免把悬浮玻璃阴影上下硬切出横贯全屏的分层线条；键盘弹出时平滑下移淡出避让
+            .offset(y: isKeyboardVisible ? 36 : 0)
             .opacity(isKeyboardVisible ? 0 : 1)
-            .clipped()
             .allowsHitTesting(!isKeyboardVisible)
+            .accessibilityHidden(isKeyboardVisible)
         }
+        .environment(\.mygoImageHeadersProvider, headersProvider)
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
+        .tint(MyGoTheme.accent)
         .preferredColorScheme(preferredScheme)
+        #if canImport(UIKit)
+        .onAppear {
+            MyGoSystemAppearanceConfigurator.apply(for: app.settings.appearance)
+            DispatchQueue.main.async {
+                MyGoSystemAppearanceConfigurator.apply(for: app.settings.appearance)
+            }
+        }
+        .onChange(of: app.settings.appearance) { _, newAppearance in
+            MyGoSystemAppearanceConfigurator.apply(for: newAppearance)
+        }
+        .onChange(of: colorScheme) { _, _ in
+            MyGoSystemAppearanceConfigurator.apply(for: app.settings.appearance)
+        }
+        #endif
         #if canImport(UIKit)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
             withAnimation(.easeOut(duration: 0.20)) {
@@ -2529,11 +2765,13 @@ public struct MainView: View {
         .fullScreenCover(isPresented: $app.isNowPlayingPresented) {
             NowPlayingView()
                 .environmentObject(app)
+                .environment(\.mygoImageHeadersProvider, headersProvider)
         }
         #else
         .sheet(isPresented: $app.isNowPlayingPresented) {
             NowPlayingView()
                 .environmentObject(app)
+                .environment(\.mygoImageHeadersProvider, headersProvider)
                 .frame(minWidth: 420, minHeight: 640)
         }
         #endif
@@ -2546,10 +2784,17 @@ public struct MainView: View {
         .sheet(isPresented: $app.isSignInSheetPresented) {
             SignInDialogSheetView()
                 .environmentObject(app)
+                .environment(\.mygoImageHeadersProvider, headersProvider)
         }
         .sheet(item: $app.activeWebSignInRequest) { req in
             WebSignInSheetView(request: req)
                 .environmentObject(app)
+                .environment(\.mygoImageHeadersProvider, headersProvider)
+        }
+        .sheet(item: $app.pendingAddToPlaylistTrack) { targetTrack in
+            AddToPlaylistSheetView(track: targetTrack)
+                .environmentObject(app)
+                .environment(\.mygoImageHeadersProvider, headersProvider)
         }
         .onOpenURL { url in
             #if DEBUG
@@ -2699,3 +2944,78 @@ public struct MainView: View {
     }
     #endif
 }
+
+#if canImport(UIKit)
+/// 统一同步原生 UIWindow 暗黑模式与 UINavigationBar 磨砂外观（消除首页等界面滚动时顶部出现浑浊脏褐横条的问题）
+@MainActor
+private enum MyGoSystemAppearanceConfigurator {
+    static func apply(for appearance: AppAppearance) {
+        let uiStyle: UIUserInterfaceStyle
+        switch appearance {
+        case .system: uiStyle = .unspecified
+        case .light: uiStyle = .light
+        case .dark: uiStyle = .dark
+        }
+
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows where window.overrideUserInterfaceStyle != uiStyle {
+                window.overrideUserInterfaceStyle = uiStyle
+            }
+        }
+
+        let standard = UINavigationBarAppearance()
+        standard.configureWithDefaultBackground()
+        standard.backgroundColor = UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor.black.withAlphaComponent(0.76)
+                : UIColor.systemBackground.withAlphaComponent(0.84)
+        }
+        standard.shadowColor = UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor.white.withAlphaComponent(0.08)
+                : UIColor.black.withAlphaComponent(0.08)
+        }
+
+        let scrollEdge = UINavigationBarAppearance()
+        scrollEdge.configureWithTransparentBackground()
+        scrollEdge.backgroundColor = .clear
+        scrollEdge.shadowColor = .clear
+
+        let barProxy = UINavigationBar.appearance()
+        barProxy.standardAppearance = standard
+        barProxy.compactAppearance = standard
+        barProxy.scrollEdgeAppearance = scrollEdge
+        barProxy.compactScrollEdgeAppearance = scrollEdge
+
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows {
+                if let rootVC = window.rootViewController {
+                    refreshNavigationBars(under: rootVC, standard: standard, scrollEdge: scrollEdge)
+                }
+            }
+        }
+    }
+
+    private static func refreshNavigationBars(
+        under vc: UIViewController,
+        standard: UINavigationBarAppearance,
+        scrollEdge: UINavigationBarAppearance
+    ) {
+        if let nav = vc as? UINavigationController {
+            nav.navigationBar.standardAppearance = standard
+            nav.navigationBar.compactAppearance = standard
+            nav.navigationBar.scrollEdgeAppearance = scrollEdge
+            nav.navigationBar.compactScrollEdgeAppearance = scrollEdge
+            nav.navigationBar.setNeedsLayout()
+        }
+        for child in vc.children {
+            refreshNavigationBars(under: child, standard: standard, scrollEdge: scrollEdge)
+        }
+        if let presented = vc.presentedViewController {
+            refreshNavigationBars(under: presented, standard: standard, scrollEdge: scrollEdge)
+        }
+    }
+}
+#endif

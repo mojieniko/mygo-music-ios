@@ -69,7 +69,7 @@ public struct LoadMoreButton: View {
             }
             .padding(.horizontal, 22)
             .padding(.vertical, 10)
-            .background(Color.primary.opacity(0.08), in: Capsule())
+            .mygoPillSurface()
         }
         .buttonStyle(.plain)
         .disabled(isLoading)
@@ -89,7 +89,7 @@ public struct HomeView: View {
     public var body: some View {
         NavigationStack(path: $navPath) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
+                LazyVStack(alignment: .leading, spacing: 26) {
                     headerGreetingSection
 
                     if app.isLoadingHome && app.homeBrowse == nil && app.recentTracks.isEmpty {
@@ -107,6 +107,7 @@ public struct HomeView: View {
                 }
                 .padding(.vertical, 16)
             }
+            .background(MyGoTheme.pageBackground.ignoresSafeArea())
             .mygoTrackVerticalScroll()
             .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "home") ?? I18n.t("Home"))
             #if os(iOS)
@@ -177,11 +178,11 @@ public struct HomeView: View {
                         .padding(.leading, 4)
                         .padding(.trailing, 9)
                         .padding(.vertical, 4)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .background(MyGoTheme.elevatedSurface, in: Capsule())
                         .overlay(
-                            Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                            Capsule().strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.7)
                         )
-                        .shadow(color: .black.opacity(0.04), radius: 4, x: 0, y: 2)
+                        .shadow(color: .black.opacity(0.06), radius: 4, x: 0, y: 2)
                     }
                     .buttonStyle(.plain)
                 }
@@ -191,18 +192,15 @@ public struct HomeView: View {
     }
 
     private var fallbackHomeSections: some View {
-        VStack(alignment: .leading, spacing: 24) {
+        LazyVStack(alignment: .leading, spacing: 24) {
             if !app.recentTracks.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(I18n.t("Recently Played"))
                         .font(.system(size: 19, weight: .bold))
                         .padding(.horizontal, 16)
                     let slice = Array(app.recentTracks.prefix(8))
-                    ForEach(Array(slice.enumerated()), id: \.element.compositeKey) { idx, tr in
-                        TrackRowView(track: tr, index: idx) {
-                            app.player.playTrack(slice, at: idx)
-                        }
-                        .padding(.horizontal, 8)
+                    LazyTrackRowsView(tracks: slice) { list, idx in
+                        app.player.playTrack(list, at: idx)
                     }
                 }
             }
@@ -214,7 +212,7 @@ public struct HomeView: View {
                         .font(.system(size: 19, weight: .bold))
                         .padding(.horizontal, 16)
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
+                        LazyHStack(spacing: 16) {
                             ForEach(allPlaylists) { pl in
                                 Button {
                                     navPath.append(NavigationTarget.playlist(id: pl.id, name: pl.name))
@@ -239,7 +237,11 @@ public struct HomeView: View {
     private var emptyHomeState: some View {
         VStack(spacing: 14) {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(Color.primary.opacity(0.06))
+                .fill(MyGoTheme.elevatedSurface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.6)
+                )
                 .frame(width: 72, height: 72)
                 .overlay(
                     Image(systemName: app.activeSourceID == LocalMusicSource.sourceID ? "folder.badge.plus" : "music.note")
@@ -386,13 +388,14 @@ public struct SourceSwitcherMenu: View {
                     .frame(width: 8, height: 8)
                 Text(app.activeSource.info().name)
                     .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(.primary)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(Color.primary.opacity(0.07), in: Capsule())
+            .mygoPillSurface()
         }
     }
 }
@@ -415,7 +418,7 @@ public struct BrowseSectionsStack: View {
         let firstTrackSectionIndex = isHome ? sections.firstIndex(where: { !($0.tracks ?? []).isEmpty }) : nil
 
         ForEach(Array(sections.enumerated()), id: \.offset) { idx, section in
-            VStack(alignment: .leading, spacing: 12) {
+            LazyVStack(alignment: .leading, spacing: 12) {
                 // 首页第一个歌曲分区展示为每日推荐黑胶卡片（对应 ui_daily.go）
                 if idx == firstTrackSectionIndex, let tracks = section.tracks, !tracks.isEmpty {
                     let isPlayingFromHere = app.player.isPlaying && tracks.contains(where: { $0.compositeKey == app.player.currentTrack?.compositeKey })
@@ -450,22 +453,17 @@ public struct BrowseSectionsStack: View {
                         .padding(.horizontal, 16)
                     }
 
-                    // 歌曲列表
+                    // 歌曲列表（全面 Lazy 虚拟化渲染）
                     if let tracks = section.tracks, !tracks.isEmpty {
-                        VStack(spacing: 2) {
-                            ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { tIdx, tr in
-                                TrackRowView(track: tr, index: tIdx) {
-                                    app.player.playTrack(tracks, at: tIdx)
-                                }
-                                .padding(.horizontal, 8)
-                            }
+                        LazyTrackRowsView(tracks: tracks) { list, tIdx in
+                            app.player.playTrack(list, at: tIdx)
                         }
                     }
 
                     // 专辑横向卡片栏
                     if let albums = section.albums, !albums.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
+                            LazyHStack(spacing: 16) {
                                 ForEach(albums) { album in
                                     NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name)) {
                                         CoverCardView(
@@ -485,7 +483,7 @@ public struct BrowseSectionsStack: View {
                     // 歌手横向圆形卡片栏
                     if let artists = section.artists, !artists.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
+                            LazyHStack(spacing: 16) {
                                 ForEach(artists) { artist in
                                     NavigationLink(value: NavigationTarget.artist(id: artist.id, name: artist.name)) {
                                         CoverCardView(
@@ -506,7 +504,7 @@ public struct BrowseSectionsStack: View {
                     // 歌单横向卡片栏
                     if let playlists = section.playlists, !playlists.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
+                            LazyHStack(spacing: 16) {
                                 ForEach(playlists) { pl in
                                     NavigationLink(value: NavigationTarget.playlist(id: pl.id, name: pl.name)) {
                                         CoverCardView(
@@ -526,7 +524,7 @@ public struct BrowseSectionsStack: View {
                     // 播客横向卡片栏
                     if let shows = section.shows, !shows.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
+                            LazyHStack(spacing: 16) {
                                 ForEach(shows) { show in
                                     NavigationLink(value: NavigationTarget.show(id: show.id, name: show.name)) {
                                         CoverCardView(
@@ -546,7 +544,7 @@ public struct BrowseSectionsStack: View {
                     // 电台卡片栏（支持点击卡片任何位置及播放按钮）
                     if let stations = section.stations, !stations.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
+                            LazyHStack(spacing: 16) {
                                 ForEach(stations) { station in
                                     CoverCardView(
                                         title: station.name,
@@ -568,16 +566,19 @@ public struct BrowseSectionsStack: View {
 
                     // 自定义页面链接卡片（Links）
                     if let links = section.links, !links.isEmpty {
+                        let navItems = app.activeSource.info().navigation ?? []
                         VStack(spacing: 8) {
-                            ForEach(links, id: \.page) { link in
+                            ForEach(Array(links.enumerated()), id: \.offset) { _, link in
+                                let navIcon = navItems.first(where: { $0.page == link.page })?.icon
                                 NavigationLink(value: NavigationTarget.browse(page: link.page, title: link.title)) {
                                     HStack(spacing: 12) {
-                                        ArtworkView(
+                                        BrowseLinkIconView(
                                             urlString: link.imageUrl,
-                                            pixelSize: 120,
+                                            page: link.page,
+                                            title: link.title,
+                                            navigationIcon: navIcon,
                                             size: 46,
-                                            cornerRadius: 10,
-                                            systemIcon: "sparkles"
+                                            cornerRadius: 10
                                         )
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(link.title)
@@ -594,7 +595,7 @@ public struct BrowseSectionsStack: View {
                                             .foregroundStyle(.secondary)
                                     }
                                     .padding(12)
-                                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                    .mygoElevatedSurface(cornerRadius: 14)
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -621,7 +622,7 @@ public struct BrowsePageView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            LazyVStack(alignment: .leading, spacing: 20) {
                 if let sub = browseData?.subtitle, !sub.isEmpty {
                     Text(sub)
                         .font(.system(size: 13))
@@ -650,6 +651,7 @@ public struct BrowsePageView: View {
             }
             .padding(.vertical, 12)
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(browseData?.title ?? fallbackTitle ?? I18n.t("Discover"))
         .task {
@@ -697,7 +699,7 @@ public struct SectionTracksPageView: View {
                             .font(.system(size: 14, weight: .semibold))
                             .padding(.horizontal, 20)
                             .padding(.vertical, 10)
-                            .background(Color.primary.opacity(0.08), in: Capsule())
+                            .mygoPillSurface()
                     }
                     .buttonStyle(.plain)
                 }
@@ -710,13 +712,8 @@ public struct SectionTracksPageView: View {
                         .padding(.horizontal, 16)
                 }
 
-                VStack(spacing: 2) {
-                    ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
-                        TrackRowView(track: tr, index: idx) {
-                            app.player.playTrack(tracks, at: idx)
-                        }
-                        .padding(.horizontal, 8)
-                    }
+                LazyTrackRowsView(tracks: tracks) { list, idx in
+                    app.player.playTrack(list, at: idx)
                 }
 
                 if hasMore, let onLoadMore {
@@ -727,6 +724,7 @@ public struct SectionTracksPageView: View {
             }
             .padding(.vertical, 12)
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(title)
     }
@@ -758,7 +756,7 @@ public struct AlbumDetailView: View {
                     .frame(maxWidth: .infinity, minHeight: 240)
             } else if let page = albumPage {
                 let tracks = page.tracks ?? []
-                VStack(spacing: 20) {
+                LazyVStack(spacing: 20) {
                     VStack(spacing: 12) {
                         ArtworkView(
                             urlString: page.album.imageUrl,
@@ -767,7 +765,11 @@ public struct AlbumDetailView: View {
                             cornerRadius: 16,
                             systemIcon: "opticaldisc"
                         )
-                        .shadow(color: .black.opacity(0.24), radius: 16, x: 0, y: 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(MyGoTheme.placeholderFill)
+                                .shadow(color: .black.opacity(0.24), radius: 16, x: 0, y: 8)
+                        )
 
                         Text(page.album.name)
                             .font(.system(size: 22, weight: .bold))
@@ -797,7 +799,7 @@ public struct AlbumDetailView: View {
                                     .font(.system(size: 14, weight: .semibold))
                                     .padding(.horizontal, 20)
                                     .padding(.vertical, 10)
-                                    .background(Color.primary.opacity(0.08), in: Capsule())
+                                    .mygoPillSurface()
                             }
                             .buttonStyle(.plain)
 
@@ -811,7 +813,7 @@ public struct AlbumDetailView: View {
                                         .font(.system(size: 15, weight: .semibold))
                                         .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
                                         .frame(width: 40, height: 40)
-                                        .background(Color.primary.opacity(0.08), in: Circle())
+                                        .mygoCircleSurface()
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityLabel(I18n.t(isSaved ? "Saved" : "Save Album"))
@@ -820,17 +822,13 @@ public struct AlbumDetailView: View {
                     }
                     .padding(.top, 12)
 
-                    VStack(spacing: 2) {
-                        ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
-                            TrackRowView(track: tr, index: idx) {
-                                app.player.playTrack(tracks, at: idx)
-                            }
-                            .padding(.horizontal, 8)
-                        }
+                    LazyTrackRowsView(tracks: tracks) { list, idx in
+                        app.player.playTrack(list, at: idx)
                     }
                 }
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(albumPage?.album.name ?? fallbackName)
         .task {
@@ -917,7 +915,7 @@ public struct ArtistDetailView: View {
                 let tracks = page.tracks ?? []
                 let albums = page.albums ?? []
                 let effectiveArtistID = page.artist.id.isEmpty ? artistID : page.artist.id
-                VStack(alignment: .leading, spacing: 22) {
+                LazyVStack(alignment: .leading, spacing: 22) {
                     VStack(spacing: 12) {
                         ArtworkView(
                             urlString: page.artist.imageUrl,
@@ -950,7 +948,7 @@ public struct ArtistDetailView: View {
                                         .font(.system(size: 14, weight: .semibold))
                                         .padding(.horizontal, 20)
                                         .padding(.vertical, 9)
-                                        .background(Color.primary.opacity(0.08), in: Capsule())
+                                        .mygoPillSurface()
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -969,7 +967,7 @@ public struct ArtistDetailView: View {
                                     .foregroundStyle(isFollowing ? MyGoTheme.accent : .primary)
                                     .padding(.horizontal, 18)
                                     .padding(.vertical, 9)
-                                    .background(Color.primary.opacity(0.08), in: Capsule())
+                                    .mygoPillSurface()
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -979,7 +977,7 @@ public struct ArtistDetailView: View {
                     .padding(.top, 12)
 
                     if !tracks.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
+                        LazyVStack(alignment: .leading, spacing: 8) {
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Text(I18n.t("Songs"))
                                     .font(.system(size: 19, weight: .bold))
@@ -989,11 +987,8 @@ public struct ArtistDetailView: View {
                             }
                             .padding(.horizontal, 16)
 
-                            ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
-                                TrackRowView(track: tr, index: idx) {
-                                    app.player.playTrack(tracks, at: idx)
-                                }
-                                .padding(.horizontal, 8)
+                            LazyTrackRowsView(tracks: tracks) { list, idx in
+                                app.player.playTrack(list, at: idx)
                             }
 
                             if hasMoreSearchTracks {
@@ -1010,7 +1005,7 @@ public struct ArtistDetailView: View {
                                 .font(.system(size: 19, weight: .bold))
                                 .padding(.horizontal, 16)
                             ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 16) {
+                                LazyHStack(spacing: 16) {
                                     ForEach(albums) { album in
                                         NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name, sourceID: targetSourceID)) {
                                             CoverCardView(
@@ -1051,6 +1046,7 @@ public struct ArtistDetailView: View {
                 .frame(maxWidth: .infinity, minHeight: 260)
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(artistPage?.artist.name ?? fallbackName)
         .task {
@@ -1080,7 +1076,7 @@ public struct PlaylistDetailView: View {
                 let canRemove = isOwner && app.activeSource.can("removeFromPlaylist")
                 let canMove = isOwner && app.activeSource.can("movePlaylistTrack")
 
-                VStack(spacing: 20) {
+                LazyVStack(spacing: 20) {
                     VStack(spacing: 12) {
                         ArtworkView(
                             urlString: pl.imageUrl,
@@ -1089,7 +1085,11 @@ public struct PlaylistDetailView: View {
                             cornerRadius: 16,
                             systemIcon: "music.note.list"
                         )
-                        .shadow(color: .black.opacity(0.22), radius: 14, x: 0, y: 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(MyGoTheme.placeholderFill)
+                                .shadow(color: .black.opacity(0.22), radius: 14, x: 0, y: 6)
+                        )
 
                         Text(pl.name)
                             .font(.system(size: 22, weight: .bold))
@@ -1128,7 +1128,7 @@ public struct PlaylistDetailView: View {
                                         .font(.system(size: 14, weight: .semibold))
                                         .padding(.horizontal, 20)
                                         .padding(.vertical, 10)
-                                        .background(Color.primary.opacity(0.08), in: Capsule())
+                                        .mygoPillSurface()
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -1144,7 +1144,7 @@ public struct PlaylistDetailView: View {
                                         .font(.system(size: 15, weight: .semibold))
                                         .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
                                         .frame(width: 40, height: 40)
-                                        .background(Color.primary.opacity(0.08), in: Circle())
+                                        .mygoCircleSurface()
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -1152,8 +1152,11 @@ public struct PlaylistDetailView: View {
                     }
                     .padding(.top, 12)
 
-                    VStack(spacing: 2) {
-                        ForEach(Array(tracks.enumerated()), id: \.element.compositeKey) { idx, tr in
+                    LazyVStack(spacing: 2) {
+                        let entries = LazyTrackRowsView.buildRowEntries(for: tracks)
+                        ForEach(entries) { entry in
+                            let idx = entry.index
+                            let tr = entry.track
                             HStack(spacing: 4) {
                                 TrackRowView(track: tr, index: idx) {
                                     app.player.playTrack(tracks, at: idx)
@@ -1214,6 +1217,7 @@ public struct PlaylistDetailView: View {
                 }
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(playlistData?.name ?? fallbackName)
         .toolbar {
@@ -1273,7 +1277,7 @@ public struct PodcastShowDetailView: View {
                     .frame(maxWidth: .infinity, minHeight: 240)
             } else if let page = showPage {
                 let episodes = page.episodes ?? []
-                VStack(alignment: .leading, spacing: 20) {
+                LazyVStack(alignment: .leading, spacing: 20) {
                     VStack(spacing: 12) {
                         ArtworkView(
                             urlString: page.show.imageUrl,
@@ -1311,7 +1315,7 @@ public struct PodcastShowDetailView: View {
                                 .foregroundStyle(isSubscribed ? MyGoTheme.accent : .white)
                                 .padding(.horizontal, 20)
                                 .padding(.vertical, 9)
-                                .background(isSubscribed ? Color.primary.opacity(0.08) : MyGoTheme.accent, in: Capsule())
+                                .mygoPillSurface(isHighlighted: !isSubscribed)
                             }
                             .buttonStyle(.plain)
                         }
@@ -1319,15 +1323,12 @@ public struct PodcastShowDetailView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.top, 12)
 
-                    VStack(alignment: .leading, spacing: 8) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
                         Text(I18n.t("Episodes"))
                             .font(.system(size: 19, weight: .bold))
                             .padding(.horizontal, 16)
-                        ForEach(Array(episodes.enumerated()), id: \.element.compositeKey) { idx, ep in
-                            TrackRowView(track: ep, index: idx) {
-                                app.player.playTrack(episodes, at: idx)
-                            }
-                            .padding(.horizontal, 8)
+                        LazyTrackRowsView(tracks: episodes) { list, idx in
+                            app.player.playTrack(list, at: idx)
                         }
 
                         if page.more == true {
@@ -1339,6 +1340,7 @@ public struct PodcastShowDetailView: View {
                 }
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(showPage?.show.name ?? fallbackName)
         .task {
@@ -1418,6 +1420,7 @@ public struct SavedAlbumsPageView: View {
                 .padding(16)
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "savedAlbums") ?? I18n.t("Saved Albums"))
     }
@@ -1452,6 +1455,7 @@ public struct StationsPageView: View {
                 .padding(16)
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "stations") ?? I18n.t("Stations"))
     }
@@ -1483,6 +1487,7 @@ public struct SubscribedPodcastsPageView: View {
                 .padding(16)
             }
         }
+        .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
         .navigationTitle(app.activeSource.info().customTitle(forBuiltin: "shows") ?? I18n.t("Podcasts"))
     }

@@ -286,7 +286,7 @@ public struct NowPlayingView: View {
 
     private var queuePaneView: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
+            LazyVStack(alignment: .leading, spacing: 8) {
                 let ordered = app.player.orderedQueue
                 ForEach(Array(ordered.enumerated()), id: \.offset) { orderIdx, tr in
                     let isCurrent = (orderIdx == app.player.currentOrderIndex)
@@ -346,7 +346,7 @@ public struct NowPlayingView: View {
                         .foregroundStyle(.white.opacity(0.5))
                         .frame(maxWidth: .infinity, minHeight: 180)
                 } else {
-                    VStack(alignment: .leading, spacing: 14) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(app.currentTrackComments) { comment in
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack(spacing: 8) {
@@ -1074,6 +1074,7 @@ struct ProgressSmokeView: View {
     var tintColor: Color = .white
     var isActive: Bool = true
     var lightSurfaceMode: Bool = false
+    var frameRate: Double = 60.0
 
     @StateObject private var tracker = SmokeTrailTracker()
     @State private var drainComplete: Bool = false
@@ -1090,7 +1091,8 @@ struct ProgressSmokeView: View {
     var body: some View {
         GeometryReader { geometry in
             let bleed = 88 * scale
-            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !isActive && drainComplete)) { timeline in
+            let interval = 1.0 / max(10.0, frameRate)
+            TimelineView(.animation(minimumInterval: interval, paused: !isActive && drainComplete)) { timeline in
                 Canvas { context, size in
                     drawSmoke(
                         in: &context,
@@ -2175,7 +2177,8 @@ public struct CoverWallPaneView: View {
 // MARK: - 正在播放动态烟雾与流光背景（1:1 移植桌面端 backdrop.go GPU Shader）
 
 struct NowPlayingBackdropView: View {
-    @EnvironmentObject private var app: AppModel
+    @Environment(\.mygoImageHeadersProvider) private var imageHeadersProvider
+    @Environment(\.mygoIsViewVisible) private var isViewVisible
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var artworkLoader = ArtworkImageLoader()
     let imageURL: String?
@@ -2196,6 +2199,7 @@ struct NowPlayingBackdropView: View {
                     tintKey: imageURL ?? "",
                     player: player,
                     preview: preview,
+                    isViewVisible: isViewVisible,
                     reduceMotion: reduceMotion
                 )
             } else if fogEnabled {
@@ -2220,7 +2224,7 @@ struct NowPlayingBackdropView: View {
                 pixelSize: 200,
                 extractDominantColor: true
             ) { url in
-                app.imageHeaders(for: url)
+                imageHeadersProvider(url)
             }
         }
     }
@@ -2448,6 +2452,7 @@ private final class FogMetalCoordinator: NSObject, MTKViewDelegate {
     private var fadeStart: TimeInterval? = nil
 
     private var previewMode: Bool = false
+    private var isViewVisible: Bool = true
     private var reduceMotion: Bool = false
     private var lastTintKey: String = ""
 
@@ -2477,10 +2482,12 @@ private final class FogMetalCoordinator: NSObject, MTKViewDelegate {
         tintKey: String,
         player: PlayerEngine,
         preview: Bool,
+        isViewVisible: Bool,
         reduceMotion: Bool
     ) {
         self.player = player
         self.previewMode = preview
+        self.isViewVisible = isViewVisible
         self.reduceMotion = reduceMotion
 
         if !hasInitializedTint {
@@ -2535,6 +2542,10 @@ private final class FogMetalCoordinator: NSObject, MTKViewDelegate {
     }
 
     private func ensureTickerState(forceDraw: Bool) {
+        guard isViewVisible else {
+            setTickerActive(false)
+            return
+        }
         let now = Date.timeIntervalSinceReferenceDate
         let isPlaying = (player?.isPlaying ?? false)
         let shouldMove = (isPlaying || previewMode) && !reduceMotion
@@ -2680,6 +2691,7 @@ private struct FogShaderBackdropRepresentable: UIViewRepresentable {
     let tintKey: String
     @ObservedObject var player: PlayerEngine
     let preview: Bool
+    let isViewVisible: Bool
     let reduceMotion: Bool
 
     func makeCoordinator() -> FogMetalCoordinator {
@@ -2701,6 +2713,7 @@ private struct FogShaderBackdropRepresentable: UIViewRepresentable {
             tintKey: tintKey,
             player: player,
             preview: preview,
+            isViewVisible: isViewVisible,
             reduceMotion: reduceMotion
         )
         return view
@@ -2712,6 +2725,7 @@ private struct FogShaderBackdropRepresentable: UIViewRepresentable {
             tintKey: tintKey,
             player: player,
             preview: preview,
+            isViewVisible: isViewVisible,
             reduceMotion: reduceMotion
         )
     }
@@ -2727,6 +2741,7 @@ private struct FogShaderBackdropRepresentable: NSViewRepresentable {
     let tintKey: String
     @ObservedObject var player: PlayerEngine
     let preview: Bool
+    let isViewVisible: Bool
     let reduceMotion: Bool
 
     func makeCoordinator() -> FogMetalCoordinator {
@@ -2746,6 +2761,7 @@ private struct FogShaderBackdropRepresentable: NSViewRepresentable {
             tintKey: tintKey,
             player: player,
             preview: preview,
+            isViewVisible: isViewVisible,
             reduceMotion: reduceMotion
         )
         return view
@@ -2757,6 +2773,7 @@ private struct FogShaderBackdropRepresentable: NSViewRepresentable {
             tintKey: tintKey,
             player: player,
             preview: preview,
+            isViewVisible: isViewVisible,
             reduceMotion: reduceMotion
         )
     }
@@ -2775,6 +2792,7 @@ private struct FogShaderBackdropRepresentable: View {
     let tintKey: String
     @ObservedObject var player: PlayerEngine
     let preview: Bool
+    let isViewVisible: Bool
     let reduceMotion: Bool
 
     var body: some View {

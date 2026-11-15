@@ -330,6 +330,77 @@ public enum PluginHTTPUtilities {
         }
         return false
     }
+
+    /// 判断 HTTP 响应是否属于纯文本或 JSON 载荷，供 `fetch` 桥接跳过高开销的全量 Base64 冗余编码
+    public static func isLikelyTextPayload(contentType: String?, data: Data) -> Bool {
+        guard let ct = contentType?.lowercased(), !ct.isEmpty else {
+            return false
+        }
+        let mime = ct.split(separator: ";", maxSplits: 1).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let textMatch = mime.hasPrefix("text/")
+            || mime.contains("json")
+            || mime.contains("javascript")
+            || mime.contains("ecmascript")
+            || mime.contains("xml")
+            || mime == "application/x-www-form-urlencoded"
+        guard textMatch else { return false }
+        // 确保无空字节并可无损转为 UTF-8，以保证 Response.arrayBuffer() 通过 TextEncoder 还原字节一致
+        return !data.contains(0) && String(data: data, encoding: .utf8) != nil
+    }
+
+    /// 在网络回调线程预处理 HTTP 响应字典，避免占用串行 JS 执行队列
+    static func buildFetchResponsePayload(
+        urlString: String,
+        data: Data?,
+        httpResp: HTTPURLResponse?
+    ) -> [String: Any] {
+        let status = httpResp?.statusCode ?? 200
+        let statusText = HTTPURLResponse.localizedString(forStatusCode: status)
+        let rawData = data ?? Data()
+
+        var contentType: String?
+        var headerEntries: [[String]] = []
+        var setCookies: [String] = []
+        if let fields = httpResp?.allHeaderFields {
+            for (k, v) in fields {
+                let name = "\(k)"
+                let value = "\(v)"
+                let lower = name.lowercased()
+                if lower == "content-type" {
+                    contentType = value
+                }
+                if lower == "set-cookie" {
+                    let parts = splitSetCookieHeader(value)
+                    setCookies.append(contentsOf: parts)
+                    for p in parts {
+                        headerEntries.append(["set-cookie", p])
+                    }
+                } else {
+                    headerEntries.append([name, value])
+                }
+            }
+        }
+
+        let isText = isLikelyTextPayload(contentType: contentType, data: rawData)
+        let text = String(data: rawData, encoding: .utf8)
+            ?? String(data: rawData, encoding: .isoLatin1)
+            ?? ""
+
+        var payload: [String: Any] = [
+            "status": status,
+            "statusText": statusText,
+            "ok": (200...299).contains(status),
+            "url": httpResp?.url?.absoluteString ?? urlString,
+            "redirected": (httpResp?.url?.absoluteString ?? urlString) != urlString,
+            "text": text,
+            "headerEntries": headerEntries,
+            "setCookies": setCookies
+        ]
+        if !isText {
+            payload["base64"] = rawData.base64EncodedString()
+        }
+        return payload
+    }
 }
 
 /// 隔离 Cookie、可控重定向、支持 AbortController 中止的插件网络传输器
@@ -2244,66 +2315,35 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
                 permissions: perms
             ) { [weak self] data, httpResp, error in
                 guard let self else { return }
-                self.jsQueue.async {
-                    if let error {
-                        if let urlErr = error as? URLError, urlErr.code == .cancelled {
-                            _ = reject.call(withArguments: ["__ABORTED__"])
-                            return
-                        }
-                        let message: String
-                        if let urlError = error as? URLError,
-                           urlError.code == .serverCertificateUntrusted ||
-                           urlError.code == .secureConnectionFailed ||
-                           urlError.code == .serverCertificateHasBadDate ||
-                           urlError.code == .serverCertificateNotYetValid ||
-                           urlError.code == .serverCertificateHasUnknownRoot ||
-                           urlError.code == .clientCertificateRejected ||
-                           urlError.code == .clientCertificateRequired {
-                            message = "插件请求 https://\(host) 的证书未通过系统校验。请检查代理设置，或将该域名设为直连后重试；应用不会跳过证书验证。"
-                        } else {
-                            message = error.localizedDescription
-                        }
+                if let error {
+                    let message: String
+                    if let urlErr = error as? URLError, urlErr.code == .cancelled {
+                        message = "__ABORTED__"
+                    } else if let urlError = error as? URLError,
+                              urlError.code == .serverCertificateUntrusted ||
+                              urlError.code == .secureConnectionFailed ||
+                              urlError.code == .serverCertificateHasBadDate ||
+                              urlError.code == .serverCertificateNotYetValid ||
+                              urlError.code == .serverCertificateHasUnknownRoot ||
+                              urlError.code == .clientCertificateRejected ||
+                              urlError.code == .clientCertificateRequired {
+                        message = "插件请求 https://\(host) 的证书未通过系统校验。请检查代理设置，或将该域名设为直连后重试；应用不会跳过证书验证。"
+                    } else {
+                        message = error.localizedDescription
+                    }
+                    self.jsQueue.async {
                         _ = reject.call(withArguments: [message])
-                        return
                     }
+                    return
+                }
 
-                    let status = httpResp?.statusCode ?? 200
-                    let statusText = HTTPURLResponse.localizedString(forStatusCode: status)
-                    let rawData = data ?? Data()
-                    let text = String(data: rawData, encoding: .utf8)
-                        ?? String(data: rawData, encoding: .isoLatin1)
-                        ?? ""
-                    let base64 = rawData.base64EncodedString()
-
-                    var headerEntries: [[String]] = []
-                    var setCookies: [String] = []
-                    if let fields = httpResp?.allHeaderFields {
-                        for (k, v) in fields {
-                            let name = "\(k)"
-                            let value = "\(v)"
-                            if name.lowercased() == "set-cookie" {
-                                let parts = PluginHTTPUtilities.splitSetCookieHeader(value)
-                                setCookies.append(contentsOf: parts)
-                                for p in parts {
-                                    headerEntries.append(["set-cookie", p])
-                                }
-                            } else {
-                                headerEntries.append([name, value])
-                            }
-                        }
-                    }
-
-                    let payload: [String: Any] = [
-                        "status": status,
-                        "statusText": statusText,
-                        "ok": (200...299).contains(status),
-                        "url": httpResp?.url?.absoluteString ?? urlString,
-                        "redirected": (httpResp?.url?.absoluteString ?? urlString) != urlString,
-                        "text": text,
-                        "base64": base64,
-                        "headerEntries": headerEntries,
-                        "setCookies": setCookies
-                    ]
+                // 在网络回调线程完成文本/Base64 预处理与 Header 拆解，避免阻塞串行 JS 队列
+                let payload = PluginHTTPUtilities.buildFetchResponsePayload(
+                    urlString: urlString,
+                    data: data,
+                    httpResp: httpResp
+                )
+                self.jsQueue.async {
                     _ = resolve.call(withArguments: [payload])
                 }
             }
