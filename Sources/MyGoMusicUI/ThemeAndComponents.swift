@@ -275,6 +275,14 @@ public final class ArtworkImageLoader: ObservableObject {
         #endif
     }
 
+    /// 从主色调缓存中零延迟同步读取已提取的封面色彩（避免首页 Hero 卡片切回时闪回默认红色）
+    public static func cachedDominantRGB(rawURLString: String?, pixelSize: Int) -> BackdropRGBColor? {
+        guard let key = cacheKey(rawURLString: rawURLString, pixelSize: pixelSize) else {
+            return nil
+        }
+        return dominantColorCache.object(forKey: key as NSString)?.value
+    }
+
     /// 清空全部内存解码缓存（供单元测试或内存警告清理）
     public static func clearMemoryCache() {
         decodedCache.removeAllObjects()
@@ -880,159 +888,550 @@ public struct EqualizerBarsView: View {
     }
 }
 
-// MARK: - 每日推荐胶片黑胶卡片（移植自 internal/app/ui_daily.go）
+// MARK: - 每日推荐 / 最近播放 3 封面错落黑胶 Hero 卡片（1:1 移植自 internal/app/ui_daily.go）
 
 public struct DailyFeatureCardView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.mygoIsViewVisible) private var isViewVisible
+    @Environment(\.mygoImageHeadersProvider) private var imageHeadersProvider
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     public let section: MusicSection
     public let isPlayingFromCard: Bool
+    public let isQueueFromCard: Bool
     public let audioBands: [Float]
     public let onPlay: () -> Void
     public let onOpen: () -> Void
 
-    @State private var spinAngle: Double = 0
+    @StateObject private var primaryArtLoader = ArtworkImageLoader()
 
     public init(
         section: MusicSection,
         isPlayingFromCard: Bool,
+        isQueueFromCard: Bool = false,
         audioBands: [Float],
         onPlay: @escaping () -> Void,
         onOpen: @escaping () -> Void
     ) {
         self.section = section
         self.isPlayingFromCard = isPlayingFromCard
+        self.isQueueFromCard = isQueueFromCard || isPlayingFromCard
         self.audioBands = audioBands
         self.onPlay = onPlay
         self.onOpen = onOpen
     }
 
-    public var body: some View {
-        let tracks = section.tracks ?? []
-        let firstTrack = tracks.first
-        let artistSummary: String = {
-            var seen = Set<String>()
-            var ordered: [String] = []
-            for name in tracks.compactMap({ $0.artists?.first?.name }) {
-                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
-                seen.insert(trimmed)
-                ordered.append(trimmed)
-                if ordered.count >= 2 { break }
-            }
-            return ordered.joined(separator: ", ")
-        }()
-
-        Button(action: onOpen) {
-            ZStack(alignment: .bottomLeading) {
-                LinearGradient(
-                    colors: [
-                        MyGoTheme.accent.opacity(0.88),
-                        Color(red: 0.45, green: 0.14, blue: 0.26),
-                        Color(red: 0.14, green: 0.10, blue: 0.16)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-
-                // 右侧旋转黑胶唱片（对应 dailySpin）
-                HStack {
-                    Spacer()
-                    ZStack {
-                        Circle()
-                            .fill(
-                                AngularGradient(
-                                    colors: [.black, .white.opacity(0.14), .black, .white.opacity(0.12), .black],
-                                    center: .center
-                                )
-                            )
-                            .frame(width: 128, height: 128)
-                            .overlay(
-                                Circle()
-                                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-                            )
-
-                        ArtworkView(
-                            urlString: firstTrack?.album.imageUrl,
-                            pixelSize: 300,
-                            size: 54,
-                            cornerRadius: 27
-                        )
-                        Circle()
-                            .fill(.black)
-                            .frame(width: 10, height: 10)
-                    }
-                    .rotationEffect(.degrees(spinAngle))
-                    .offset(x: 16, y: 6)
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(section.title ?? I18n.t("Daily Picks"))
-                        .font(.system(size: 22, weight: .heavy))
-                        .foregroundStyle(.white)
-
-                    if !artistSummary.isEmpty {
-                        Text("\(artistSummary) · \(I18n.songs(tracks.count))")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.78))
-                            .lineLimit(1)
-                    } else {
-                        Text(I18n.songs(tracks.count))
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.78))
-                    }
-
-                    Spacer(minLength: 12)
-
-                    Button(action: onPlay) {
-                        HStack(spacing: 6) {
-                            if isPlayingFromCard {
-                                EqualizerBarsView(bands: audioBands, isPlaying: true, color: .white, barCount: 3)
-                            } else {
-                                Image(systemName: "play.fill")
-                                    .font(.system(size: 12, weight: .bold))
-                            }
-                            Text(I18n.t("Play"))
-                                .font(.system(size: 13, weight: .bold))
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(18)
-            }
-            .frame(height: 156)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color(red: 0.14, green: 0.10, blue: 0.16))
-                    .shadow(color: .black.opacity(0.22), radius: 14, x: 0, y: 6)
-            )
-        }
-        .buttonStyle(.plain)
-        .onAppear {
-            updateSpinAnimation(active: isPlayingFromCard && isViewVisible)
-        }
-        .onChange(of: isPlayingFromCard) { _, playing in
-            updateSpinAnimation(active: playing && isViewVisible)
-        }
-        .onChange(of: isViewVisible) { _, visible in
-            updateSpinAnimation(active: isPlayingFromCard && visible)
-        }
+    private var tracks: [Track] {
+        section.tracks ?? []
     }
 
-    private func updateSpinAnimation(active: Bool) {
-        if active {
-            withAnimation(.linear(duration: 12).repeatForever(autoreverses: false)) {
-                spinAngle = 360
+    private var coverURLs: [String?] {
+        DailyFeatureCardMath.featuredCoverURLs(for: tracks, limit: 3)
+    }
+
+    private var primaryCoverURL: String? {
+        coverURLs.first ?? tracks.first?.album.imageUrl
+    }
+
+    private var resolvedPrimaryImage: Image? {
+        if let targetKey = ArtworkImageLoader.cacheKey(rawURLString: primaryCoverURL, pixelSize: 480),
+           primaryArtLoader.loadedCacheKey == targetKey,
+           let loaded = primaryArtLoader.image {
+            return loaded
+        }
+        return ArtworkImageLoader.cachedSwiftUIImage(rawURLString: primaryCoverURL, pixelSize: 480)
+    }
+
+    private var resolvedDominantRGB: BackdropRGBColor? {
+        if let targetKey = ArtworkImageLoader.cacheKey(rawURLString: primaryCoverURL, pixelSize: 480),
+           primaryArtLoader.loadedCacheKey == targetKey,
+           let dom = primaryArtLoader.dominantRGB {
+            return dom
+        }
+        return ArtworkImageLoader.cachedDominantRGB(rawURLString: primaryCoverURL, pixelSize: 480)
+    }
+
+    private var isRecordAnimating: Bool {
+        isPlayingFromCard && isViewVisible && !reduceMotion
+    }
+
+    public var body: some View {
+        let colors = BackdropFogMath.dailyCardColors(from: resolvedDominantRGB)
+        let deepColor = Color(red: colors.deep.r, green: colors.deep.g, blue: colors.deep.b)
+        let richColor = Color(red: colors.rich.r, green: colors.rich.g, blue: colors.rich.b)
+        let glowColor = Color(red: colors.glow.r, green: colors.glow.g, blue: colors.glow.b)
+        let cardShape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+
+        GeometryReader { geo in
+            let compactLayout = geo.size.width < 355
+            let sleeveSize: CGFloat = compactLayout ? 94 : 106
+            let recordSize: CGFloat = compactLayout ? 86 : 98
+            let stackWidth: CGFloat = compactLayout ? 142 : 158
+            let trailingPadding: CGFloat = compactLayout ? 12 : 14
+            let leadingPadding: CGFloat = compactLayout ? 16 : 18
+            let coverCenterOffsetInStack: CGFloat = sleeveSize * 0.08
+            let recordPullOut: CGFloat = isQueueFromCard ? sleeveSize * 0.34 : sleeveSize * 0.25
+            let recordCenterX = geo.size.width
+                - trailingPadding
+                - stackWidth * 0.5
+                + coverCenterOffsetInStack
+                + recordPullOut
+            let recordCenter = CGPoint(x: recordCenterX, y: geo.size.height * 0.5)
+
+            ZStack {
+                DailyFeatureBackdropView(
+                    blurredCover: resolvedPrimaryImage,
+                    deepColor: deepColor,
+                    richColor: richColor,
+                    glowColor: glowColor,
+                    recordCenter: recordCenter,
+                    recordDiameter: recordSize,
+                    isAnimating: isRecordAnimating
+                )
+                .contentShape(cardShape)
+                .onTapGesture(perform: onOpen)
+
+                HStack(alignment: .center, spacing: compactLayout ? 8 : 12) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(I18n.today())
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .tracking(0.3)
+                            .foregroundStyle(.white.opacity(0.68))
+                            .lineLimit(1)
+
+                        Text(section.title ?? I18n.t("Daily Picks"))
+                            .font(.system(size: compactLayout ? 23 : 26, weight: .heavy))
+                            .tracking(-0.6)
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.76)
+
+                        Text(DailyFeatureCardMath.artistSummary(for: tracks))
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.82))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.9)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Spacer(minLength: 6)
+
+                        DailyHeroPlayPillButton(
+                            isQueueActive: isQueueFromCard,
+                            isPlaying: isPlayingFromCard,
+                            audioBands: audioBands,
+                            onPlay: onPlay
+                        )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onOpen)
+
+                    DailyHeroArtworkStack(
+                        coverURLs: coverURLs,
+                        primaryImage: resolvedPrimaryImage,
+                        sleeveSize: sleeveSize,
+                        recordSize: recordSize,
+                        stackWidth: stackWidth,
+                        coverCenterOffsetX: coverCenterOffsetInStack,
+                        recordOffsetX: recordPullOut,
+                        isPlaying: isPlayingFromCard,
+                        isAnimating: isRecordAnimating
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onOpen)
+                }
+                .padding(.leading, leadingPadding)
+                .padding(.trailing, trailingPadding)
+                .padding(.vertical, 16)
             }
-        } else {
-            withAnimation(.easeOut(duration: 0.45)) {
-                spinAngle = 0
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(cardShape)
+            .overlay(
+                cardShape.strokeBorder(.white.opacity(0.14), lineWidth: 0.85)
+            )
+            .background(
+                cardShape
+                    .fill(deepColor)
+                    .shadow(
+                        color: .black.opacity(colorScheme == .dark ? 0.36 : 0.18),
+                        radius: 16,
+                        x: 0,
+                        y: 8
+                    )
+            )
+        }
+        .frame(height: 186)
+        .animation(.easeInOut(duration: 0.55), value: resolvedDominantRGB)
+        .task(id: primaryCoverURL) {
+            await primaryArtLoader.load(
+                rawURLString: primaryCoverURL,
+                pixelSize: 480,
+                extractDominantColor: true
+            ) { url in
+                imageHeadersProvider(url)
             }
         }
+    }
+}
+
+/// Hero 卡片底层渐变、模糊纹理、发光光晕与同心圆黑胶纹理（对应 drawDailyBackdrop）
+private struct DailyFeatureBackdropView: View {
+    let blurredCover: Image?
+    let deepColor: Color
+    let richColor: Color
+    let glowColor: Color
+    let recordCenter: CGPoint
+    let recordDiameter: CGFloat
+    let isAnimating: Bool
+
+    @State private var phaseAnchor = Date()
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                stops: [
+                    .init(color: deepColor, location: 0.08),
+                    .init(color: richColor, location: 0.84),
+                    .init(color: MyGoTheme.mix(richColor, with: deepColor, ratio: 0.30), location: 1.0)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+
+            if let blurredCover {
+                Color.clear
+                    .background {
+                        blurredCover
+                            .resizable()
+                            .scaledToFill()
+                            .scaleEffect(1.18)
+                            .blur(radius: 28)
+                            .opacity(0.24)
+                    }
+                    .clipped()
+            }
+
+            // 左侧压暗，确保任何高光封面上白色文字依旧保持高对比度清晰可读
+            LinearGradient(
+                stops: [
+                    .init(color: deepColor.opacity(0.88), location: 0.0),
+                    .init(color: deepColor.opacity(0.0), location: 0.62)
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+
+            // 右侧黑胶中心发出的柔和主题辉光
+            GeometryReader { geo in
+                RadialGradient(
+                    colors: [glowColor.opacity(0.32), .clear],
+                    center: UnitPoint(
+                        x: geo.size.width > 0 ? recordCenter.x / geo.size.width : 0.78,
+                        y: geo.size.height > 0 ? recordCenter.y / geo.size.height : 0.5
+                    ),
+                    startRadius: 4,
+                    endRadius: 126
+                )
+            }
+
+            // 以黑胶中心向外逐圈淡出的细密同心圆环纹理（播放时微速向外涟漪，平时 0 帧刷新静默渲染）
+            TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !isAnimating)) { timeline in
+                let gap: CGFloat = 16
+                let rippleOffset: CGFloat = isAnimating
+                    ? CGFloat((timeline.date.timeIntervalSince(phaseAnchor) * Double(gap / 6.0)).truncatingRemainder(dividingBy: Double(gap)))
+                    : 0
+
+                Canvas { context, size in
+                    var radius = recordDiameter * 0.5 + 6 + rippleOffset
+                    let maxRadius = max(size.width, size.height) * 1.15
+                    while radius < maxRadius {
+                        let falloff = 1.0 - (radius - recordDiameter * 0.5) / (size.height * 1.45)
+                        let fadeIn = min(1.0, (radius - recordDiameter * 0.5 - 6) / gap)
+                        let alpha = 0.082 * falloff * fadeIn
+                        if alpha <= 0.005 {
+                            break
+                        }
+                        let ringRect = CGRect(
+                            x: recordCenter.x - radius,
+                            y: recordCenter.y - radius,
+                            width: radius * 2,
+                            height: radius * 2
+                        )
+                        context.stroke(
+                            Path(ellipseIn: ringRect),
+                            with: .color(.white.opacity(alpha)),
+                            lineWidth: 1.0
+                        )
+                        radius += gap
+                    }
+                }
+            }
+        }
+        .onChange(of: isAnimating) { _, active in
+            if active {
+                phaseAnchor = Date()
+            }
+        }
+    }
+}
+
+/// 右侧 3 张错落专辑封面叠放 + 侧出旋转黑胶唱片（对应 dailyStack）
+private struct DailyHeroArtworkStack: View {
+    let coverURLs: [String?]
+    let primaryImage: Image?
+    let sleeveSize: CGFloat
+    let recordSize: CGFloat
+    let stackWidth: CGFloat
+    let coverCenterOffsetX: CGFloat
+    let recordOffsetX: CGFloat
+    let isPlaying: Bool
+    let isAnimating: Bool
+
+    var body: some View {
+        let thirdSize = sleeveSize * 0.78
+        let secondSize = sleeveSize * 0.89
+        let opaquePlaceholderBg = LinearGradient(
+            colors: [
+                Color(red: 0.17, green: 0.17, blue: 0.19),
+                Color(red: 0.11, green: 0.11, blue: 0.13)
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+
+        ZStack {
+            // 第 3 张专辑封面（最深层、左侧倾斜露出）
+            if coverURLs.count >= 3 {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous).fill(opaquePlaceholderBg)
+                    ArtworkView(
+                        urlString: coverURLs[2],
+                        pixelSize: 240,
+                        size: thirdSize,
+                        cornerRadius: 9,
+                        systemIcon: "music.note"
+                    )
+                    RoundedRectangle(cornerRadius: 9, style: .continuous).fill(.black.opacity(0.16))
+                }
+                .frame(width: thirdSize, height: thirdSize)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .opacity(0.88)
+                .rotationEffect(.degrees(-11.0))
+                .offset(x: coverCenterOffsetX - sleeveSize * 0.35, y: 2)
+                .shadow(color: .black.opacity(0.42), radius: 10, x: 0, y: 5)
+            }
+
+            // 第 2 张专辑封面（中层、稍微左倾露出）
+            if coverURLs.count >= 2 {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous).fill(opaquePlaceholderBg)
+                    ArtworkView(
+                        urlString: coverURLs[1],
+                        pixelSize: 240,
+                        size: secondSize,
+                        cornerRadius: 10,
+                        systemIcon: "music.note"
+                    )
+                    RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.black.opacity(0.06))
+                }
+                .frame(width: secondSize, height: secondSize)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .opacity(0.95)
+                .rotationEffect(.degrees(-5.4))
+                .offset(x: coverCenterOffsetX - sleeveSize * 0.18, y: 1)
+                .shadow(color: .black.opacity(0.45), radius: 12, x: 0, y: 6)
+            }
+
+            // 探出的黑胶唱片（位于主封面右侧背后，播放本队列时向外顺滑滑出并缓慢旋转）
+            DailyMiniVinylRecordView(
+                size: recordSize,
+                labelImage: primaryImage,
+                isAnimating: isAnimating
+            )
+            .offset(x: coverCenterOffsetX + recordOffsetX, y: 0)
+            .shadow(color: .black.opacity(0.48), radius: 10, x: 0, y: 4)
+            .animation(.spring(duration: 0.65, bounce: 0.25), value: recordOffsetX)
+
+            // 第 1 张主专辑封面（最前方封套，不透明底托防止浅色模式透出背后黑胶）
+            primarySleeveView(size: sleeveSize, cornerRadius: 11.5, placeholderGradient: opaquePlaceholderBg)
+                .rotationEffect(.degrees(isPlaying ? -1.5 : 0))
+                .offset(x: coverCenterOffsetX, y: isPlaying ? -1 : 0)
+                .shadow(color: .black.opacity(0.50), radius: 14, x: 0, y: 7)
+                .animation(.spring(duration: 0.55, bounce: 0.25), value: isPlaying)
+        }
+        .frame(width: stackWidth, height: sleeveSize + 10)
+    }
+
+    private func primarySleeveView(
+        size: CGFloat,
+        cornerRadius: CGFloat,
+        placeholderGradient: LinearGradient
+    ) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        return ZStack {
+            shape.fill(placeholderGradient)
+
+            if let primaryImage {
+                primaryImage
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: "music.note")
+                    .font(.system(size: size * 0.34, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.60))
+            }
+
+            // 封套高光折光与极细亮边（对应 ui_daily.go sleeve gloss）
+            LinearGradient(
+                stops: [
+                    .init(color: .white.opacity(0.20), location: 0.0),
+                    .init(color: .clear, location: 0.42),
+                    .init(color: .clear, location: 0.72),
+                    .init(color: .black.opacity(0.16), location: 1.0)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+        .frame(width: size, height: size)
+        .clipShape(shape)
+        .overlay(
+            shape.strokeBorder(.white.opacity(0.16), lineWidth: 1.0)
+        )
+    }
+}
+
+/// 卡片内迷你黑胶唱片绘制（同心微沟槽 + 双对角 Conic 光束 + 中心封面标签 + 转轴孔，对应 drawRecord）
+private struct DailyMiniVinylRecordView: View {
+    let size: CGFloat
+    let labelImage: Image?
+    let isAnimating: Bool
+
+    @State private var spinStart = Date()
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isAnimating)) { timeline in
+            let angleDeg: Double = isAnimating
+                ? (timeline.date.timeIntervalSince(spinStart) * 60.0).truncatingRemainder(dividingBy: 360.0)
+                : 0
+            let labelDiameter = size * 0.36
+
+            ZStack {
+                Circle()
+                    .fill(Color(red: 0.055, green: 0.055, blue: 0.063))
+
+                // 同心黑胶纹路
+                Canvas { context, canvasSize in
+                    let d = min(canvasSize.width, canvasSize.height)
+                    let center = CGPoint(x: d * 0.5, y: d * 0.5)
+                    var rr = d * 0.21
+                    var index = 0
+                    while rr < d * 0.48 {
+                        let alpha = index.isMultiple(of: 3) ? 0.075 : 0.035
+                        let rect = CGRect(x: center.x - rr, y: center.y - rr, width: rr * 2, height: rr * 2)
+                        context.stroke(Path(ellipseIn: rect), with: .color(.white.opacity(alpha)), lineWidth: 0.7)
+                        rr += 2.2
+                        index += 1
+                    }
+                }
+
+                // 固定光源反射的双对角黑胶扇形高光
+                Circle()
+                    .fill(
+                        AngularGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.00),
+                                .init(color: .white.opacity(0.14), location: 0.08),
+                                .init(color: .clear, location: 0.20),
+                                .init(color: .clear, location: 0.50),
+                                .init(color: .white.opacity(0.14), location: 0.58),
+                                .init(color: .clear, location: 0.70),
+                                .init(color: .clear, location: 1.00)
+                            ],
+                            center: .center,
+                            angle: .degrees(20)
+                        )
+                    )
+
+                Circle()
+                    .strokeBorder(.white.opacity(0.11), lineWidth: 0.9)
+
+                // 中心随唱片同步旋转的专辑封面圆贴标
+                ZStack {
+                    Circle().fill(Color(red: 0.847, green: 0.149, blue: 0.176))
+                    if let labelImage {
+                        labelImage
+                            .resizable()
+                            .scaledToFill()
+                    }
+                }
+                .frame(width: labelDiameter, height: labelDiameter)
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(.black.opacity(0.35), lineWidth: 1.2))
+                .rotationEffect(.degrees(angleDeg))
+
+                // 黑胶中心转轴孔
+                Circle()
+                    .fill(Color(red: 0.055, green: 0.055, blue: 0.063))
+                    .frame(width: 4.5, height: 4.5)
+            }
+            .frame(width: size, height: size)
+        }
+        .onChange(of: isAnimating) { _, active in
+            if active {
+                spinStart = Date()
+            }
+        }
+    }
+}
+
+/// 卡片左下纯白高亮胶囊播放按钮（对应 dailyPlayButton）
+private struct DailyHeroPlayPillButton: View {
+    let isQueueActive: Bool
+    let isPlaying: Bool
+    let audioBands: [Float]
+    let onPlay: () -> Void
+
+    private var labelText: String {
+        if isPlaying {
+            return I18n.t("Playing")
+        }
+        if isQueueActive {
+            return I18n.t("Resume")
+        }
+        return I18n.t("Play")
+    }
+
+    var body: some View {
+        let ink = Color(red: 0.114, green: 0.114, blue: 0.122)
+        Button(action: onPlay) {
+            HStack(spacing: 7) {
+                if isPlaying {
+                    EqualizerBarsView(bands: audioBands, isPlaying: true, color: MyGoTheme.accent, barCount: 3)
+                } else {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 12, weight: .bold))
+                }
+                Text(labelText)
+                    .font(.system(size: 13.5, weight: .bold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(ink)
+            .padding(.horizontal, 18)
+            .frame(height: 36)
+            .background(Color.white, in: Capsule())
+            .shadow(color: .black.opacity(0.30), radius: 10, x: 0, y: 5)
+        }
+        .buttonStyle(DailyHeroPillPressStyle())
+    }
+}
+
+private struct DailyHeroPillPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
+            .opacity(configuration.isPressed ? 0.90 : 1.0)
+            .animation(.spring(duration: 0.22, bounce: 0.2), value: configuration.isPressed)
     }
 }
 

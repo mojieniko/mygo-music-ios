@@ -194,15 +194,14 @@ public struct HomeView: View {
     private var fallbackHomeSections: some View {
         LazyVStack(alignment: .leading, spacing: 24) {
             if !app.recentTracks.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(I18n.t("Recently Played"))
-                        .font(.system(size: 19, weight: .bold))
-                        .padding(.horizontal, 16)
-                    let slice = Array(app.recentTracks.prefix(8))
-                    LazyTrackRowsView(tracks: slice) { list, idx in
-                        app.player.playTrack(list, at: idx)
-                    }
+                let recentSection = MusicSection(
+                    title: I18n.t("Recently Played"),
+                    tracks: app.recentTracks
+                )
+                HomeSectionFeatureCard(section: recentSection) { target in
+                    navPath.append(target)
                 }
+                .padding(.horizontal, 16)
             }
 
             let allPlaylists = app.myPlaylists + app.savedPlaylists
@@ -418,47 +417,35 @@ public struct BrowseSectionsStack: View {
         let firstTrackSectionIndex = isHome ? sections.firstIndex(where: { !($0.tracks ?? []).isEmpty }) : nil
 
         ForEach(Array(sections.enumerated()), id: \.offset) { idx, section in
+            let isLeadFeature = idx == firstTrackSectionIndex && !(section.tracks ?? []).isEmpty
             LazyVStack(alignment: .leading, spacing: 12) {
-                // 首页第一个歌曲分区展示为每日推荐黑胶卡片（对应 ui_daily.go）
-                if idx == firstTrackSectionIndex, let tracks = section.tracks, !tracks.isEmpty {
-                    let isPlayingFromHere = app.player.isPlaying && tracks.contains(where: { $0.compositeKey == app.player.currentTrack?.compositeKey })
-                    DailyFeatureCardView(
-                        section: section,
-                        isPlayingFromCard: isPlayingFromHere,
-                        audioBands: isPlayingFromHere ? app.player.audioBands : [0.2, 0.2, 0.2, 0.2],
-                        onPlay: {
-                            app.player.playQueue(tracks, start: 0)
-                        },
-                        onOpen: {
-                            let pageTitle = section.pageTitle ?? section.title ?? I18n.t("Songs")
-                            onNavigate(.sectionTracks(title: pageTitle, subtitle: section.subtitle, tracks: tracks))
-                        }
-                    )
-                    .padding(.horizontal, 16)
-                } else {
-                    if let title = section.title, !title.isEmpty {
-                        HStack {
-                            Text(title)
-                                .font(.system(size: 19, weight: .bold))
-                            Spacer()
-                            if let morePage = section.morePage, !morePage.isEmpty {
-                                NavigationLink(value: NavigationTarget.browse(page: morePage, title: title)) {
-                                    Text(I18n.t("See All"))
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(MyGoTheme.accent)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
+                // 首页第一个歌曲分区展示为 3 封面错落黑胶 Hero 卡片（对应 ui_daily.go）
+                if isLeadFeature {
+                    HomeSectionFeatureCard(section: section, onNavigate: onNavigate)
                         .padding(.horizontal, 16)
-                    }
-
-                    // 歌曲列表（全面 Lazy 虚拟化渲染）
-                    if let tracks = section.tracks, !tracks.isEmpty {
-                        LazyTrackRowsView(tracks: tracks) { list, tIdx in
-                            app.player.playTrack(list, at: tIdx)
+                } else if let title = section.title, !title.isEmpty {
+                    HStack {
+                        Text(title)
+                            .font(.system(size: 19, weight: .bold))
+                        Spacer()
+                        if let morePage = section.morePage, !morePage.isEmpty {
+                            NavigationLink(value: NavigationTarget.browse(page: morePage, title: title)) {
+                                Text(I18n.t("See All"))
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(MyGoTheme.accent)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
+                    .padding(.horizontal, 16)
+                }
+
+                // 歌曲列表（首部已提升为 Hero 卡片的分区不再重复平铺单曲行；全面 Lazy 虚拟化渲染）
+                if !isLeadFeature, let tracks = section.tracks, !tracks.isEmpty {
+                    LazyTrackRowsView(tracks: tracks) { list, tIdx in
+                        app.player.playTrack(list, at: tIdx)
+                    }
+                }
 
                     // 专辑横向卡片栏
                     if let albums = section.albums, !albums.isEmpty {
@@ -602,9 +589,48 @@ public struct BrowseSectionsStack: View {
                         }
                         .padding(.horizontal, 16)
                     }
-                }
             }
         }
+    }
+}
+
+/// 首页 Hero 卡片共享连接器，统一承载「自定义首页」与「最近播放 Fallback」两种入口
+private struct HomeSectionFeatureCard: View {
+    @EnvironmentObject private var app: AppModel
+    let section: MusicSection
+    let onNavigate: (NavigationTarget) -> Void
+
+    var body: some View {
+        let tracks = section.tracks ?? []
+        let isQueueActive = DailyFeatureCardMath.isQueueActive(
+            queue: app.player.queue,
+            currentTrack: app.player.currentTrack,
+            sectionTracks: tracks
+        )
+        let isPlayingFromHere = isQueueActive && app.player.isPlaying
+
+        DailyFeatureCardView(
+            section: section,
+            isPlayingFromCard: isPlayingFromHere,
+            isQueueFromCard: isQueueActive,
+            audioBands: isPlayingFromHere ? app.player.audioBands : [0.2, 0.2, 0.2, 0.2],
+            onPlay: {
+                if isQueueActive {
+                    app.player.togglePlay()
+                } else {
+                    let startIdx = tracks.firstIndex(where: { $0.unavailable != true }) ?? 0
+                    app.player.playQueue(tracks, start: startIdx)
+                }
+            },
+            onOpen: {
+                let pageTitle = section.pageTitle ?? section.title ?? I18n.t("Songs")
+                if let morePage = section.morePage, !morePage.isEmpty {
+                    onNavigate(.browse(page: morePage, title: pageTitle))
+                } else {
+                    onNavigate(.sectionTracks(title: pageTitle, subtitle: section.subtitle, tracks: tracks))
+                }
+            }
+        )
     }
 }
 

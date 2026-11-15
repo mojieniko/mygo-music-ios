@@ -12,6 +12,35 @@ import UIKit
 import AppKit
 #endif
 
+/// 单个插件的在线检查状态
+public enum PluginUpdateCheckState: Hashable, Sendable {
+    case checking
+    case upToDate
+    case updateAvailable(String)
+    case failed(String)
+}
+
+/// 插件升级请求新增敏感权限时，等待用户二次确认的挂起任务
+public struct PendingPluginUpdateApproval: Identifiable, Sendable {
+    public var id: String { pending.manifest.id }
+    public var pluginName: String
+    public var targetVersion: String
+    public var addedPermissions: PluginPermissions
+    public var pending: PendingPlugin
+
+    public init(
+        pluginName: String,
+        targetVersion: String,
+        addedPermissions: PluginPermissions,
+        pending: PendingPlugin
+    ) {
+        self.pluginName = pluginName
+        self.targetVersion = targetVersion
+        self.addedPermissions = addedPermissions
+        self.pending = pending
+    }
+}
+
 /// 外观模式（对应 settings.Appearance）
 public enum AppAppearance: String, CaseIterable, Identifiable, Codable, Sendable {
     case system = "system"
@@ -166,6 +195,19 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var pluginLoadFailures: [PluginLoadFailure] = []
     @Published public private(set) var pluginOrigins: [String: PluginOrigin] = [:]
     @Published public private(set) var isCheckingUpdates: Bool = false
+    @Published public private(set) var pluginCheckStates: [String: PluginUpdateCheckState] = [:]
+    @Published public private(set) var updatingPluginIDs: Set<String> = []
+    @Published public private(set) var isUpdatingAllPlugins: Bool = false
+    @Published public var pendingPluginUpdateApproval: PendingPluginUpdateApproval? = nil
+    @Published public private(set) var communityPlugins: [CommunityPluginEntry] = []
+    @Published public private(set) var isLoadingCommunityPlugins: Bool = false
+    @Published public private(set) var communityPluginsError: String? = nil
+    private var cachedPluginReleases: [String: PluginReleaseInfo] = [:]
+
+    /// 当前有可用更新的已安装插件数量（仅计仍存在于本地列表中的插件）
+    public var availablePluginUpdateCount: Int {
+        pluginSources.filter { settings.pluginUpdates[$0.manifest.id] != nil }.count
+    }
     @Published public private(set) var isStartupReady: Bool = true
     @Published public var activeSourceID: String = "kugou-lite"
     public private(set) var syncInitDurationMs: Double = 0
@@ -226,6 +268,7 @@ public final class AppModel: ObservableObject {
     private var trackChangeCancellable: AnyCancellable?
     private var captionTask: Task<Void, Never>?
     private var startupTask: Task<Void, Never>? = nil
+    private var hasExplicitPluginReload = false
     private var commentLikePendingIDs: Set<String> = []
     private var searchGeneration = 0
     private var suggestionGeneration = 0
@@ -413,7 +456,13 @@ public final class AppModel: ObservableObject {
                 return (snapshot, restoredSession)
             }.value
 
-        applyPluginSnapshot(payload.snapshot)
+        let effectiveSnapshot: PluginDiscoverySnapshot
+        if hasExplicitPluginReload {
+            effectiveSnapshot = Self.loadPluginSnapshot(pluginsDir: pluginsRoot, pluginDataDir: pluginDataRoot)
+        } else {
+            effectiveSnapshot = payload.snapshot
+        }
+        applyPluginSnapshot(effectiveSnapshot)
         resolveInitialActiveSource()
 
         if let session = payload.session, player.currentTrack == nil {
@@ -426,6 +475,11 @@ public final class AppModel: ObservableObject {
         #endif
 
         await refreshActiveSource()
+
+        // 启动完成后后台按 24 小时冷却自动检测一次插件更新，不阻塞首屏就绪
+        Task { [weak self] in
+            await self?.checkForPluginUpdates(manual: false)
+        }
     }
 
     nonisolated private static func purgeDemoPluginAndFiles(pluginsDir: URL, localDir: URL) {
@@ -457,7 +511,7 @@ public final class AppModel: ObservableObject {
         let discovered = result.plugins.filter { $0.manifest.id != "demo" }
         var origins: [String: PluginOrigin] = [:]
         for p in discovered {
-            if let origin = PluginInstaller.readOrigin(in: p.pluginDir) {
+            if let origin = PluginInstaller.effectiveOrigin(for: p.pluginDir, manifest: p.manifest) {
                 origins[p.manifest.id] = origin
             }
         }
@@ -466,19 +520,33 @@ public final class AppModel: ObservableObject {
     }
 
     public func reloadPlugins() {
+        hasExplicitPluginReload = true
         let snapshot = Self.loadPluginSnapshot(pluginsDir: pluginsDir, pluginDataDir: pluginDataDir)
         applyPluginSnapshot(snapshot)
     }
 
     private func applyPluginSnapshot(_ snapshot: PluginDiscoverySnapshot) {
         var updates = settings.pluginUpdates
+        let activeIDs = Set(snapshot.plugins.map(\.manifest.id))
         for p in snapshot.plugins {
             wirePluginCallbacks(p)
-            if let pendingVer = updates[p.manifest.id],
-               let curVer = p.manifest.version,
-               !PluginInstaller.isNewerVersion(pendingVer, than: curVer) {
-                updates.removeValue(forKey: p.manifest.id)
+            let pid = p.manifest.id
+            let originVer = snapshot.origins[pid]?.version ?? ""
+            let installedVer = originVer.isEmpty ? (p.manifest.version ?? "") : originVer
+            if let pendingVer = updates[pid],
+               !installedVer.isEmpty,
+               !PluginInstaller.hasNewerUpdate(candidate: pendingVer, current: installedVer) {
+                updates.removeValue(forKey: pid)
             }
+        }
+        for staleID in updates.keys where !activeIDs.contains(staleID) {
+            updates.removeValue(forKey: staleID)
+        }
+        for staleID in pluginCheckStates.keys where !activeIDs.contains(staleID) {
+            pluginCheckStates.removeValue(forKey: staleID)
+        }
+        for staleID in cachedPluginReleases.keys where !activeIDs.contains(staleID) {
+            cachedPluginReleases.removeValue(forKey: staleID)
         }
         if updates != settings.pluginUpdates {
             settings.pluginUpdates = updates
@@ -1547,17 +1615,71 @@ public final class AppModel: ObservableObject {
 
     // MARK: - 插件安装、更新与 Deep Link（mygo-music://install-plugin?repo=owner/repo）
 
-    public func installPluginFromGitHub(repoInput: String) async {
+    private func cleanupTemporaryPendingSource(_ sourcePath: URL) {
+        let fm = FileManager.default
+        let tmpRoot = fm.temporaryDirectory.standardizedFileURL.path
+        let stdPath = sourcePath.standardizedFileURL.path
+        guard stdPath.hasPrefix(tmpRoot) else { return }
+        var cursor: URL? = sourcePath
+        while let current = cursor {
+            let stdCurrent = current.standardizedFileURL.path
+            guard stdCurrent.count > tmpRoot.count else { break }
+            let name = current.lastPathComponent
+            // 仅清理 PluginInstaller 自行解包的临时目录，绝不误删用户传入的本地文件夹或其父目录
+            if name.hasPrefix("mygo-plugin-") || name.hasPrefix("mygo-local-zip-") {
+                try? fm.removeItem(at: current)
+                return
+            }
+            cursor = current.deletingLastPathComponent()
+        }
+    }
+
+    private func finalizeInstalledPending(_ pending: PendingPlugin, switchActive: Bool) async throws -> JSPluginSource {
+        defer { cleanupTemporaryPendingSource(pending.sourcePath) }
+        let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
+        let pid = installed.manifest.id
+        settings.pluginUpdates.removeValue(forKey: pid)
+        cachedPluginReleases.removeValue(forKey: pid)
+        pluginCheckStates[pid] = .upToDate
+        reloadPlugins()
+        if switchActive {
+            switchSource(to: pid)
+        } else if activeSourceID == pid {
+            await refreshActiveSource()
+        }
+        return installed
+    }
+
+    private func applyCheckResult(
+        pluginID: String,
+        info: PluginUpdateInfo,
+        updates: inout [String: String]
+    ) {
+        if info.hasUpdate {
+            updates[pluginID] = info.latestVersion
+            if let release = info.release {
+                cachedPluginReleases[pluginID] = release
+            }
+            pluginCheckStates[pluginID] = .updateAvailable(info.latestVersion)
+        } else {
+            updates.removeValue(forKey: pluginID)
+            cachedPluginReleases.removeValue(forKey: pluginID)
+            pluginCheckStates[pluginID] = .upToDate
+        }
+    }
+
+    public func installPluginFromGitHub(repoInput: String, transport: PluginHTTPTransport? = nil) async {
         isInstallingPlugin = true
         installErrorMessage = nil
         defer { isInstallingPlugin = false }
         do {
-            let pending = try await PluginInstaller.fetchFromGitHub(repoInput: repoInput, token: settings.githubToken)
-            let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
-            settings.pluginUpdates.removeValue(forKey: installed.manifest.id)
-            reloadPlugins()
-            switchSource(to: installed.manifest.id)
-            showToast("Installed \(installed.info().name)")
+            let pending = try await PluginInstaller.fetchFromGitHub(
+                repoInput: repoInput,
+                token: settings.githubToken,
+                transport: transport
+            )
+            let installed = try await finalizeInstalledPending(pending, switchActive: true)
+            showToast(I18n.tf("Installed %@", installed.info().name))
         } catch {
             installErrorMessage = error.localizedDescription
         }
@@ -1569,77 +1691,290 @@ public final class AppModel: ObservableObject {
         defer { isInstallingPlugin = false }
         do {
             let pending = try PluginInstaller.openFromLocal(url)
-            let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
-            settings.pluginUpdates.removeValue(forKey: installed.manifest.id)
-            reloadPlugins()
-            switchSource(to: installed.manifest.id)
-            showToast("Installed \(installed.info().name)")
+            let installed = try await finalizeInstalledPending(pending, switchActive: true)
+            showToast(I18n.tf("Installed %@", installed.info().name))
         } catch {
             installErrorMessage = error.localizedDescription
             showToast(error.localizedDescription)
         }
     }
 
-    public func checkForPluginUpdates(manual: Bool = true) async {
+    public func checkForPluginUpdates(manual: Bool = true, transport: PluginHTTPTransport? = nil) async {
         guard !isCheckingUpdates else { return }
         if !manual {
             let now = Date().timeIntervalSince1970
             if now - settings.pluginsCheckedAt < 86400 { return }
         }
+
+        let checkable = pluginSources.compactMap { plugin -> (id: String, dir: URL)? in
+            guard PluginInstaller.effectiveOrigin(for: plugin.pluginDir, manifest: plugin.manifest) != nil else {
+                return nil
+            }
+            return (plugin.manifest.id, plugin.pluginDir)
+        }
+        guard !checkable.isEmpty else {
+            if manual {
+                let msg = pluginSources.isEmpty
+                    ? I18n.t("No updates available")
+                    : I18n.t("No plugins have a GitHub update source yet")
+                showToast(msg)
+            }
+            return
+        }
+
         isCheckingUpdates = true
         defer { isCheckingUpdates = false }
+        for item in checkable {
+            pluginCheckStates[item.id] = .checking
+        }
+
+        let token = settings.githubToken
+        let results: [(String, Result<PluginUpdateInfo, Error>)] = await withTaskGroup(
+            of: (String, Result<PluginUpdateInfo, Error>).self
+        ) { group in
+            for item in checkable {
+                group.addTask {
+                    do {
+                        let info = try await PluginInstaller.checkUpdate(for: item.dir, token: token, transport: transport)
+                        return (item.id, .success(info))
+                    } catch {
+                        return (item.id, .failure(error))
+                    }
+                }
+            }
+            var collected: [(String, Result<PluginUpdateInfo, Error>)] = []
+            for await res in group {
+                collected.append(res)
+            }
+            return collected
+        }
 
         var newUpdates = settings.pluginUpdates
         var foundCount = 0
-        for p in pluginSources {
-            guard PluginInstaller.readOrigin(in: p.pluginDir) != nil else { continue }
-            if let info = try? await PluginInstaller.checkUpdate(for: p.pluginDir, token: settings.githubToken) {
+        var firstFoundVersion: String?
+        var succeededCount = 0
+        var failedCount = 0
+        var lastError: String?
+
+        for (pid, result) in results {
+            switch result {
+            case .success(let info):
+                succeededCount += 1
+                applyCheckResult(pluginID: pid, info: info, updates: &newUpdates)
                 if info.hasUpdate {
-                    newUpdates[p.manifest.id] = info.latestVersion
                     foundCount += 1
-                    if let tmp = info.pending?.sourcePath {
-                        try? FileManager.default.removeItem(at: tmp)
+                    if firstFoundVersion == nil {
+                        firstFoundVersion = PluginInstaller.displayVersion(info.latestVersion)
                     }
-                } else {
-                    newUpdates.removeValue(forKey: p.manifest.id)
                 }
+            case .failure(let err):
+                failedCount += 1
+                lastError = err.localizedDescription
+                pluginCheckStates[pid] = .failed(err.localizedDescription)
             }
         }
+
         settings.pluginUpdates = newUpdates
-        settings.pluginsCheckedAt = Date().timeIntervalSince1970
+        // 自动后台检查若全部因离线/限流失败，不锁定 24 小时冷却，以便恢复联网后能自动重试
+        if manual || succeededCount > 0 {
+            settings.pluginsCheckedAt = Date().timeIntervalSince1970
+        }
 
         if manual {
-            if foundCount > 0 {
-                if let first = newUpdates.first {
-                    showToast(I18n.tf("Update to %s available", first.value))
-                }
+            if foundCount == 1, let ver = firstFoundVersion {
+                showToast(I18n.tf("Update to %s available", ver))
+            } else if foundCount > 1 {
+                showToast(I18n.tf("Checked updates · %d available", foundCount))
+            } else if failedCount > 0 && succeededCount == 0 {
+                showToast(lastError ?? I18n.t("Couldn't check for updates"))
             } else {
                 showToast(I18n.t("No updates available"))
             }
         }
     }
 
-    public func updatePlugin(id: String) async {
+    public func checkPluginUpdate(id: String, transport: PluginHTTPTransport? = nil) async {
         guard let target = pluginSources.first(where: { $0.manifest.id == id }) else { return }
-        guard let origin = PluginInstaller.readOrigin(in: target.pluginDir) else {
+        guard PluginInstaller.effectiveOrigin(for: target.pluginDir, manifest: target.manifest) != nil else {
+            pluginCheckStates[id] = .failed(I18n.t("Not installed via GitHub"))
             showToast(I18n.t("Not installed via GitHub"))
             return
         }
+
+        pluginCheckStates[id] = .checking
+        do {
+            let info = try await PluginInstaller.checkUpdate(
+                for: target.pluginDir,
+                token: settings.githubToken,
+                transport: transport
+            )
+            var newUpdates = settings.pluginUpdates
+            applyCheckResult(pluginID: id, info: info, updates: &newUpdates)
+            settings.pluginUpdates = newUpdates
+            if info.hasUpdate {
+                let ver = PluginInstaller.displayVersion(info.latestVersion)
+                showToast(I18n.tf("Update to %s available", ver))
+            } else {
+                showToast(I18n.t("Up to date"))
+            }
+        } catch {
+            pluginCheckStates[id] = .failed(error.localizedDescription)
+            showToast(error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    public func updatePlugin(
+        id: String,
+        forceReinstall: Bool = false,
+        skipPermissionPrompt: Bool = false,
+        transport: PluginHTTPTransport? = nil
+    ) async -> Bool {
+        guard !updatingPluginIDs.contains(id) else { return false }
+        guard let target = pluginSources.first(where: { $0.manifest.id == id }) else { return false }
+        guard let origin = PluginInstaller.effectiveOrigin(for: target.pluginDir, manifest: target.manifest) else {
+            showToast(I18n.t("Not installed via GitHub"))
+            return false
+        }
+
+        updatingPluginIDs.insert(id)
         isInstallingPlugin = true
         installErrorMessage = nil
+        defer {
+            updatingPluginIDs.remove(id)
+            isInstallingPlugin = !updatingPluginIDs.isEmpty
+        }
+
+        do {
+            var pending: PendingPlugin
+            if !forceReinstall,
+               let cached = cachedPluginReleases[id],
+               cached.repo == origin.repo {
+                pending = try await PluginInstaller.fetchFromRelease(
+                    cached,
+                    token: settings.githubToken,
+                    transport: transport
+                )
+            } else {
+                pending = try await PluginInstaller.fetchFromGitHub(
+                    repoInput: origin.repo,
+                    token: settings.githubToken,
+                    transport: transport
+                )
+            }
+            if pending.repo == nil {
+                pending.repo = origin.repo
+            }
+
+            if !skipPermissionPrompt,
+               let added = PluginInstaller.expandedPermissions(
+                   from: target.manifest.permissions,
+                   to: pending.manifest.permissions
+               ) {
+                let displayVer = PluginInstaller.displayVersion(pending.version ?? (pending.manifest.version ?? ""))
+                pendingPluginUpdateApproval = PendingPluginUpdateApproval(
+                    pluginName: pending.manifest.name ?? target.info().name,
+                    targetVersion: displayVer,
+                    addedPermissions: added,
+                    pending: pending
+                )
+                return false
+            }
+
+            let installed = try await finalizeInstalledPending(pending, switchActive: false)
+            let ver = PluginInstaller.displayVersion(pending.version ?? (installed.manifest.version ?? ""))
+            showToast(I18n.tf("Updated %@ %@", installed.info().name, ver))
+            return true
+        } catch {
+            installErrorMessage = error.localizedDescription
+            pluginCheckStates[id] = .failed(error.localizedDescription)
+            showToast(error.localizedDescription)
+            return false
+        }
+    }
+
+    public func updateAllPlugins(transport: PluginHTTPTransport? = nil) async {
+        guard !isUpdatingAllPlugins else { return }
+        let targetIDs = pluginSources
+            .map(\.manifest.id)
+            .filter { settings.pluginUpdates[$0] != nil }
+        guard !targetIDs.isEmpty else { return }
+
+        isUpdatingAllPlugins = true
+        defer { isUpdatingAllPlugins = false }
+        for pid in targetIDs {
+            _ = await updatePlugin(id: pid, transport: transport)
+        }
+    }
+
+    public func confirmPendingPluginUpdate() async {
+        guard let approval = pendingPluginUpdateApproval else { return }
+        pendingPluginUpdateApproval = nil
+        isInstallingPlugin = true
         defer { isInstallingPlugin = false }
         do {
-            let pending = try await PluginInstaller.fetchFromGitHub(repoInput: origin.repo, token: settings.githubToken)
-            let installed = try PluginInstaller.install(pending, into: pluginsDir, dataRootDir: pluginDataDir)
-            settings.pluginUpdates.removeValue(forKey: id)
-            reloadPlugins()
-            if activeSourceID == id {
-                await refreshActiveSource()
-            }
-            showToast("Updated \(installed.info().name) v\(installed.manifest.version ?? "")")
+            let installed = try await finalizeInstalledPending(approval.pending, switchActive: false)
+            let ver = PluginInstaller.displayVersion(approval.pending.version ?? (installed.manifest.version ?? ""))
+            showToast(I18n.tf("Updated %@ %@", installed.info().name, ver))
         } catch {
             installErrorMessage = error.localizedDescription
             showToast(error.localizedDescription)
+        }
+    }
+
+    public func cancelPendingPluginUpdate() {
+        guard let approval = pendingPluginUpdateApproval else { return }
+        pendingPluginUpdateApproval = nil
+        cleanupTemporaryPendingSource(approval.pending.sourcePath)
+    }
+
+    @discardableResult
+    public func linkPluginRepository(
+        id: String,
+        repoInput: String,
+        checkNow: Bool = true,
+        transport: PluginHTTPTransport? = nil
+    ) async -> Bool {
+        guard let target = pluginSources.first(where: { $0.manifest.id == id }) else { return false }
+        do {
+            let normalizedRepo = try PluginInstaller.parseRepo(repoInput)
+            let existing = PluginInstaller.readOrigin(in: target.pluginDir)
+            let initialVer: String
+            if existing?.repo == normalizedRepo, let ver = existing?.version, !ver.isEmpty {
+                initialVer = ver
+            } else {
+                initialVer = PluginInstaller.normalizeVersionTag(target.manifest.version ?? "")
+            }
+            try PluginInstaller.saveOrigin(PluginOrigin(repo: normalizedRepo, version: initialVer), in: target.pluginDir)
+            settings.pluginUpdates.removeValue(forKey: id)
+            cachedPluginReleases.removeValue(forKey: id)
+            pluginCheckStates.removeValue(forKey: id)
+            reloadPlugins()
+            if checkNow {
+                await checkPluginUpdate(id: id, transport: transport)
+            } else {
+                showToast(I18n.t("Linked GitHub update source"))
+            }
+            return true
+        } catch {
+            showToast(error.localizedDescription)
+            return false
+        }
+    }
+
+    public func loadCommunityPlugins(force: Bool = false, transport: PluginHTTPTransport? = nil) async {
+        guard !isLoadingCommunityPlugins else { return }
+        if !force && !communityPlugins.isEmpty { return }
+        isLoadingCommunityPlugins = true
+        communityPluginsError = nil
+        defer { isLoadingCommunityPlugins = false }
+        do {
+            communityPlugins = try await PluginInstaller.fetchCommunityPlugins(
+                token: settings.githubToken,
+                transport: transport
+            )
+        } catch {
+            communityPluginsError = error.localizedDescription
         }
     }
 
@@ -1658,6 +1993,9 @@ public final class AppModel: ObservableObject {
         guard let target = pluginSources.first(where: { $0.manifest.id == id }) else { return }
         try? FileManager.default.removeItem(at: target.pluginDir)
         settings.pluginUpdates.removeValue(forKey: id)
+        pluginCheckStates.removeValue(forKey: id)
+        cachedPluginReleases.removeValue(forKey: id)
+        updatingPluginIDs.remove(id)
         reloadPlugins()
         if activeSourceID == id {
             switchSource(to: enabledSources.first?.info().id ?? LocalMusicSource.sourceID)

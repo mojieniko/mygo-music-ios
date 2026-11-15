@@ -59,7 +59,6 @@ public struct NowPlayingView: View {
                         switch app.activeNowPlayingPane {
                         case .lyrics:
                             lyricsMainView(for: track, scrubbingPosition: scrubbingPosition)
-                                .padding(.horizontal, 22)
                                 .clipped()
                         case .stage:
                             StageVisualizerHostView(
@@ -268,8 +267,9 @@ public struct NowPlayingView: View {
                     navPath.append(NavigationTarget.artist(id: artist.id, name: artist.name, sourceID: track.source))
                 }
             )
+            .padding(.horizontal, 22)
 
-            // 滚动歌词区（直接传入 player 与 scrubbingPosition，实现拖动实时跟随与精准回弹）
+            // 滚动歌词区（行内自留 10pt 按压高光圆角边距，外侧 12pt 与上方封面保持精确 22pt 左对齐）
             LyricsScrollView(
                 player: app.player,
                 scrubbingPosition: scrubbingPosition,
@@ -279,6 +279,7 @@ public struct NowPlayingView: View {
                     app.player.seek(to: sec)
                 }
             )
+            .padding(.horizontal, 12)
         }
     }
 
@@ -1368,92 +1369,437 @@ struct ProgressSmokeView: View {
 
 // MARK: - 歌词高亮离散层级与单行缓存渲染（极大缩减 Diff 范围与避免级联刷新）
 
-private enum LyricHighlightTier: Equatable {
-    case current
-    case near1
-    case near2
-    case far
+/// 歌词行按压圆角高光反馈样式（遵循 iOS HIG 触控卡片微缩与明暗衬底反馈）
+private struct LyricRowButtonStyle: ButtonStyle {
+    let reduceMotion: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.white.opacity(configuration.isPressed ? 0.11 : 0.0))
+            )
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1.0, anchor: .leading)
+            .animation(.easeOut(duration: 0.16), value: configuration.isPressed)
+    }
+}
+
+/// 标记词条结尾是否自带空白间隔，用于在单词边界精确换行且不因尾随空格误折行
+private struct LyricWordTrailingSpaceKey: LayoutValueKey {
+    static let defaultValue: CGFloat = 0
+}
+
+/// Apple Music 风格自适应词流布局：按行排布完整词条与单字，防止英文单词被拆分或切换焦点时重排抖动
+private struct AppleMusicWordFlowLayout: Layout {
+    var lineSpacing: CGFloat = 5
+
+    func makeCache(subviews: Subviews) -> () { () }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = (proposal.width ?? .greatestFiniteMagnitude).isFinite
+            ? max(40, proposal.width ?? 340)
+            : CGFloat.greatestFiniteMagnitude
+        let rows = computeRows(maxWidth: maxWidth, subviews: subviews)
+        guard !rows.isEmpty else { return .zero }
+
+        var totalHeight: CGFloat = 0
+        var widest: CGFloat = 0
+        for (idx, row) in rows.enumerated() {
+            totalHeight += row.height
+            if idx + 1 < rows.count {
+                totalHeight += lineSpacing
+            }
+            widest = max(widest, row.width)
+        }
+        let resultWidth = maxWidth.isFinite ? maxWidth : widest
+        return CGSize(width: resultWidth, height: totalHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxWidth = max(40, bounds.width)
+        let rows = computeRows(maxWidth: maxWidth, subviews: subviews)
+        var y = bounds.minY
+        for row in rows {
+            var x = bounds.minX
+            for item in row.items {
+                let yOffset = (row.height - item.size.height) * 0.5
+                let itemProposal = item.clampedToContainer
+                    ? ProposedViewSize(width: maxWidth, height: nil)
+                    : ProposedViewSize(width: item.size.width, height: item.size.height)
+                subviews[item.index].place(
+                    at: CGPoint(x: x, y: y + yOffset),
+                    anchor: .topLeading,
+                    proposal: itemProposal
+                )
+                x += item.size.width
+            }
+            y += row.height + lineSpacing
+        }
+    }
+
+    private struct RowItem {
+        let index: Int
+        let size: CGSize
+        let clampedToContainer: Bool
+    }
+
+    private struct ComputedRow {
+        var items: [RowItem] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func computeRows(maxWidth: CGFloat, subviews: Subviews) -> [ComputedRow] {
+        var rows: [ComputedRow] = []
+        var current = ComputedRow()
+
+        for index in subviews.indices {
+            let subview = subviews[index]
+            let natural = subview.sizeThatFits(.unspecified)
+            let trailingTolerance = subview[LyricWordTrailingSpaceKey.self]
+            let visibleAdvance = max(0, natural.width - trailingTolerance)
+
+            if !current.items.isEmpty && current.width + visibleAdvance > maxWidth {
+                rows.append(current)
+                current = ComputedRow()
+            }
+
+            let needsClamp = current.items.isEmpty && natural.width > maxWidth && maxWidth.isFinite
+            let measuredSize = needsClamp
+                ? subview.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+                : natural
+
+            current.items.append(RowItem(index: index, size: measuredSize, clampedToContainer: needsClamp))
+            current.width += measuredSize.width
+            current.height = max(current.height, measuredSize.height)
+        }
+        if !current.items.isEmpty {
+            rows.append(current)
+        }
+        return rows
+    }
+}
+
+/// 单个歌词词条视觉单元：支持基于连续线性渐变遮罩的流体扫光、柔性余韵辉光与音节轻抬
+private struct AppleMusicWordItemView: View {
+    let parts: (core: String, trailing: String)
+    let motion: LyricWordMotion
+    let isActiveHighlight: Bool
+    let fontSize: CGFloat
+    let fontWeight: Font.Weight
+    let staticTintOpacity: Double
+    let dimOpacity: Double
+
+    private var glyphFont: Font {
+        .system(size: fontSize, weight: fontWeight)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if !parts.core.isEmpty {
+                coreGlyphView
+            }
+            if !parts.trailing.isEmpty {
+                Text(parts.trailing)
+                    .font(glyphFont)
+                    .foregroundStyle(.clear)
+            }
+        }
+        .layoutValue(
+            key: LyricWordTrailingSpaceKey.self,
+            value: parts.trailing.isEmpty ? 0 : fontSize * 0.25
+        )
+    }
+
+    @ViewBuilder
+    private var coreGlyphView: some View {
+        if !isActiveHighlight {
+            // 相邻预布局行（near1）：纯单色呈现以保证零重排开销
+            Text(parts.core)
+                .font(glyphFont)
+                .foregroundStyle(Color.white.opacity(staticTintOpacity))
+        } else {
+            ZStack(alignment: .leading) {
+                Text(parts.core)
+                    .font(glyphFont)
+                    .foregroundStyle(Color.white.opacity(dimOpacity))
+
+                if motion.wipeProgress >= 0.999 {
+                    Text(parts.core)
+                        .font(glyphFont)
+                        .foregroundStyle(.white)
+                        .shadow(
+                            color: .white.opacity(0.30 * motion.glowIntensity),
+                            radius: 5,
+                            x: 0,
+                            y: 0
+                        )
+                } else if motion.wipeProgress > 0.001 {
+                    let feather = 0.22
+                    let lead = motion.wipeProgress * (1.0 + feather) - feather
+                    let tail = lead + feather
+                    Text(parts.core)
+                        .font(glyphFont)
+                        .foregroundStyle(.white)
+                        .shadow(
+                            color: .white.opacity(0.36 * motion.glowIntensity),
+                            radius: 6,
+                            x: 0,
+                            y: 0
+                        )
+                        .mask {
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black, location: 0.0),
+                                    .init(color: .black, location: min(max(lead, 0.0), 1.0)),
+                                    .init(color: .clear, location: min(max(tail, 0.0), 1.0)),
+                                    .init(color: .clear, location: 1.0)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        }
+                }
+            }
+            .scaleEffect(motion.scale, anchor: .center)
+            .offset(y: motion.liftY)
+        }
+    }
+}
+
+/// 隔离于单行内部的 60fps 硬件时钟驱动器：仅当该行处于当前聚焦演唱态时才唤醒逐字动画帧刷新
+private struct ActiveLyricLineWordsHostView: View {
+    let words: [LyricWord]
+    let fallbackText: String
+    let isCurrent: Bool
+    let isPlaying: Bool
+    let scrubbingPosition: TimeInterval?
+    let staticPosition: TimeInterval
+    let livePositionProvider: () -> TimeInterval
+    let fontSize: CGFloat
+    let fontWeight: Font.Weight
+    let staticTintOpacity: Double
+    let reduceMotion: Bool
+
+    var body: some View {
+        if isCurrent {
+            // 仅在播放且非拖拽时启动 60fps 帧采样；暂停与拖拽时由外部状态按需精准刷新
+            let timelinePaused = !isPlaying || scrubbingPosition != nil
+            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: timelinePaused)) { timeline in
+                let _ = timeline.date
+                let rawPos = scrubbingPosition ?? (isPlaying ? livePositionProvider() : staticPosition)
+                // 与行切分保持一致的 0.08s 视听前瞻补偿，让歌词点亮时刻与耳中人声分毫不差
+                let livePos = rawPos + 0.08
+                wordsFlowContent(livePosition: livePos, active: true)
+            }
+        } else {
+            wordsFlowContent(livePosition: nil, active: false)
+        }
+    }
+
+    @ViewBuilder
+    private func wordsFlowContent(livePosition: TimeInterval?, active: Bool) -> some View {
+        if words.count > 120 {
+            // 对极端超长文本兜底系统 Text 拼合，兼顾流体计算上限保护
+            legacyConcatenatedText(livePosition: livePosition, active: active)
+        } else {
+            AppleMusicWordFlowLayout(lineSpacing: 5) {
+                ForEach(Array(words.enumerated()), id: \.offset) { _, word in
+                    let parts = LyricsEngine.splitWordTrailingWhitespace(word.text)
+                    let motion = active && livePosition != nil
+                        ? LyricsEngine.wordMotion(for: word, at: livePosition ?? 0, reduceMotion: reduceMotion)
+                        : LyricWordMotion(wipeProgress: 0, liftY: 0, scale: 1.0, glowIntensity: 0, isActive: false)
+                    AppleMusicWordItemView(
+                        parts: parts,
+                        motion: motion,
+                        isActiveHighlight: active,
+                        fontSize: fontSize,
+                        fontWeight: fontWeight,
+                        staticTintOpacity: staticTintOpacity,
+                        dimOpacity: 0.54
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func legacyConcatenatedText(livePosition: TimeInterval?, active: Bool) -> some View {
+        var combined = Text("")
+        if active, let pos = livePosition {
+            for word in words {
+                let motion = LyricsEngine.wordMotion(for: word, at: pos, reduceMotion: reduceMotion)
+                let opacity = 0.54 + 0.46 * motion.wipeProgress
+                combined = combined + Text(word.text).foregroundColor(.white.opacity(opacity))
+            }
+        } else {
+            combined = Text(fallbackText).foregroundColor(.white.opacity(staticTintOpacity))
+        }
+        return combined
+            .font(.system(size: fontSize, weight: fontWeight))
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// 滚动歌词流中的 Apple Music 风格前奏/长间奏三圆点呼吸气泡
+private struct AppleMusicInterludeDotsRowView: View {
+    let window: LyricInterludeWindow?
+    let isVisible: Bool
+    let isPlaying: Bool
+    let scrubbingPosition: TimeInterval?
+    let staticPosition: TimeInterval
+    let livePositionProvider: () -> TimeInterval
+    let reduceMotion: Bool
+
+    var body: some View {
+        let timelinePaused = !isVisible || !isPlaying || scrubbingPosition != nil
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: timelinePaused)) { timeline in
+            let now = timeline.date.timeIntervalSince1970
+            let pos = scrubbingPosition ?? (isPlaying ? livePositionProvider() : staticPosition)
+            let progress: Double = {
+                guard let window else { return 0 }
+                let span = max(0.1, window.to - window.from)
+                return min(1.0, max(0.0, (pos - window.from) / span))
+            }()
+            // 在靠近下一句开唱前 0.45s 平滑收敛消隐，优雅让位给首字
+            let tailScale: CGFloat = {
+                guard let window, !reduceMotion else { return 1.0 }
+                let rem = max(0.0, window.to - pos)
+                return rem < 0.45 ? max(0.65, CGFloat(rem / 0.45)) : 1.0
+            }()
+
+            HStack(spacing: 8) {
+                ForEach(0..<3, id: \.self) { idx in
+                    let dotLit = min(1.0, max(0.0, progress * 3.0 - Double(idx)))
+                    let pulse: CGFloat = reduceMotion
+                        ? 1.0
+                        : 0.90 + 0.22 * CGFloat(0.5 + 0.5 * sin(now * 3.6 - Double(idx) * 0.85))
+                    Circle()
+                        .fill(Color.white.opacity(0.28 + 0.68 * dotLit))
+                        .frame(width: 10, height: 10)
+                        .scaleEffect(pulse * tailScale)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: isVisible ? 34 : 0)
+            .opacity(isVisible ? 1.0 : 0.0)
+            .clipped()
+            .animation(.spring(response: 0.44, dampingFraction: 0.86), value: isVisible)
+        }
+    }
 }
 
 private struct LyricRowView: View, Equatable {
     let index: Int
     let line: LyricLine
-    let tier: LyricHighlightTier
-    let currentTime: TimeInterval
+    let presentation: LyricLinePresentation
+    let isUserScrolling: Bool
+    let isCredit: Bool
+    let isPlaying: Bool
+    let scrubbingPosition: TimeInterval?
+    let staticPosition: TimeInterval
+    let livePositionProvider: () -> TimeInterval
+    let reduceMotion: Bool
     let onSeek: (TimeInterval) -> Void
+
+    private static let primaryFontSize: CGFloat = 24
+    private static let translationFontSize: CGFloat = 15
 
     static func == (lhs: LyricRowView, rhs: LyricRowView) -> Bool {
         guard lhs.index == rhs.index &&
-                lhs.tier == rhs.tier &&
+                lhs.presentation == rhs.presentation &&
+                lhs.isUserScrolling == rhs.isUserScrolling &&
+                lhs.isCredit == rhs.isCredit &&
+                lhs.isPlaying == rhs.isPlaying &&
+                lhs.reduceMotion == rhs.reduceMotion &&
+                lhs.line.at == rhs.line.at &&
+                lhs.line.end == rhs.line.end &&
                 lhs.line.text == rhs.line.text &&
                 lhs.line.translation == rhs.line.translation &&
                 lhs.line.words.count == rhs.line.words.count else {
             return false
         }
-        if lhs.tier == .current && !lhs.line.words.isEmpty {
-            return abs(lhs.currentTime - rhs.currentTime) < 0.025
+        // 非聚焦行完全屏蔽高频时间变更，保持 0% 额外重绘消耗
+        guard lhs.presentation.tier == .current else { return true }
+        if lhs.scrubbingPosition != rhs.scrubbingPosition {
+            return false
+        }
+        // 仅在暂停非拖拽状态下比对静态位置（播放态由内部 60fps TimelineView 驱动）
+        if !lhs.isPlaying && lhs.scrubbingPosition == nil {
+            return abs(lhs.staticPosition - rhs.staticPosition) < 0.015
         }
         return true
     }
 
-    var body: some View {
-        let isCurrent = (tier == .current)
-        let opacity: Double = {
-            switch tier {
-            case .current: return 1.0
-            case .near1: return 0.58
-            case .near2: return 0.42
-            case .far: return 0.24
-            }
-        }()
-
-        VStack(alignment: .leading, spacing: 4) {
-            lyricLineText(isCurrent: isCurrent, fallbackOpacity: opacity)
-                .font(.system(size: isCurrent ? 23 : 18, weight: isCurrent ? .bold : .semibold))
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !line.translation.isEmpty {
-                Text(line.translation)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(isCurrent ? .white.opacity(0.80) : .white.opacity(opacity * 0.75))
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+    private var rowTransitionAnimation: Animation {
+        if isUserScrolling {
+            return .easeOut(duration: 0.18)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            onSeek(line.at)
+        if reduceMotion {
+            return .easeInOut(duration: 0.22)
         }
+        return .spring(response: 0.54, dampingFraction: 0.84, blendDuration: 0.14)
+            .delay(presentation.staggerDelay)
     }
 
-    /// 逐字卡拉OK拼合渲染：仅当前行且存在逐字时间戳时启用，未唱到文字柔和半透明，已唱/正唱渐变点亮
-    private func lyricLineText(isCurrent: Bool, fallbackOpacity: Double) -> Text {
-        guard isCurrent, !line.words.isEmpty else {
-            return Text(line.text)
-                .foregroundColor(isCurrent ? .white : .white.opacity(fallbackOpacity))
-        }
-        var combined = Text("")
-        for word in line.words {
-            let wordColor: Color
-            if currentTime >= word.end || (word.end <= word.start && currentTime >= word.start) {
-                wordColor = .white
-            } else if currentTime >= word.start {
-                let dur = max(0.04, word.end - word.start)
-                let p = min(max((currentTime - word.start) / dur, 0), 1)
-                wordColor = .white.opacity(0.55 + 0.45 * p)
-            } else {
-                wordColor = .white.opacity(0.45)
+    var body: some View {
+        let isCurrent = (presentation.tier == .current)
+        let usesWordFlow = !line.words.isEmpty && (presentation.tier == .current || presentation.tier == .near1)
+
+        Button {
+            onSeek(line.at)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                if usesWordFlow {
+                    ActiveLyricLineWordsHostView(
+                        words: line.words,
+                        fallbackText: line.text,
+                        isCurrent: isCurrent,
+                        isPlaying: isPlaying,
+                        scrubbingPosition: scrubbingPosition,
+                        staticPosition: staticPosition,
+                        livePositionProvider: livePositionProvider,
+                        fontSize: Self.primaryFontSize,
+                        fontWeight: isCredit ? .semibold : .bold,
+                        staticTintOpacity: presentation.primaryOpacity,
+                        reduceMotion: reduceMotion
+                    )
+                } else {
+                    Text(line.text)
+                        .font(.system(size: Self.primaryFontSize, weight: isCredit ? .semibold : .bold))
+                        .foregroundStyle(.white.opacity(presentation.primaryOpacity))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !line.translation.isEmpty {
+                    Text(line.translation)
+                        .font(.system(size: Self.translationFontSize, weight: .medium))
+                        .foregroundStyle(.white.opacity(presentation.translationOpacity))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            combined = combined + Text(word.text).foregroundColor(wordColor)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        return combined
+        .buttonStyle(LyricRowButtonStyle(reduceMotion: reduceMotion))
+        // 统一字号配合 GPU 左侧锚点缩放，保证切换焦点行时折行位置 100% 固定不跳动
+        .scaleEffect(presentation.scale, anchor: .leading)
+        .blur(radius: presentation.blurRadius)
+        .animation(rowTransitionAnimation, value: presentation)
+        .animation(.easeOut(duration: 0.18), value: isUserScrolling)
+        .accessibilityLabel(line.translation.isEmpty ? line.text : "\(line.text)，\(line.translation)")
     }
 }
 
-// MARK: - 滚动歌词组件（含间奏热评浮层，高性能实时驱动版）
+// MARK: - 滚动歌词组件（Apple Music 逐字扫光 + 景深柔焦 + 弹簧级联滚屏 + 间奏引导/热评浮层）
 
 private struct LyricsScrollView: View {
     @ObservedObject var player: PlayerEngine
@@ -1462,16 +1808,20 @@ private struct LyricsScrollView: View {
     let comments: [Comment]
     let onSeek: (TimeInterval) -> Void
 
-    // 缓存间奏检测结果，避免在每次 body 评估时重复对所有行做遍历和正则匹配
-    @State private var cachedQuiets: [LyricQuiet] = []
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    // 用户手动拖拽/浏览歌词状态
+    // 缓存间奏与演职员行标识，避免高频评估重复正则匹配
+    @State private var cachedQuiets: [LyricQuiet] = []
+    @State private var cachedCreditFlags: [Bool] = []
+
+    // 用户手动拖拽/浏览歌词状态与触觉反馈触发器
     @State private var isUserScrolling: Bool = false
     @State private var autoSnapTask: Task<Void, Never>? = nil
     @State private var seekAlignmentTask: Task<Void, Never>? = nil
+    @State private var seekHapticTrigger: Int = 0
 
-    /// 对标桌面端黄金分割视线焦点（视口由顶向下的 32% 位置，下方留足接下来演唱的 3~5 行预览）
-    private let lyricAnchor = UnitPoint(x: 0.5, y: 0.32)
+    /// 对标 Apple Music 视觉重心（视口顶向下 30%，上方保留前句余光、下方铺开待唱预读区）
+    private let lyricAnchor = UnitPoint(x: 0.5, y: 0.30)
 
     init(
         player: PlayerEngine,
@@ -1489,6 +1839,10 @@ private struct LyricsScrollView: View {
 
     private var effectivePosition: TimeInterval {
         scrubbingPosition ?? player.position
+    }
+
+    private func livePositionSample() -> TimeInterval {
+        scrubbingPosition ?? (player.isPlaying ? player.livePlaybackPosition() : player.position)
     }
 
     /// 加入 0.08 秒视听前瞻补偿（消除音频解码至耳机的延迟，歌手开唱瞬间歌词正正好好高亮）
@@ -1510,53 +1864,50 @@ private struct LyricsScrollView: View {
         return nil
     }
 
-    private func tier(for index: Int, current: Int) -> LyricHighlightTier {
-        if current < 0 {
-            return .far
-        }
-        let diff = abs(index - current)
-        if diff == 0 {
-            return .current
-        } else if diff == 1 {
-            return .near1
-        } else if diff == 2 {
-            return .near2
-        } else {
-            return .far
-        }
-    }
-
-    private func refreshQuiets() {
-        if hotCommentsEnabled && !player.lyrics.isEmpty {
-            cachedQuiets = LyricsEngine.quiets(in: player.lyrics, trackLength: player.duration, least: 8.0)
+    private func refreshCachedLineMetadata() {
+        let lines = player.lyrics
+        cachedCreditFlags = lines.map { LyricsEngine.isCredit($0.text) }
+        if hotCommentsEnabled && !lines.isEmpty {
+            cachedQuiets = LyricsEngine.quiets(in: lines, trackLength: player.duration, least: 8.0)
         } else {
             cachedQuiets = []
         }
     }
 
-    private func scrollToLine(index: Int, proxy: ScrollViewProxy, animated: Bool = true) {
-        guard index >= 0 && index < player.lyrics.count else { return }
+    private func scrollToFocus(index targetIndex: Int, proxy: ScrollViewProxy, animated: Bool = true) {
+        guard !player.lyrics.isEmpty else { return }
+        let applyScroll = {
+            if targetIndex >= 0 && targetIndex < player.lyrics.count {
+                proxy.scrollTo(targetIndex, anchor: lyricAnchor)
+            } else if (player.lyrics.first?.at ?? 0) >= 2.2 {
+                proxy.scrollTo("interlude-intro", anchor: lyricAnchor)
+            } else {
+                proxy.scrollTo(0, anchor: lyricAnchor)
+            }
+        }
         if animated {
-            withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
-                proxy.scrollTo(index, anchor: lyricAnchor)
+            let curve: Animation = reduceMotion
+                ? .easeInOut(duration: 0.22)
+                : .spring(response: 0.54, dampingFraction: 0.84)
+            withAnimation(curve) {
+                applyScroll()
             }
         } else {
-            proxy.scrollTo(index, anchor: lyricAnchor)
+            applyScroll()
         }
     }
 
     private func scheduleAutoSnap(proxy: ScrollViewProxy) {
         autoSnapTask?.cancel()
         autoSnapTask = Task {
-            // 松手后等待 2.5 秒，若用户无新动作，自动平滑弹回当前播放行！
+            // 松手后等待 2.5 秒，若用户无新动作，自动平滑弹回当前播放行或前奏引导！
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                isUserScrolling = false
-                let target = currentIndex
-                if target >= 0 {
-                    scrollToLine(index: target, proxy: proxy, animated: true)
+                withAnimation(.easeOut(duration: 0.22)) {
+                    isUserScrolling = false
                 }
+                scrollToFocus(index: currentIndex, proxy: proxy, animated: true)
             }
         }
     }
@@ -1565,6 +1916,9 @@ private struct LyricsScrollView: View {
         let lines = player.lyrics
         let loaded = player.lyricsLoaded
         let curIdx = currentIndex
+        let interlude = activeQuietComment == nil
+            ? LyricsEngine.activeInterlude(in: lines, at: effectivePosition + 0.08, currentIndex: curIdx)
+            : nil
 
         ZStack {
             if !loaded {
@@ -1576,29 +1930,73 @@ private struct LyricsScrollView: View {
                     .foregroundStyle(.white.opacity(0.45))
             } else {
                 GeometryReader { geo in
-                    let topPad = max(geo.size.height * 0.32, 100)
+                    let topPad = max(geo.size.height * 0.30, 108)
                     let bottomPad = max(geo.size.height * 0.58, 160)
 
                     ScrollViewReader { proxy in
                         ZStack(alignment: .bottomTrailing) {
                             ScrollView(showsIndicators: false) {
-                                // 使用标准 VStack 保证所有歌词行坐标绝对精确，无论如何拖拽/跳转均 100% 居中对齐，杜绝 Lazy 虚拟化偏移
-                                VStack(alignment: .leading, spacing: 18) {
+                                // 使用标准 VStack 保证所有歌词行坐标绝对精确，无论如何拖拽/跳转均 100% 精准定位，杜绝 Lazy 虚拟化偏移
+                                VStack(alignment: .leading, spacing: 14) {
+                                    // 歌曲前奏三圆点呼吸引导槽（仅当首句存在 >=2.2s 前奏时挂载）
+                                    if let firstAt = lines.first?.at, firstAt >= 2.2 {
+                                        let showIntro = (interlude?.insertAfterLineIndex == -1)
+                                        AppleMusicInterludeDotsRowView(
+                                            window: showIntro ? interlude : nil,
+                                            isVisible: showIntro,
+                                            isPlaying: player.isPlaying,
+                                            scrubbingPosition: scrubbingPosition,
+                                            staticPosition: effectivePosition,
+                                            livePositionProvider: { livePositionSample() },
+                                            reduceMotion: reduceMotion
+                                        )
+                                        .id("interlude-intro")
+                                    }
+
                                     ForEach(Array(lines.enumerated()), id: \.offset) { idx, line in
-                                        let rowTier = tier(for: idx, current: curIdx)
+                                        let isCredit = idx < cachedCreditFlags.count ? cachedCreditFlags[idx] : false
+                                        let pres = LyricsEngine.linePresentation(
+                                            index: idx,
+                                            currentIndex: curIdx,
+                                            isUserScrolling: isUserScrolling,
+                                            isCredit: isCredit,
+                                            reduceMotion: reduceMotion
+                                        )
                                         LyricRowView(
                                             index: idx,
                                             line: line,
-                                            tier: rowTier,
-                                            currentTime: (rowTier == .current && !line.words.isEmpty) ? effectivePosition : 0,
+                                            presentation: pres,
+                                            isUserScrolling: isUserScrolling,
+                                            isCredit: isCredit,
+                                            isPlaying: player.isPlaying,
+                                            scrubbingPosition: scrubbingPosition,
+                                            staticPosition: effectivePosition,
+                                            livePositionProvider: { livePositionSample() },
+                                            reduceMotion: reduceMotion,
                                             onSeek: { targetTime in
                                                 autoSnapTask?.cancel()
                                                 isUserScrolling = false
+                                                seekHapticTrigger &+= 1
                                                 onSeek(targetTime)
-                                                scrollToLine(index: idx, proxy: proxy, animated: true)
+                                                scrollToFocus(index: idx, proxy: proxy, animated: true)
                                             }
                                         )
+                                        .equatable()
                                         .id(idx)
+
+                                        // 句间长间奏三圆点呼吸引导槽（仅挂载在 >=4s 真实间奏行后）
+                                        if idx + 1 < lines.count, lines[idx + 1].at - line.end >= 4.0 {
+                                            let showGapDots = (interlude?.insertAfterLineIndex == idx)
+                                            AppleMusicInterludeDotsRowView(
+                                                window: showGapDots ? interlude : nil,
+                                                isVisible: showGapDots,
+                                                isPlaying: player.isPlaying,
+                                                scrubbingPosition: scrubbingPosition,
+                                                staticPosition: effectivePosition,
+                                                livePositionProvider: { livePositionSample() },
+                                                reduceMotion: reduceMotion
+                                            )
+                                        }
                                     }
                                 }
                                 .padding(.top, topPad)
@@ -1610,7 +2008,7 @@ private struct LyricsScrollView: View {
                                         autoSnapTask?.cancel()
                                         seekAlignmentTask?.cancel()
                                         if !isUserScrolling {
-                                            withAnimation(.easeInOut(duration: 0.18)) {
+                                            withAnimation(.easeOut(duration: 0.18)) {
                                                 isUserScrolling = true
                                             }
                                         }
@@ -1619,24 +2017,21 @@ private struct LyricsScrollView: View {
                                         scheduleAutoSnap(proxy: proxy)
                                     }
                             )
-                            // 自然播放推进换行
+                            // 自然播放推进换行（含从间奏或拖回前奏）
                             .onChange(of: curIdx) { _, newIdx in
-                                if scrubbingPosition == nil && !isUserScrolling && newIdx >= 0 {
-                                    scrollToLine(index: newIdx, proxy: proxy, animated: true)
+                                if scrubbingPosition == nil && !isUserScrolling {
+                                    scrollToFocus(index: newIdx, proxy: proxy, animated: true)
                                 }
                             }
-                            // 用户在底栏进度条拖拽时：歌词实时丝滑跟随手指高亮与滚动！
+                            // 用户在底栏进度条拖拽时：歌词实时丝滑跟随手指高亮与滚动（含拖回前奏区间）
                             .onChange(of: scrubbingPosition) { _, newScrub in
                                 guard newScrub != nil else { return }
                                 autoSnapTask?.cancel()
                                 seekAlignmentTask?.cancel()
                                 isUserScrolling = false
-                                let target = currentIndex
-                                if target >= 0 {
-                                    scrollToLine(index: target, proxy: proxy, animated: false)
-                                }
+                                scrollToFocus(index: currentIndex, proxy: proxy, animated: false)
                             }
-                            // 拖拽松手（Seek）或外部跳转时：强制退出手动浏览状态，100% 精准无条件重定位目标行！
+                            // 拖拽松手（Seek）或外部跳转时：强制退出手动浏览状态，100% 精准无条件重定位（含跳转至前奏）
                             .onChange(of: player.seekRevision) { _, revision in
                                 autoSnapTask?.cancel()
                                 seekAlignmentTask?.cancel()
@@ -1644,51 +2039,48 @@ private struct LyricsScrollView: View {
                                 seekAlignmentTask = Task { @MainActor in
                                     await Task.yield()
                                     guard !Task.isCancelled, player.seekRevision == revision else { return }
-                                    var target = currentIndex
-                                    guard target >= 0 else { return }
-                                    scrollToLine(index: target, proxy: proxy, animated: true)
+                                    scrollToFocus(index: currentIndex, proxy: proxy, animated: true)
 
                                     try? await Task.sleep(nanoseconds: 50_000_000)
                                     guard !Task.isCancelled, player.seekRevision == revision else { return }
                                     isUserScrolling = false
-                                    target = currentIndex
-                                    scrollToLine(index: target, proxy: proxy, animated: false)
+                                    scrollToFocus(index: currentIndex, proxy: proxy, animated: false)
                                 }
                             }
                             .onAppear {
-                                refreshQuiets()
-                                let target = curIdx >= 0 ? curIdx : 0
+                                refreshCachedLineMetadata()
+                                let target = curIdx
                                 DispatchQueue.main.async {
-                                    scrollToLine(index: target, proxy: proxy, animated: false)
+                                    scrollToFocus(index: target, proxy: proxy, animated: false)
                                 }
                             }
                             .onChange(of: player.currentTrack?.id) { _, _ in
-                                refreshQuiets()
+                                refreshCachedLineMetadata()
                                 autoSnapTask?.cancel()
                                 seekAlignmentTask?.cancel()
                                 isUserScrolling = false
-                                let target = curIdx >= 0 ? curIdx : 0
+                                let target = curIdx
                                 DispatchQueue.main.async {
-                                    scrollToLine(index: target, proxy: proxy, animated: false)
+                                    scrollToFocus(index: target, proxy: proxy, animated: false)
                                 }
                             }
                             .onChange(of: lines.count) { _, _ in
-                                refreshQuiets()
-                                let target = curIdx >= 0 ? curIdx : 0
+                                refreshCachedLineMetadata()
+                                let target = curIdx
                                 DispatchQueue.main.async {
-                                    scrollToLine(index: target, proxy: proxy, animated: false)
+                                    scrollToFocus(index: target, proxy: proxy, animated: false)
                                 }
                             }
 
-                            // 用户手动滑动浏览时，右下角优雅浮现一键回到当前播放胶囊按钮
+                            // 用户手动滑动浏览时，右下角优雅浮现 iOS 玻璃胶囊「回位」按钮
                             if isUserScrolling {
                                 Button {
                                     autoSnapTask?.cancel()
-                                    isUserScrolling = false
-                                    let target = currentIndex
-                                    if target >= 0 {
-                                        scrollToLine(index: target, proxy: proxy, animated: true)
+                                    withAnimation(.easeOut(duration: 0.2)) {
+                                        isUserScrolling = false
                                     }
+                                    seekHapticTrigger &+= 1
+                                    scrollToFocus(index: currentIndex, proxy: proxy, animated: true)
                                 } label: {
                                     HStack(spacing: 5) {
                                         Image(systemName: "scope")
@@ -1713,13 +2105,13 @@ private struct LyricsScrollView: View {
                         }
                     }
                 }
-                // 上下边缘渐隐，避免歌词被生硬截断
+                // 上下边缘渐变柔隐，契合 Apple Music 无边界液态沉浸质感
                 .mask(
                     LinearGradient(
                         stops: [
                             .init(color: .clear, location: 0),
                             .init(color: .black, location: 0.08),
-                            .init(color: .black, location: 0.92),
+                            .init(color: .black, location: 0.87),
                             .init(color: .clear, location: 1)
                         ],
                         startPoint: .top,
@@ -1759,10 +2151,12 @@ private struct LyricsScrollView: View {
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.09), lineWidth: 0.75)
                 )
+                .padding(.horizontal, 10)
                 .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
         }
         .animation(.easeInOut(duration: 0.36), value: activeQuietComment != nil)
+        .sensoryFeedback(.impact(weight: .light), trigger: seekHapticTrigger)
     }
 }
 

@@ -13,18 +13,28 @@ import WebKit
 
 // MARK: - 设置与插件管理页（对应 ui_settings.go / plugin_install.go）
 
+private struct RepoLinkTarget: Identifiable {
+    let id: String
+    let name: String
+}
+
 public struct SettingsView: View {
     @EnvironmentObject private var app: AppModel
     @Environment(\.mygoIsViewVisible) private var isViewVisible
+    @Environment(\.openURL) private var openURL
     @State private var showInstallSheet = false
     @State private var showPluginImporter = false
     @State private var githubRepoInput = ""
+    @State private var repoLinkTarget: RepoLinkTarget? = nil
+    @State private var repoLinkInput = ""
+    @State private var repoLinkError: String? = nil
     @State private var cacheUsedBytes: Int64 = 0
 
     public init() {}
 
     public var body: some View {
         NavigationStack {
+            ScrollViewReader { scrollProxy in
             Form {
                 // 1. 通用与外观
                 SwiftUI.Section(I18n.t("General")) {
@@ -203,17 +213,37 @@ public struct SettingsView: View {
                         isBuiltIn: true,
                         onRemove: nil
                     )
+                    .id("pluginsSection")
 
                     // 已安装的 JS/TS 插件列表
                     ForEach(app.pluginSources, id: \.manifest.id) { plugin in
                         let pid = plugin.manifest.id
+                        let resolvedOrigin = app.pluginOrigins[pid]
                         PluginSourceRowView(
                             source: plugin,
                             isBuiltIn: false,
                             pendingUpdateVersion: app.settings.pluginUpdates[pid],
-                            origin: app.pluginOrigins[pid],
+                            origin: resolvedOrigin,
+                            checkState: app.pluginCheckStates[pid],
+                            isUpdating: app.updatingPluginIDs.contains(pid),
+                            onCheckUpdate: {
+                                Task { await app.checkPluginUpdate(id: pid) }
+                            },
                             onUpdate: {
                                 Task { await app.updatePlugin(id: pid) }
+                            },
+                            onForceReinstall: {
+                                Task { await app.updatePlugin(id: pid, forceReinstall: true) }
+                            },
+                            onLinkRepository: {
+                                repoLinkInput = resolvedOrigin?.repo ?? ""
+                                repoLinkError = nil
+                                repoLinkTarget = RepoLinkTarget(id: pid, name: plugin.info().name)
+                            },
+                            onOpenGitHub: resolvedOrigin.flatMap { origin in
+                                URL(string: "https://github.com/\(origin.repo)")
+                            }.map { url in
+                                { openURL(url) }
                             },
                             onRemove: {
                                 app.removePlugin(id: pid)
@@ -241,6 +271,28 @@ public struct SettingsView: View {
                         .padding(.vertical, 4)
                     }
 
+                    if app.availablePluginUpdateCount >= 2 {
+                        Button {
+                            Task { await app.updateAllPlugins() }
+                        } label: {
+                            if app.isUpdatingAllPlugins {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text(I18n.t("Updating…"))
+                                }
+                                .foregroundStyle(MyGoTheme.accent)
+                            } else {
+                                Label(
+                                    "\(I18n.t("Update All Plugins")) (\(app.availablePluginUpdateCount))",
+                                    systemImage: "arrow.down.circle.fill"
+                                )
+                                .foregroundStyle(MyGoTheme.accent)
+                            }
+                        }
+                        .disabled(app.isUpdatingAllPlugins || app.isInstallingPlugin)
+                    }
+
                     Button {
                         githubRepoInput = ""
                         app.installErrorMessage = nil
@@ -257,7 +309,7 @@ public struct SettingsView: View {
                             .foregroundStyle(MyGoTheme.accent)
                     }
 
-                    if !app.pluginOrigins.isEmpty {
+                    if !app.pluginSources.isEmpty {
                         Button {
                             Task { await app.checkForPluginUpdates(manual: true) }
                         } label: {
@@ -268,6 +320,12 @@ public struct SettingsView: View {
                                     Text(I18n.t("Checking for updates…"))
                                 } else {
                                     Label(I18n.t("Check for Updates"), systemImage: "arrow.triangle.2.circlepath")
+                                    Spacer()
+                                    if app.settings.pluginsCheckedAt > 0 {
+                                        Text(Date(timeIntervalSince1970: app.settings.pluginsCheckedAt), style: .relative)
+                                            .font(.system(size: 11.5))
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
                             }
                             .foregroundStyle(MyGoTheme.accent)
@@ -289,7 +347,17 @@ public struct SettingsView: View {
                     }
                     .padding(.vertical, 2)
                 } header: {
-                    Text(I18n.t("Plugins"))
+                    HStack(spacing: 8) {
+                        Text(I18n.t("Plugins"))
+                        if app.availablePluginUpdateCount > 0 {
+                            Text(I18n.tf("Updates Available (%d)", app.availablePluginUpdateCount))
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(MyGoTheme.accent, in: Capsule())
+                        }
+                    }
                 } footer: {
                     Text(I18n.t("A repository with a plugin, as owner/repo or its address on GitHub"))
                 }
@@ -328,6 +396,7 @@ public struct SettingsView: View {
                             cacheUsedBytes = app.player.diskCache.usedBytes()
                         }
                     }
+                    .id("settingsBottom")
                 }
             }
             .mygoTrackVerticalScroll()
@@ -337,9 +406,82 @@ public struct SettingsView: View {
             #endif
             .onAppear {
                 cacheUsedBytes = app.player.diskCache.usedBytes()
+                #if DEBUG
+                if app.isStartupReady {
+                    scrollToDebugSectionIfNeeded(using: scrollProxy, delay: 0.25)
+                }
+                #endif
+            }
+            #if DEBUG
+            .onChange(of: app.isStartupReady) { _, ready in
+                guard ready else { return }
+                scrollToDebugSectionIfNeeded(using: scrollProxy, delay: 0.35)
+            }
+            #endif
             }
             .sheet(isPresented: $showInstallSheet) {
-                installPluginSheet
+                PluginRepoPickerSheet(
+                    mode: .install,
+                    repoInput: $githubRepoInput,
+                    errorMessage: app.installErrorMessage,
+                    isBusy: app.isInstallingPlugin,
+                    onSubmit: { repo in
+                        await app.installPluginFromGitHub(repoInput: repo)
+                        if app.installErrorMessage == nil {
+                            showInstallSheet = false
+                        }
+                    },
+                    onCancel: {
+                        showInstallSheet = false
+                    }
+                )
+            }
+            .sheet(item: $repoLinkTarget) { target in
+                PluginRepoPickerSheet(
+                    mode: .link(pluginName: target.name),
+                    repoInput: $repoLinkInput,
+                    errorMessage: repoLinkError,
+                    isBusy: app.isCheckingUpdates || app.isInstallingPlugin,
+                    onSubmit: { repo in
+                        do {
+                            _ = try PluginInstaller.parseRepo(repo)
+                            let ok = await app.linkPluginRepository(
+                                id: target.id,
+                                repoInput: repo,
+                                checkNow: true
+                            )
+                            if ok {
+                                repoLinkTarget = nil
+                            }
+                        } catch {
+                            repoLinkError = error.localizedDescription
+                        }
+                    },
+                    onCancel: {
+                        repoLinkTarget = nil
+                    }
+                )
+            }
+            .alert(
+                I18n.t("Plugin Permission Update"),
+                isPresented: Binding(
+                    get: { app.pendingPluginUpdateApproval != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            app.cancelPendingPluginUpdate()
+                        }
+                    }
+                ),
+                presenting: app.pendingPluginUpdateApproval
+            ) { _ in
+                Button(I18n.t("Confirm & Update")) {
+                    Task { await app.confirmPendingPluginUpdate() }
+                }
+                Button(I18n.t("Cancel"), role: .cancel) {
+                    app.cancelPendingPluginUpdate()
+                }
+            } message: { approval in
+                Text(formatPermissionApprovalMessage(approval))
             }
             .fileImporter(
                 isPresented: $showPluginImporter,
@@ -359,72 +501,221 @@ public struct SettingsView: View {
         }
     }
 
-    private var installPluginSheet: some View {
+    #if DEBUG
+    private func scrollToDebugSectionIfNeeded(using scrollProxy: ScrollViewProxy, delay: TimeInterval) {
+        let args = ProcessInfo.processInfo.arguments
+        let env = ProcessInfo.processInfo.environment
+        let targetSection = args.first(where: { $0.hasPrefix("-MyGoSection:") })?
+            .split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_SECTION"]
+        guard let section = targetSection?.lowercased() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            if section == "plugins" {
+                scrollProxy.scrollTo("pluginsSection", anchor: .top)
+            } else if section == "bottom" {
+                scrollProxy.scrollTo("settingsBottom", anchor: .bottom)
+            }
+        }
+    }
+    #endif
+
+    private func formatPermissionApprovalMessage(_ approval: PendingPluginUpdateApproval) -> String {
+        var lines: [String] = []
+        if let hosts = approval.addedPermissions.network, !hosts.isEmpty {
+            lines.append("• " + I18n.tf("Network access: %@", hosts.joined(separator: ", ")))
+        }
+        if let procs = approval.addedPermissions.process, !procs.isEmpty {
+            let procLine = procs == ["*"]
+                ? I18n.t("Run local helper processes")
+                : "\(I18n.t("Run local helper processes")): \(procs.joined(separator: ", "))"
+            lines.append("• " + procLine)
+        }
+        let verText = approval.targetVersion.isEmpty ? I18n.t("latest") : approval.targetVersion
+        return I18n.tf(
+            "%@ wants additional permissions in %@:\n%@",
+            approval.pluginName,
+            verText,
+            lines.joined(separator: "\n")
+        )
+    }
+}
+
+/// 统一的 GitHub 仓库选择与社区目录面板（共用于首次安装插件与本地插件绑定更新源）
+private struct PluginRepoPickerSheet: View {
+    enum Mode {
+        case install
+        case link(pluginName: String)
+
+        var title: String {
+            switch self {
+            case .install: return I18n.t("Install a Plugin")
+            case .link(let pluginName): return "\(I18n.t("Link Update Source")) · \(pluginName)"
+            }
+        }
+
+        var confirmTitle: String {
+            switch self {
+            case .install: return I18n.t("Install")
+            case .link: return I18n.t("Save & Check Updates")
+            }
+        }
+    }
+
+    @EnvironmentObject private var app: AppModel
+    let mode: Mode
+    @Binding var repoInput: String
+    let errorMessage: String?
+    let isBusy: Bool
+    let onSubmit: (String) async -> Void
+    let onCancel: () -> Void
+
+    private static let featuredRepos: [(repo: String, desc: String)] = [
+        ("egoist/mygo-music-youtube-music", "YouTube Music 官方插件"),
+        ("GentleM4dman/mygo-music-bilibili", "哔哩哔哩音乐插件"),
+        ("AkinoKaede/mygo-music-netease-cloud-music", "网易云音乐插件"),
+        ("sogud/mygo-music-netease", "网易云音乐插件（社区分支）"),
+        ("xingkaixin/mygo-music-spotify", "Spotify 插件")
+    ]
+
+    var body: some View {
         NavigationStack {
             Form {
                 SwiftUI.Section {
-                    TextField(I18n.t("owner/repo or URL"), text: $githubRepoInput)
+                    TextField(I18n.t("owner/repo or URL"), text: $repoInput)
                         .autocorrectionDisabled()
                         #if os(iOS)
                         .textInputAutocapitalization(.never)
                         #endif
 
-                    if let err = app.installErrorMessage {
-                        Text(err)
+                    if let errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
                             .font(.caption)
                             .foregroundStyle(.red)
                     }
                 } header: {
-                    Text(I18n.t("Install from GitHub"))
+                    Text(modeHeaderText)
                 } footer: {
-                    Text("例如: egoist/mygo-music-youtube-music 或 GentleM4dman/mygo-music-bilibili")
+                    Text(modeFooterText)
                 }
 
-                SwiftUI.Section("推荐社区插件") {
-                    ForEach([
-                        ("egoist/mygo-music-youtube-music", "YouTube Music 官方插件"),
-                        ("GentleM4dman/mygo-music-bilibili", "哔哩哔哩音乐插件"),
-                        ("AkinoKaede/mygo-music-netease-cloud-music", "网易云音乐插件"),
-                        ("sogud/mygo-music-netease", "网易云音乐插件（社区分支）"),
-                        ("xingkaixin/mygo-music-spotify", "Spotify 插件")
-                    ], id: \.0) { repo, desc in
-                        Button {
-                            githubRepoInput = repo
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(repo)
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Text(desc)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.secondary)
+                SwiftUI.Section {
+                    if app.isLoadingCommunityPlugins && app.communityPlugins.isEmpty {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(I18n.t("Fetching community plugins…"))
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if !app.communityPlugins.isEmpty {
+                        ForEach(app.communityPlugins) { entry in
+                            repoOptionButton(
+                                repo: entry.repo,
+                                subtitle: entry.description,
+                                stars: entry.stars
+                            )
+                        }
+                    } else if let err = app.communityPluginsError {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(err)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                            ForEach(Self.featuredRepos, id: \.repo) { item in
+                                repoOptionButton(repo: item.repo, subtitle: item.desc, stars: nil)
                             }
                         }
+                    } else {
+                        ForEach(Self.featuredRepos, id: \.repo) { item in
+                            repoOptionButton(repo: item.repo, subtitle: item.desc, stars: nil)
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text(I18n.t("Online Plugin Directory"))
+                        Spacer()
+                        Button {
+                            Task { await app.loadCommunityPlugins(force: true) }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .disabled(app.isLoadingCommunityPlugins)
+                        .accessibilityLabel(I18n.t("Refresh"))
                     }
                 }
             }
-            .navigationTitle(I18n.t("Install a Plugin"))
+            .navigationTitle(mode.title)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(I18n.t("Cancel")) {
-                        showInstallSheet = false
-                    }
+                    Button(I18n.t("Cancel"), action: onCancel)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    if app.isInstallingPlugin {
+                    if isBusy {
                         ProgressView()
                     } else {
-                        Button(I18n.t("Install")) {
-                            let repo = githubRepoInput
-                            Task {
-                                await app.installPluginFromGitHub(repoInput: repo)
-                                if app.installErrorMessage == nil {
-                                    showInstallSheet = false
-                                }
-                            }
+                        Button(mode.confirmTitle) {
+                            let target = repoInput
+                            Task { await onSubmit(target) }
                         }
-                        .disabled(githubRepoInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(repoInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
+                }
+            }
+            .task {
+                await app.loadCommunityPlugins()
+            }
+        }
+    }
+
+    private var modeHeaderText: String {
+        switch mode {
+        case .install: return I18n.t("Install from GitHub")
+        case .link: return I18n.t("Link GitHub Source…")
+        }
+    }
+
+    private var modeFooterText: String {
+        switch mode {
+        case .install:
+            return "例如: egoist/mygo-music-youtube-music 或 GentleM4dman/mygo-music-bilibili"
+        case .link:
+            return I18n.t("Link a GitHub repository (owner/repo) to enable one-tap online updates for this plugin.")
+        }
+    }
+
+    private func repoOptionButton(repo: String, subtitle: String, stars: Int?) -> some View {
+        let alreadyLinked = app.pluginOrigins.values.contains {
+            $0.repo.caseInsensitiveCompare(repo) == .orderedSame
+        }
+        return Button {
+            repoInput = repo
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(repo)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                        if alreadyLinked {
+                            Text(I18n.t("Installed"))
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(MyGoTheme.accent)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1.5)
+                                .background(MyGoTheme.accent.opacity(0.14), in: Capsule())
+                        }
+                    }
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer()
+                if let stars, stars > 0 {
+                    Label("\(stars)", systemImage: "star.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -437,17 +728,25 @@ private struct PluginSourceRowView: View {
     let isBuiltIn: Bool
     var pendingUpdateVersion: String? = nil
     var origin: PluginOrigin? = nil
+    var checkState: PluginUpdateCheckState? = nil
+    var isUpdating: Bool = false
+    var onCheckUpdate: (() -> Void)? = nil
     var onUpdate: (() -> Void)? = nil
+    var onForceReinstall: (() -> Void)? = nil
+    var onLinkRepository: (() -> Void)? = nil
+    var onOpenGitHub: (() -> Void)? = nil
     let onRemove: (() -> Void)?
 
     var body: some View {
         let info = source.info()
         let enabled = app.isSourceEnabled(info.id)
         let signedAccount = app.accountsBySource[info.id]
+        let versionLabel = info.version.map { PluginInstaller.displayVersion($0) } ?? ""
+        let pendingLabel = pendingUpdateVersion.map { PluginInstaller.displayVersion($0) } ?? ""
 
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(info.name)
                             .font(.system(size: 15, weight: .semibold))
@@ -457,13 +756,13 @@ private struct PluginSourceRowView: View {
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
                                 .background(MyGoTheme.pillSurface, in: Capsule())
-                        } else if let ver = info.version, !ver.isEmpty {
-                            Text("v\(ver)")
+                        } else if !versionLabel.isEmpty {
+                            Text(versionLabel)
                                 .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
                         }
-                        if let pending = pendingUpdateVersion, !pending.isEmpty {
-                            Text("→ v\(pending)")
+                        if !pendingLabel.isEmpty {
+                            Text("→ \(pendingLabel)")
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 6)
@@ -476,11 +775,6 @@ private struct PluginSourceRowView: View {
                         Text(nets.isEmpty ? I18n.t("Asks for no network") : I18n.tf("Can reach %s", nets.joined(separator: ", ")))
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
-                        if let repo = origin?.repo, !repo.isEmpty {
-                            Text(repo)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
-                        }
                     }
                 }
 
@@ -591,28 +885,152 @@ private struct PluginSourceRowView: View {
             }
 
             if !isBuiltIn {
-                HStack(spacing: 12) {
-                    if let pending = pendingUpdateVersion, !pending.isEmpty, let onUpdate {
-                        Button(action: onUpdate) {
-                            Label(I18n.tf("Update to %s", "v\(pending)"), systemImage: "arrow.down.circle.fill")
-                                .font(.system(size: 12.5, weight: .semibold))
-                                .foregroundStyle(MyGoTheme.accent)
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(app.isInstallingPlugin)
-                    }
-                    Spacer()
-                    if let onRemove {
-                        Button(role: .destructive, action: onRemove) {
-                            Label(I18n.t("Remove"), systemImage: "trash")
-                                .font(.system(size: 12.5, weight: .medium))
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                }
+                pluginStatusAndActionRow(pendingLabel: pendingLabel)
             }
         }
         .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func pluginStatusAndActionRow(pendingLabel: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let checkState {
+                switch checkState {
+                case .checking:
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text(I18n.t("Checking for updates…"))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                case .upToDate:
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle")
+                            .font(.system(size: 11))
+                        Text(I18n.t("Up to date"))
+                            .font(.system(size: 11.5))
+                    }
+                    .foregroundStyle(.secondary)
+                case .failed(let message):
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                        Text(message)
+                            .font(.system(size: 11.5))
+                            .lineLimit(2)
+                    }
+                    .foregroundStyle(.red)
+                case .updateAvailable:
+                    EmptyView()
+                }
+            }
+
+            HStack(alignment: .center, spacing: 8) {
+                if let repo = origin?.repo, !repo.isEmpty {
+                    if let onOpenGitHub {
+                        Button(action: onOpenGitHub) {
+                            HStack(spacing: 4) {
+                                Text(repo)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Image(systemName: "arrow.up.right.square")
+                                    .font(.system(size: 10))
+                            }
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .tint(.secondary)
+                    } else {
+                        Text(repo)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                } else if let onLinkRepository {
+                    Button(action: onLinkRepository) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "link")
+                                .font(.system(size: 10.5))
+                            Text(I18n.t("Link Update Source"))
+                        }
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.orange.opacity(0.95))
+                    }
+                    .buttonStyle(.borderless)
+                } else {
+                    Text(I18n.t("Local import · No update source linked"))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                if isUpdating {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(I18n.t("Updating…"))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                } else if !pendingLabel.isEmpty, let onUpdate {
+                    Button(action: onUpdate) {
+                        Text(I18n.t("Update"))
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 5)
+                            .background(MyGoTheme.accent, in: Capsule())
+                            .fixedSize()
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(app.isInstallingPlugin)
+                }
+
+                Menu {
+                    if origin != nil, let onCheckUpdate {
+                        Button(action: onCheckUpdate) {
+                            Label(I18n.t("Check for Update"), systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                    if origin != nil, let onForceReinstall {
+                        Button(action: onForceReinstall) {
+                            Label(I18n.t("Reinstall Latest"), systemImage: "arrow.down.to.line")
+                        }
+                    }
+                    if let onLinkRepository {
+                        Button(action: onLinkRepository) {
+                            Label(
+                                I18n.t(origin == nil ? "Link GitHub Source…" : "Change Repository…"),
+                                systemImage: "link"
+                            )
+                        }
+                    }
+                    if let onOpenGitHub {
+                        Button(action: onOpenGitHub) {
+                            Label(I18n.t("Open on GitHub"), systemImage: "safari")
+                        }
+                    }
+                    if let onRemove {
+                        Divider()
+                        Button(role: .destructive, action: onRemove) {
+                            Label(I18n.t("Remove"), systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24, alignment: .trailing)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .tint(.secondary)
+            }
+        }
     }
 }
 
@@ -1487,8 +1905,23 @@ public enum FloatingTabBarMetrics {
     public static let searchCircleSize: CGFloat = barHeight
     public static let splitSpacing: CGFloat = 12
     public static let compactSplitSpacing: CGFloat = 10
-    public static let bottomInsetEmptyPlayer: CGFloat = 78
-    public static let bottomInsetWithMiniPlayer: CGFloat = 148
+    public static let bottomInsetEmptyPlayer: CGFloat = 98
+    public static let bottomInsetWithMiniPlayer: CGFloat = 168
+
+    /// 计算纵向滚动容器在系统安全区之外还需追加的底部留白，确保所有页脚完整高于悬浮胶囊与迷你播放条
+    public static func extraScrollBottomInset(
+        hasTrack: Bool,
+        isKeyboardVisible: Bool,
+        bottomOverlayPadding: CGFloat,
+        systemSafeAreaBottom: CGFloat
+    ) -> CGFloat {
+        guard !isKeyboardVisible else { return 0 }
+        let clearance: CGFloat = hasTrack ? 24 : 22
+        let chromePhysicalHeight: CGFloat = hasTrack
+            ? (bottomOverlayPadding + barHeight + overlaySpacing + miniExpandedHeight + clearance)
+            : (bottomOverlayPadding + barHeight + clearance)
+        return max(0, chromePhysicalHeight - max(0, systemSafeAreaBottom))
+    }
 }
 
 /// 底部导航主浏览页签与独立搜索圆钮之间的槽位映射模型
@@ -1604,6 +2037,10 @@ private struct VerticalScrollResetKey: EnvironmentKey {
     static let defaultValue: @MainActor () -> Void = {}
 }
 
+private struct VerticalScrollBottomOverlayInsetKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+
 public extension EnvironmentValues {
     var mygoReportVerticalScroll: @MainActor (VerticalScrollMetrics) -> Void {
         get { self[VerticalScrollReportKey.self] }
@@ -1613,6 +2050,12 @@ public extension EnvironmentValues {
     var mygoResetScrollTracker: @MainActor () -> Void {
         get { self[VerticalScrollResetKey.self] }
         set { self[VerticalScrollResetKey.self] = newValue }
+    }
+
+    /// 底部悬浮胶囊与迷你播放条所需的额外底部滚动安全边距（穿透 NavigationStack 传递到各级滚动视图）
+    var mygoBottomOverlayInset: CGFloat {
+        get { self[VerticalScrollBottomOverlayInsetKey.self] }
+        set { self[VerticalScrollBottomOverlayInsetKey.self] = newValue }
     }
 }
 
@@ -1991,9 +2434,11 @@ private final class VerticalScrollProbeUIView: UIView {
 private struct VerticalScrollTrackingModifier: ViewModifier {
     @Environment(\.mygoReportVerticalScroll) private var reportVerticalScroll
     @Environment(\.mygoResetScrollTracker) private var resetScrollTracker
+    @Environment(\.mygoBottomOverlayInset) private var bottomOverlayInset
 
     func body(content: Content) -> some View {
         content
+            .safeAreaPadding(.bottom, bottomOverlayInset)
             #if canImport(UIKit)
             .background(
                 VerticalScrollProbeRepresentable { metrics in
@@ -2104,6 +2549,7 @@ private struct MainTabItem: Identifiable {
 private struct PrimaryTabsCapsuleBar: View {
     @Binding var selectedTab: Int
     let lastPrimaryTab: Int
+    var settingsBadgeCount: Int = 0
     let isCompactHeight: Bool
     let isCollapsedToCircle: Bool
     let expandedWidth: CGFloat
@@ -2194,6 +2640,15 @@ private struct PrimaryTabsCapsuleBar: View {
                             weight: isHighlight ? .semibold : .medium
                         ))
                         .frame(height: FloatingTabBarMetrics.iconFrameHeight)
+                        .overlay(alignment: .topTrailing) {
+                            if item.id == 3 && settingsBadgeCount > 0 {
+                                Circle()
+                                    .fill(Color.red)
+                                    .frame(width: 7, height: 7)
+                                    .overlay(Circle().stroke(Color.black.opacity(0.25), lineWidth: 0.75))
+                                    .offset(x: 4, y: -1)
+                            }
+                        }
                         .scaleEffect(iconScale)
                         .offset(y: showLabels ? -7.5 : 0)
 
@@ -2554,6 +3009,7 @@ private struct AdaptiveFloatingBottomChrome: View {
                     PrimaryTabsCapsuleBar(
                         selectedTab: $selectedTab,
                         lastPrimaryTab: lastPrimaryTab,
+                        settingsBadgeCount: app.availablePluginUpdateCount,
                         isCompactHeight: isCompactWithoutTrack,
                         isCollapsedToCircle: isCompactRow,
                         expandedWidth: fullExpandedTabWidth,
@@ -2696,7 +3152,21 @@ public struct MainView: View {
     @State private var isKeyboardVisible: Bool = false
     @State private var bottomSafeAreaInset: CGFloat = 0
 
-    public init() {}
+    public init() {
+        #if DEBUG
+        let args = ProcessInfo.processInfo.arguments
+        let env = ProcessInfo.processInfo.environment
+        let tabArg = args.first(where: { $0.hasPrefix("-MyGoTab:") })?
+            .split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_TAB"]
+        if let tabArg, let tab = Int(tabArg), (0...3).contains(tab) {
+            _selectedTab = State(initialValue: tab)
+            _activatedTabs = State(initialValue: [tab])
+            if MainTabMapping.slotIndex(for: tab) != nil {
+                _lastPrimaryTab = State(initialValue: tab)
+            }
+        }
+        #endif
+    }
 
     private var scrollCoordinator: TabBarScrollCoordinator {
         scrollStore.coordinator
@@ -2721,26 +3191,27 @@ public struct MainView: View {
         #endif
     }
 
-    @ViewBuilder
-    private func tabWithBottomOverlayInset<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        let insetHeight: CGFloat = isKeyboardVisible
-            ? 0
-            : (app.player.currentTrack == nil
-                ? FloatingTabBarMetrics.bottomInsetEmptyPlayer
-                : FloatingTabBarMetrics.bottomInsetWithMiniPlayer)
-        content()
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                Color.clear
-                    .frame(height: insetHeight)
-                    .allowsHitTesting(false)
-            }
+    @MainActor
+    private var bottomScrollExtraInset: CGFloat {
+        let safeBottom: CGFloat
+        #if os(iOS)
+        safeBottom = max(bottomSafeAreaInset, MyGoSystemAppearanceConfigurator.currentBottomSafeAreaInset)
+        #else
+        safeBottom = 0
+        #endif
+        return FloatingTabBarMetrics.extraScrollBottomInset(
+            hasTrack: app.player.currentTrack != nil,
+            isKeyboardVisible: isKeyboardVisible,
+            bottomOverlayPadding: bottomOverlayPadding,
+            systemSafeAreaBottom: safeBottom
+        )
     }
 
     @ViewBuilder
     private func tabViewport<Content: View>(index: Int, @ViewBuilder content: () -> Content) -> some View {
         let isActive = (selectedTab == index)
         if activatedTabs.contains(index) || isActive {
-            tabWithBottomOverlayInset(content: content)
+            content()
                 .environment(\.mygoIsViewVisible, isActive && !app.isNowPlayingPresented)
                 .opacity(isActive ? 1 : 0)
                 .allowsHitTesting(isActive)
@@ -2761,6 +3232,7 @@ public struct MainView: View {
                 tabViewport(index: 3) { SettingsView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environment(\.mygoBottomOverlayInset, bottomScrollExtraInset)
             .environment(\.mygoReportVerticalScroll) { metrics in
                 scrollCoordinator.handleScroll(metrics)
             }
@@ -2945,8 +3417,9 @@ public struct MainView: View {
     private func applyDebugLaunchOptionsIfNeeded() {
         let args = ProcessInfo.processInfo.arguments
         let env = ProcessInfo.processInfo.environment
+        let tabArg = args.first(where: { $0.hasPrefix("-MyGoTab:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_TAB"]
         let shouldOpen = args.contains("-MyGoOpenNowPlaying") || env["MYGO_DEBUG_OPEN"] == "1"
-        guard shouldOpen else { return }
+        guard shouldOpen || tabArg != nil else { return }
 
         let paneArg = args.first(where: { $0.hasPrefix("-MyGoPane:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_PANE"]
         let styleArg = args.first(where: { $0.hasPrefix("-MyGoStageStyle:") })?.split(separator: ":").last.map(String.init) ?? env["MYGO_DEBUG_STYLE"]
@@ -2955,6 +3428,14 @@ public struct MainView: View {
 
         Task { @MainActor in
             await app.waitUntilStartupReady()
+            if let tabArg, let tab = Int(tabArg), (0...3).contains(tab) {
+                activatedTabs.insert(tab)
+                selectedTab = tab
+                if MainTabMapping.slotIndex(for: tab) != nil {
+                    lastPrimaryTab = tab
+                }
+            }
+            guard shouldOpen else { return }
             // 等待 UIWindowScene 首帧完全挂载，避免 fullScreenCover 被吞掉
             try? await Task.sleep(nanoseconds: 180_000_000)
             guard app.player.currentTrack != nil else { return }

@@ -2720,7 +2720,7 @@ public final class PlayerEngine: ObservableObject {
         updateNowPlayingCenter()
     }
 
-    /// 生成锁屏 / 控制中心展示元数据：开启锁屏歌词且命中非空歌词行时，将主标题替换为当前歌词并保留歌名
+    /// 生成锁屏 / 控制中心展示元数据：开启锁屏歌词且命中非空歌词行时，将主标题替换为当前歌词（含翻译）并保持副标题展示歌名与歌手
     nonisolated public static func buildNowPlayingDisplayMetadata(
         track: Track,
         lyrics: [LyricLine],
@@ -2746,16 +2746,20 @@ public final class PlayerEngine: ObservableObject {
             return fallback
         }
         let translation = line.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headline: String
+        if !translation.isEmpty && translation != lyricText {
+            headline = "\(lyricText) · \(translation)"
+        } else {
+            headline = lyricText
+        }
         let subtitle: String
-        if !translation.isEmpty {
-            subtitle = "\(translation) · \(track.name)"
-        } else if track.artistNames.isEmpty {
+        if track.artistNames.isEmpty {
             subtitle = track.name
         } else {
             subtitle = "\(track.name) - \(track.artistNames)"
         }
         return NowPlayingDisplayMetadata(
-            title: lyricText,
+            title: headline,
             artist: subtitle,
             albumTitle: track.album.name,
             lyricIndex: idx

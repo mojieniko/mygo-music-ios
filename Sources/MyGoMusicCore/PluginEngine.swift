@@ -102,6 +102,8 @@ public struct PluginManifest: Codable, Hashable, Sendable {
     public var requestHeaders: [PluginRequestHeaders]?
     public var settings: [PluginSettingSpec]?
     public var navigation: [NavItem]?
+    public var repository: String?
+    public var homepage: String?
 
     public init(
         id: String,
@@ -113,7 +115,9 @@ public struct PluginManifest: Codable, Hashable, Sendable {
         permissions: PluginPermissions? = nil,
         requestHeaders: [PluginRequestHeaders]? = nil,
         settings: [PluginSettingSpec]? = nil,
-        navigation: [NavItem]? = nil
+        navigation: [NavItem]? = nil,
+        repository: String? = nil,
+        homepage: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -125,6 +129,8 @@ public struct PluginManifest: Codable, Hashable, Sendable {
         self.requestHeaders = requestHeaders
         self.settings = settings
         self.navigation = navigation
+        self.repository = repository
+        self.homepage = homepage
     }
 }
 

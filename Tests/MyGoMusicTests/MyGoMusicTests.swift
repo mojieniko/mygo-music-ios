@@ -53,6 +53,81 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(quiets.last?.to, 20.0)
     }
 
+    func testAppleMusicLyricsMotionPresentationAndInterlude() {
+        // 1) 验证词尾空白拆分（确保逐字扫光与放大聚焦在核心字形）
+        let eng = LyricsEngine.splitWordTrailingWhitespace("running ")
+        XCTAssertEqual(eng.core, "running")
+        XCTAssertEqual(eng.trailing, " ")
+        let cjk = LyricsEngine.splitWordTrailingWhitespace("暮")
+        XCTAssertEqual(cjk.core, "暮")
+        XCTAssertEqual(cjk.trailing, "")
+        let empty = LyricsEngine.splitWordTrailingWhitespace("")
+        XCTAssertEqual(empty.core, "")
+        XCTAssertEqual(empty.trailing, "")
+
+        // 2) 验证逐字流体扫光、呼吸轻抬、尾音余韵以及 Reduce Motion 保护
+        let word = LyricWord(text: "running ", start: 2.0, end: 3.0)
+        let before = LyricsEngine.wordMotion(for: word, at: 1.5, reduceMotion: false)
+        XCTAssertEqual(before.wipeProgress, 0.0, accuracy: 0.001)
+        XCTAssertEqual(before.liftY, 0.0, accuracy: 0.001)
+        XCTAssertEqual(before.scale, 1.0, accuracy: 0.001)
+        XCTAssertFalse(before.isActive)
+
+        let mid = LyricsEngine.wordMotion(for: word, at: 2.5, reduceMotion: false)
+        XCTAssertEqual(mid.wipeProgress, 0.5, accuracy: 0.02)
+        XCTAssertLessThan(mid.liftY, -0.5)
+        XCTAssertGreaterThan(mid.scale, 1.01)
+        XCTAssertGreaterThan(mid.glowIntensity, 0.7)
+        XCTAssertTrue(mid.isActive)
+
+        let midReduced = LyricsEngine.wordMotion(for: word, at: 2.5, reduceMotion: true)
+        XCTAssertEqual(midReduced.wipeProgress, 0.5, accuracy: 0.02)
+        XCTAssertEqual(midReduced.liftY, 0.0, accuracy: 0.001)
+        XCTAssertEqual(midReduced.scale, 1.0, accuracy: 0.001)
+
+        let tail = LyricsEngine.wordMotion(for: word, at: 3.08, reduceMotion: false)
+        XCTAssertEqual(tail.wipeProgress, 1.0, accuracy: 0.001)
+        XCTAssertGreaterThan(tail.glowIntensity, 0.0)
+        let settled = LyricsEngine.wordMotion(for: word, at: 3.5, reduceMotion: false)
+        XCTAssertEqual(settled.wipeProgress, 1.0, accuracy: 0.001)
+        XCTAssertEqual(settled.glowIntensity, 0.0, accuracy: 0.001)
+
+        // 3) 验证 Apple Music 景深柔焦、下一句预读亮度、滑屏浏览去模糊与级联延迟
+        let cur = LyricsEngine.linePresentation(index: 3, currentIndex: 3, isUserScrolling: false)
+        let prev = LyricsEngine.linePresentation(index: 2, currentIndex: 3, isUserScrolling: false)
+        let next = LyricsEngine.linePresentation(index: 4, currentIndex: 3, isUserScrolling: false)
+        let far = LyricsEngine.linePresentation(index: 7, currentIndex: 3, isUserScrolling: false)
+        XCTAssertEqual(cur.blurRadius, 0.0, accuracy: 0.001)
+        XCTAssertEqual(cur.scale, 1.0, accuracy: 0.001)
+        XCTAssertGreaterThan(next.primaryOpacity, prev.primaryOpacity)
+        XCTAssertLessThan(next.blurRadius, far.blurRadius)
+        XCTAssertGreaterThan(next.staggerDelay, prev.staggerDelay)
+
+        let scrollingFar = LyricsEngine.linePresentation(index: 7, currentIndex: 3, isUserScrolling: true)
+        XCTAssertEqual(scrollingFar.blurRadius, 0.0, accuracy: 0.001)
+        XCTAssertGreaterThan(scrollingFar.primaryOpacity, far.primaryOpacity)
+
+        let reducedFar = LyricsEngine.linePresentation(index: 7, currentIndex: 3, isUserScrolling: false, reduceMotion: true)
+        XCTAssertEqual(reducedFar.blurRadius, 0.0, accuracy: 0.001)
+        XCTAssertEqual(reducedFar.scale, 1.0, accuracy: 0.001)
+        XCTAssertEqual(reducedFar.staggerDelay, 0.0, accuracy: 0.001)
+
+        // 4) 验证前奏与句间长间奏三圆点呼吸检测窗口
+        let lines = [
+            LyricLine(at: 8.0, end: 11.0, text: "First line"),
+            LyricLine(at: 17.0, end: 20.0, text: "Second line")
+        ]
+        let intro = LyricsEngine.activeInterlude(in: lines, at: 2.0, currentIndex: -1)
+        XCTAssertEqual(intro?.insertAfterLineIndex, -1)
+        XCTAssertEqual(intro?.progress ?? -1, 0.25, accuracy: 0.01)
+
+        XCTAssertNil(LyricsEngine.activeInterlude(in: lines, at: 11.2, currentIndex: 0))
+        let midInterlude = LyricsEngine.activeInterlude(in: lines, at: 13.5, currentIndex: 0)
+        XCTAssertEqual(midInterlude?.insertAfterLineIndex, 0)
+        XCTAssertGreaterThan(midInterlude?.progress ?? 0, 0.2)
+        XCTAssertNil(LyricsEngine.activeInterlude(in: lines, at: 16.92, currentIndex: 0))
+    }
+
     func testAppSettingsDecodesLegacyFilesWithMissingKeys() throws {
         let minimal = try JSONDecoder().decode(AppSettings.self, from: Data("{}".utf8))
         XCTAssertEqual(minimal.source, "kugou-lite")
@@ -678,6 +753,7 @@ final class MyGoMusicTests: XCTestCase {
         let lines: [LyricLine] = [
             LyricLine(at: 5.0, text: "迷い子でもいい"),
             LyricLine(at: 10.0, text: "迷い子でもいいと", translation: "就算迷茫也无妨"),
+            LyricLine(at: 14.0, text: "迷星叫", translation: "迷星叫"),
             LyricLine(at: 16.0, text: "   ")
         ]
 
@@ -703,16 +779,27 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(firstLine.artist, "迷星叫 - MyGO!!!!!")
         XCTAssertEqual(firstLine.lyricIndex, 0)
 
-        // 3) 命中带翻译歌词行：主标题显示原文歌词，副标题显示 "翻译 · 歌名"
+        // 3) 命中带翻译歌词行：翻译随原文合并展示于第一行，第二行保持 "歌名 - 歌手" 不被翻译挤占
         let secondLine = PlayerEngine.buildNowPlayingDisplayMetadata(
             track: track,
             lyrics: lines,
             position: 11.0,
             lockScreenLyricsEnabled: true
         )
-        XCTAssertEqual(secondLine.title, "迷い子でもいいと")
-        XCTAssertEqual(secondLine.artist, "就算迷茫也无妨 · 迷星叫")
+        XCTAssertEqual(secondLine.title, "迷い子でもいいと · 就算迷茫也无妨")
+        XCTAssertEqual(secondLine.artist, "迷星叫 - MyGO!!!!!")
         XCTAssertEqual(secondLine.lyricIndex, 1)
+
+        // 3b) 翻译与原文相同时不重复拼接
+        let duplicateTranslationLine = PlayerEngine.buildNowPlayingDisplayMetadata(
+            track: track,
+            lyrics: lines,
+            position: 14.5,
+            lockScreenLyricsEnabled: true
+        )
+        XCTAssertEqual(duplicateTranslationLine.title, "迷星叫")
+        XCTAssertEqual(duplicateTranslationLine.artist, "迷星叫 - MyGO!!!!!")
+        XCTAssertEqual(duplicateTranslationLine.lyricIndex, 2)
 
         // 4) 命中空白清屏行：自动回退原曲信息，防止锁屏变空白
         let blankLine = PlayerEngine.buildNowPlayingDisplayMetadata(
@@ -809,6 +896,72 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(FloatingTabBarMetrics.iconSize, 21.0)
         XCTAssertGreaterThan(FloatingTabBarMetrics.bottomInsetEmptyPlayer, FloatingTabBarMetrics.barHeight)
         XCTAssertGreaterThan(FloatingTabBarMetrics.bottomInsetWithMiniPlayer, FloatingTabBarMetrics.bottomInsetEmptyPlayer)
+
+        // 验证底部滚动避让边距：键盘弹出清零；全面屏/非全面屏均须高于悬浮胶囊及展开态 MiniPlayer
+        XCTAssertEqual(
+            FloatingTabBarMetrics.extraScrollBottomInset(
+                hasTrack: false,
+                isKeyboardVisible: true,
+                bottomOverlayPadding: 22,
+                systemSafeAreaBottom: 34
+            ),
+            0.0,
+            accuracy: 0.01
+        )
+        XCTAssertEqual(
+            FloatingTabBarMetrics.extraScrollBottomInset(
+                hasTrack: true,
+                isKeyboardVisible: true,
+                bottomOverlayPadding: 22,
+                systemSafeAreaBottom: 34
+            ),
+            0.0,
+            accuracy: 0.01
+        )
+        let notchEmptyExtra = FloatingTabBarMetrics.extraScrollBottomInset(
+            hasTrack: false,
+            isKeyboardVisible: false,
+            bottomOverlayPadding: 22,
+            systemSafeAreaBottom: 34
+        )
+        let notchMiniExtra = FloatingTabBarMetrics.extraScrollBottomInset(
+            hasTrack: true,
+            isKeyboardVisible: false,
+            bottomOverlayPadding: 22,
+            systemSafeAreaBottom: 34
+        )
+        XCTAssertEqual(notchEmptyExtra, 74.0, accuracy: 0.01)
+        XCTAssertEqual(notchMiniExtra, 142.0, accuracy: 0.01)
+        XCTAssertGreaterThan(34.0 + notchEmptyExtra, 22.0 + FloatingTabBarMetrics.barHeight)
+        XCTAssertGreaterThan(
+            34.0 + notchMiniExtra,
+            22.0 + FloatingTabBarMetrics.barHeight + FloatingTabBarMetrics.overlaySpacing + FloatingTabBarMetrics.miniExpandedHeight
+        )
+
+        let classicEmptyExtra = FloatingTabBarMetrics.extraScrollBottomInset(
+            hasTrack: false,
+            isKeyboardVisible: false,
+            bottomOverlayPadding: 14,
+            systemSafeAreaBottom: 0
+        )
+        let classicMiniExtra = FloatingTabBarMetrics.extraScrollBottomInset(
+            hasTrack: true,
+            isKeyboardVisible: false,
+            bottomOverlayPadding: 14,
+            systemSafeAreaBottom: 0
+        )
+        XCTAssertEqual(classicEmptyExtra, 100.0, accuracy: 0.01)
+        XCTAssertEqual(classicMiniExtra, 168.0, accuracy: 0.01)
+        XCTAssertEqual(
+            FloatingTabBarMetrics.extraScrollBottomInset(
+                hasTrack: false,
+                isKeyboardVisible: false,
+                bottomOverlayPadding: 22,
+                systemSafeAreaBottom: 220
+            ),
+            0.0,
+            accuracy: 0.01
+        )
 
         let tmpRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("mygo-ui-\(UUID().uuidString)", isDirectory: true)
@@ -2158,6 +2311,501 @@ final class MyGoMusicTests: XCTestCase {
         acc.add(5.0)
         acc.reset()
         XCTAssertEqual(acc.drain(), 0.0, accuracy: 0.001)
+    }
+
+    func testDailyFeatureCardMathColorsCoversAndQueueDetection() {
+        // 1. 封面主色调衍生三重色：高饱和暖金应生成 deep(v=0.24) / rich(v=0.50) / glow(v=1.0)
+        let warmAmber = BackdropRGBColor(r: 0.85, g: 0.62, b: 0.18)
+        let amberColors = BackdropFogMath.dailyCardColors(from: warmAmber)
+        let (_, _, deepV) = BackdropFogMath.rgbToHSV(r: amberColors.deep.r, g: amberColors.deep.g, b: amberColors.deep.b)
+        let (_, _, richV) = BackdropFogMath.rgbToHSV(r: amberColors.rich.r, g: amberColors.rich.g, b: amberColors.rich.b)
+        let (_, _, glowV) = BackdropFogMath.rgbToHSV(r: amberColors.glow.r, g: amberColors.glow.g, b: amberColors.glow.b)
+        XCTAssertEqual(deepV, 0.24, accuracy: 0.02)
+        XCTAssertEqual(richV, 0.50, accuracy: 0.02)
+        XCTAssertEqual(glowV, 1.00, accuracy: 0.02)
+
+        // 极低饱和度黑白封面与 nil 应安全回落到绯红色系，避免灰蒙
+        let neutralGray = BackdropRGBColor(r: 0.55, g: 0.55, b: 0.56)
+        let fallbackColors = BackdropFogMath.dailyCardColors(from: neutralGray)
+        let defaultColors = BackdropFogMath.dailyCardColors(from: nil)
+        XCTAssertEqual(fallbackColors.deep.r, defaultColors.deep.r, accuracy: 0.01)
+        XCTAssertEqual(fallbackColors.rich.g, defaultColors.rich.g, accuracy: 0.01)
+
+        // 2. 三张错落封面抽取：前两首同专辑时应智能略过重复封面并向后抓取第三张不同专辑
+        let makeTrack: (String, String, String?) -> Track = { id, artist, coverURL in
+            Track(
+                id: id,
+                source: "fn",
+                name: "Song \(id)",
+                artists: artist.isEmpty ? nil : [Artist(id: artist, name: artist)],
+                album: Album(id: "alb-\(id)", name: "Alb \(id)", imageUrl: coverURL)
+            )
+        }
+        let tracks = [
+            makeTrack("1", "Phoebe Ryan", "https://example.com/a.jpg"),
+            makeTrack("2", "Phoebe Ryan", "https://example.com/a.jpg"), // 与第1首同封面
+            makeTrack("3", "筷子兄弟", "https://example.com/b.jpg"),
+            makeTrack("4", "许嵩", "https://example.com/c.jpg"),
+            makeTrack("5", "周杰伦", "https://example.com/d.jpg")
+        ]
+        let pickedCovers = DailyFeatureCardMath.featuredCoverURLs(for: tracks, limit: 3)
+        XCTAssertEqual(pickedCovers, [
+            "https://example.com/a.jpg",
+            "https://example.com/b.jpg",
+            "https://example.com/c.jpg"
+        ])
+
+        // 少于 3 首但仅 1 个唯一封面时仍应保留叠层占位数量
+        let singleCoverDuo = [
+            makeTrack("10", "许嵩", "https://example.com/same.jpg"),
+            makeTrack("11", "许嵩", "https://example.com/same.jpg")
+        ]
+        XCTAssertEqual(DailyFeatureCardMath.featuredCoverURLs(for: singleCoverDuo, limit: 3).count, 2)
+
+        // 3. 歌手摘要最多提取 3 名去重歌手（对齐桌面端 `%s 等 · %s`）；单曲单歌手不带多余的“等”
+        let summary = DailyFeatureCardMath.artistSummary(for: tracks)
+        XCTAssertTrue(summary.contains("Phoebe Ryan, 筷子兄弟, 许嵩"))
+        XCTAssertFalse(summary.contains("周杰伦"))
+        XCTAssertTrue(summary.contains("5"))
+
+        let singleTrackSummary = DailyFeatureCardMath.artistSummary(for: [makeTrack("99", "许嵩", nil)])
+        XCTAssertTrue(singleTrackSummary.contains("许嵩"))
+        XCTAssertFalse(singleTrackSummary.contains("等"))
+
+        // 4. 播放队列归属判定与新版 3 封面黑胶卡片构造
+        XCTAssertTrue(DailyFeatureCardMath.isQueueActive(queue: tracks, currentTrack: tracks[2], sectionTracks: tracks))
+        XCTAssertFalse(DailyFeatureCardMath.isQueueActive(queue: tracks, currentTrack: nil, sectionTracks: tracks))
+        XCTAssertFalse(DailyFeatureCardMath.isQueueActive(queue: Array(tracks.prefix(4)), currentTrack: tracks[0], sectionTracks: tracks))
+
+        let cardView = DailyFeatureCardView(
+            section: MusicSection(title: "最近播放", tracks: tracks),
+            isPlayingFromCard: true,
+            isQueueFromCard: true,
+            audioBands: [0.4, 0.7, 0.5, 0.3],
+            onPlay: {},
+            onOpen: {}
+        )
+        _ = cardView.body
+    }
+
+    // MARK: - 14. 插件在线更新（轻量检测 / Commit SHA 回退 / 仓库绑定 / 权限二次确认 / 社区目录）
+
+    func testPluginInstallerLightweightUpdateAndCommitFallback() async throws {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-plugin-upd-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        let pluginsDir = workDir.appendingPathComponent("plugins", isDirectory: true)
+        let dataRootDir = workDir.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dataRootDir, withIntermediateDirectories: true)
+
+        // 先构造已安装插件（带有旧的 8 位 commit origin 与用户数据）
+        let installedDir = pluginsDir.appendingPathComponent("mock-plugin", isDirectory: true)
+        try FileManager.default.createDirectory(at: installedDir, withIntermediateDirectories: true)
+        let v1Manifest = """
+        {
+          "id": "mock-plugin",
+          "name": "Mock Plugin",
+          "version": "1.0.0",
+          "main": "index.js",
+          "repository": "owner/mock-plugin",
+          "homepage": "https://docs.other-host.dev/mock/plugin",
+          "permissions": { "network": ["*.example.com"] }
+        }
+        """
+        try Data(v1Manifest.utf8).write(to: installedDir.appendingPathComponent("plugin.json"))
+        try Data("export function home() { return { title: 'V1', sections: [] }; }\n".utf8)
+            .write(to: installedDir.appendingPathComponent("index.js"))
+
+        // 验证 strictly 只匹配 GitHub 的 repository，忽略非 GitHub 域名 homepage
+        let inferredOrigin = PluginInstaller.effectiveOrigin(for: installedDir)
+        XCTAssertEqual(inferredOrigin?.repo, "owner/mock-plugin")
+        XCTAssertEqual(inferredOrigin?.version, "1.0.0")
+        XCTAssertNil(PluginInstaller.parseOptionalGitHubRepo("https://docs.other-host.dev/mock/plugin"))
+
+        // 写入旧 8 位 SHA .origin.json，测试与远端 12 位同前缀 commit 不误报假更新
+        try PluginInstaller.saveOrigin(PluginOrigin(repo: "owner/mock-plugin", version: "a1b2c3d4"), in: installedDir)
+        let commitMockState = LockedRequestRecorder()
+        let sameCommitTransport: PluginHTTPTransport = { req in
+            commitMockState.record(req)
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr.hasSuffix("/releases/latest") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 404, json: #"{"message":"Not Found"}"#)
+            }
+            if urlStr.hasSuffix("/commits/HEAD") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, json: #"{"sha":"a1b2c3d4e5f678901234567890abcdef12345678"}"#)
+            }
+            XCTFail("轻量 checkUpdate 不应预下载 zipball: \(urlStr)")
+            return Self.mockHTTPResponse(url: req.url!, statusCode: 500, data: Data())
+        }
+
+        let noUpdateInfo = try await PluginInstaller.checkUpdate(for: installedDir, transport: sameCommitTransport)
+        XCTAssertFalse(noUpdateInfo.hasUpdate)
+        XCTAssertEqual(noUpdateInfo.latestVersion, "a1b2c3d4e5f6")
+        XCTAssertEqual(commitMockState.urls.count, 2)
+
+        // 当远端产生新 commit（Release 404 回退到 HEAD SHA），精准检出更新且可从 release.zipball 下载安装
+        let newCommitZip = Self.makeStoredZipData(entries: [
+            ("owner-mock-plugin-fedcba9/plugin.json", Data("""
+            {
+              "id": "mock-plugin",
+              "name": "Mock Plugin",
+              "version": "1.0.0",
+              "main": "index.js",
+              "permissions": { "network": ["sub.example.com"] }
+            }
+            """.utf8)),
+            ("owner-mock-plugin-fedcba9/index.js", Data("export function home() { return { title: 'V2-Commit', sections: [] }; }\n".utf8))
+        ])
+
+        let releaseAssetZip = Self.makeStoredZipData(entries: [
+            ("plugin.json", Data("""
+            {
+              "id": "mock-plugin",
+              "name": "Mock Plugin",
+              "version": "1.2.0",
+              "main": "index.js",
+              "permissions": { "network": ["sub.example.com", "cdn.api.test"] }
+            }
+            """.utf8)),
+            ("index.js", Data("export function home() { return { title: 'V1.2-Release', sections: [] }; }\n".utf8))
+        ])
+
+        // 1) 新 commit 检查 + fetchFromRelease 验证
+        let nextCommitTransport: PluginHTTPTransport = { req in
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr.hasSuffix("/releases/latest") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 404, json: #"{"message":"Not Found"}"#)
+            }
+            if urlStr.hasSuffix("/commits/HEAD") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, json: #"{"sha":"fedcba9876543210000000000000000000000000"}"#)
+            }
+            if urlStr.contains("/zipball/") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, data: newCommitZip)
+            }
+            return Self.mockHTTPResponse(url: req.url!, statusCode: 404, data: Data())
+        }
+
+        let commitUpdateInfo = try await PluginInstaller.checkUpdate(for: installedDir, transport: nextCommitTransport)
+        XCTAssertTrue(commitUpdateInfo.hasUpdate)
+        XCTAssertEqual(commitUpdateInfo.latestVersion, "fedcba987654")
+        XCTAssertNotNil(commitUpdateInfo.release)
+
+        let pendingCommit = try await PluginInstaller.fetchFromRelease(commitUpdateInfo.release!, transport: nextCommitTransport)
+        defer { try? FileManager.default.removeItem(at: pendingCommit.sourcePath) }
+        XCTAssertEqual(pendingCommit.version, "fedcba987654")
+        // 验证旧权限通配符 *.example.com 覆盖 sub.example.com，不应触发权限变更确认
+        XCTAssertNil(PluginInstaller.expandedPermissions(
+            from: PluginPermissions(network: ["*.example.com"]),
+            to: pendingCommit.manifest.permissions
+        ))
+
+        // 2) 带 Token 拉取 Release Asset：验证 Accept: application/octet-stream，且外链 CDN 不带 Authorization
+        let assetRecorder = LockedRequestRecorder()
+        let releaseTransport: PluginHTTPTransport = { req in
+            assetRecorder.record(req)
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr.hasSuffix("/releases/latest") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, json: """
+                {
+                  "tag_name": "v1.2.0",
+                  "zipball_url": "https://api.github.com/repos/owner/mock-plugin/zipball/v1.2.0",
+                  "assets": [
+                    {
+                      "name": "mock-plugin.zip",
+                      "url": "https://api.github.com/repos/owner/mock-plugin/releases/assets/9988",
+                      "browser_download_url": "https://objects.githubusercontent.com/assets/mock-plugin.zip"
+                    }
+                  ]
+                }
+                """)
+            }
+            if urlStr.hasSuffix("/releases/assets/9988") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, data: releaseAssetZip)
+            }
+            return Self.mockHTTPResponse(url: req.url!, statusCode: 404, data: Data())
+        }
+
+        let releaseInfoWithToken = try await PluginInstaller.latestRelease(
+            repoInput: "owner/mock-plugin",
+            token: "ghp_secret_token",
+            transport: releaseTransport
+        )
+        XCTAssertEqual(releaseInfoWithToken.version, "1.2.0")
+        XCTAssertTrue(releaseInfoWithToken.isReleaseAssetAPI)
+        let pendingRelease = try await PluginInstaller.fetchFromRelease(
+            releaseInfoWithToken,
+            token: "ghp_secret_token",
+            transport: releaseTransport
+        )
+        defer { try? FileManager.default.removeItem(at: pendingRelease.sourcePath) }
+        let installedUpdated = try PluginInstaller.install(pendingRelease, into: pluginsDir, dataRootDir: dataRootDir)
+        let homeResult = try await installedUpdated.home()
+        XCTAssertEqual(homeResult.title, "V1.2-Release")
+        XCTAssertEqual(PluginInstaller.readOrigin(in: installedUpdated.pluginDir)?.version, "1.2.0")
+
+        let assetReq = assetRecorder.requests.last!
+        XCTAssertEqual(assetReq.value(forHTTPHeaderField: "Accept"), "application/octet-stream")
+        XCTAssertEqual(assetReq.value(forHTTPHeaderField: "Authorization"), "Bearer ghp_secret_token")
+
+        // 无 token 时应选公开 browser_download_url，且不对非 api.github.com 发送 Bearer Token
+        let publicReleaseInfo = try await PluginInstaller.latestRelease(
+            repoInput: "owner/mock-plugin",
+            token: nil,
+            transport: releaseTransport
+        )
+        XCTAssertFalse(publicReleaseInfo.isReleaseAssetAPI)
+        XCTAssertEqual(publicReleaseInfo.downloadURL, "https://objects.githubusercontent.com/assets/mock-plugin.zip")
+
+        // 3) 测试社区插件搜索 API 解析
+        let communityTransport: PluginHTTPTransport = { req in
+            Self.mockHTTPResponse(url: req.url!, statusCode: 200, json: """
+            {
+              "items": [
+                {
+                  "full_name": "egoist/mygo-music-youtube-music",
+                  "name": "mygo-music-youtube-music",
+                  "owner": { "login": "egoist" },
+                  "description": "YouTube Music plugin",
+                  "stargazers_count": 42,
+                  "html_url": "https://github.com/egoist/mygo-music-youtube-music"
+                }
+              ]
+            }
+            """)
+        }
+        let communityList = try await PluginInstaller.fetchCommunityPlugins(transport: communityTransport)
+        XCTAssertEqual(communityList.count, 1)
+        XCTAssertEqual(communityList[0].repo, "egoist/mygo-music-youtube-music")
+        XCTAssertEqual(communityList[0].stars, 42)
+    }
+
+    @MainActor
+    func testAppModelPluginUpdateStateMachinePermissionsAndRepoLinking() async throws {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-appmodel-upd-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+        let model = AppModel(baseDataDir: workDir)
+        // 手动导入一个最初没有 .origin.json 的本地插件，并写入用户配置数据验证升级后不丢失
+        let localSourceFolder = workDir.appendingPathComponent("staged-local", isDirectory: true)
+        try FileManager.default.createDirectory(at: localSourceFolder, withIntermediateDirectories: true)
+        try Data("""
+        {
+          "id": "demo-sync-plugin",
+          "name": "Sync Test Plugin",
+          "version": "1.0.0",
+          "main": "index.js",
+          "permissions": { "network": ["api.safe.test"], "process": false }
+        }
+        """.utf8).write(to: localSourceFolder.appendingPathComponent("plugin.json"))
+        try Data("export function home() { return { title: 'SyncV1', sections: [] }; }\n".utf8)
+            .write(to: localSourceFolder.appendingPathComponent("index.js"))
+
+        await model.importLocalPlugin(from: localSourceFolder)
+        XCTAssertNil(model.pluginOrigins["demo-sync-plugin"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localSourceFolder.appendingPathComponent("plugin.json").path))
+
+        let userStorageDir = workDir
+            .appendingPathComponent("plugin-data", isDirectory: true)
+            .appendingPathComponent("demo-sync-plugin", isDirectory: true)
+        try FileManager.default.createDirectory(at: userStorageDir, withIntermediateDirectories: true)
+        let savedSettingFile = userStorageDir.appendingPathComponent("storage.json")
+        try Data(#"{"cookie":"keep-me-across-update"}"#.utf8).write(to: savedSettingFile)
+
+        // 构造远端 v2.0.0 压缩包（新增网络权限与 process: true）
+        let v2Zip = Self.makeStoredZipData(entries: [
+            ("plugin.json", Data("""
+            {
+              "id": "demo-sync-plugin",
+              "name": "Sync Test Plugin",
+              "version": "2.0.0",
+              "main": "index.js",
+              "permissions": { "network": ["api.safe.test", "extra.new.host"], "process": true }
+            }
+            """.utf8)),
+            ("index.js", Data("export function home() { return { title: 'SyncV2', sections: [] }; }\n".utf8))
+        ])
+
+        let mockTransport: PluginHTTPTransport = { req in
+            let urlStr = req.url?.absoluteString ?? ""
+            if urlStr.hasSuffix("/releases/latest") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, json: """
+                {
+                  "tag_name": "v2.0.0",
+                  "zipball_url": "https://api.github.com/repos/test-org/demo-sync/zipball/v2.0.0",
+                  "assets": []
+                }
+                """)
+            }
+            if urlStr.contains("/zipball/v2.0.0") {
+                return Self.mockHTTPResponse(url: req.url!, statusCode: 200, data: v2Zip)
+            }
+            return Self.mockHTTPResponse(url: req.url!, statusCode: 404, data: Data())
+        }
+
+        // 1. 为本地导入插件绑定 GitHub 仓库并立刻检测更新
+        let linked = await model.linkPluginRepository(
+            id: "demo-sync-plugin",
+            repoInput: "https://github.com/test-org/demo-sync",
+            checkNow: true,
+            transport: mockTransport
+        )
+        XCTAssertTrue(linked)
+        XCTAssertEqual(model.pluginOrigins["demo-sync-plugin"]?.repo, "test-org/demo-sync")
+        XCTAssertEqual(model.settings.pluginUpdates["demo-sync-plugin"], "2.0.0")
+        XCTAssertEqual(model.availablePluginUpdateCount, 1)
+        XCTAssertEqual(model.pluginCheckStates["demo-sync-plugin"], .updateAvailable("2.0.0"))
+
+        // 2. 更新到 2.0.0 时检测到权限扩大：挂起等待确认，不直接覆盖
+        let updatedImmediately = await model.updatePlugin(id: "demo-sync-plugin", transport: mockTransport)
+        XCTAssertFalse(updatedImmediately)
+        XCTAssertEqual(model.pendingPluginUpdateApproval?.addedPermissions.network, ["extra.new.host"])
+        XCTAssertEqual(model.pendingPluginUpdateApproval?.addedPermissions.process, ["*"])
+        XCTAssertEqual(model.pluginSources.first(where: { $0.manifest.id == "demo-sync-plugin" })?.manifest.version, "1.0.0")
+
+        // 3. 用户确认权限扩展后完成升级，且用户 plugin-data 保持完整
+        await model.confirmPendingPluginUpdate()
+        XCTAssertNil(model.pendingPluginUpdateApproval)
+        XCTAssertNil(model.settings.pluginUpdates["demo-sync-plugin"])
+        XCTAssertEqual(model.availablePluginUpdateCount, 0)
+        XCTAssertEqual(model.pluginCheckStates["demo-sync-plugin"], .upToDate)
+
+        let upgradedPlugin = model.pluginSources.first(where: { $0.manifest.id == "demo-sync-plugin" })
+        XCTAssertEqual(upgradedPlugin?.manifest.version, "2.0.0")
+        let homeV2 = try await upgradedPlugin?.home()
+        XCTAssertEqual(homeV2?.title, "SyncV2")
+        let preservedStorage = try String(contentsOf: savedSettingFile, encoding: .utf8)
+        XCTAssertTrue(preservedStorage.contains("keep-me-across-update"))
+
+        // 4. 接口限流 / 错误不再被静默吞没，准确写入 .failed 状态
+        let rateLimitTransport: PluginHTTPTransport = { req in
+            let http = HTTPURLResponse(
+                url: req.url!,
+                statusCode: 403,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["X-RateLimit-Remaining": "0"]
+            )!
+            return (Data(), http)
+        }
+        await model.checkForPluginUpdates(manual: true, transport: rateLimitTransport)
+        if case .failed(let msg)? = model.pluginCheckStates["demo-sync-plugin"] {
+            XCTAssertTrue(msg.contains("rate limit"))
+        } else {
+            XCTFail("期望 checkState 为 .failed，实际为 \(String(describing: model.pluginCheckStates["demo-sync-plugin"]))")
+        }
+    }
+
+    private static func mockHTTPResponse(
+        url: URL,
+        statusCode: Int,
+        json: String
+    ) -> (Data, URLResponse) {
+        mockHTTPResponse(url: url, statusCode: statusCode, data: Data(json.utf8))
+    }
+
+    private static func mockHTTPResponse(
+        url: URL,
+        statusCode: Int,
+        data: Data
+    ) -> (Data, URLResponse) {
+        let resp = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: nil)!
+        return (data, resp)
+    }
+
+    /// 构造标准无压缩 Stored ZIP 字节流供在线更新单元测试使用
+    private static func makeStoredZipData(entries: [(name: String, data: Data)]) -> Data {
+        func appendLE16(_ out: inout Data, _ v: UInt16) {
+            out.append(UInt8(v & 0xFF))
+            out.append(UInt8((v >> 8) & 0xFF))
+        }
+        func appendLE32(_ out: inout Data, _ v: UInt32) {
+            out.append(UInt8(v & 0xFF))
+            out.append(UInt8((v >> 8) & 0xFF))
+            out.append(UInt8((v >> 16) & 0xFF))
+            out.append(UInt8((v >> 24) & 0xFF))
+        }
+
+        var archive = Data()
+        var centralDir = Data()
+
+        for entry in entries {
+            let nameData = Data(entry.name.utf8)
+            let localOffset = UInt32(archive.count)
+            let size = UInt32(entry.data.count)
+
+            // Local file header
+            appendLE32(&archive, 0x04034b50)
+            appendLE16(&archive, 20)
+            appendLE16(&archive, 0)
+            appendLE16(&archive, 0) // method 0: Stored
+            appendLE16(&archive, 0)
+            appendLE16(&archive, 0)
+            appendLE32(&archive, 0) // extractZipData 不依赖 CRC32 字段
+            appendLE32(&archive, size)
+            appendLE32(&archive, size)
+            appendLE16(&archive, UInt16(nameData.count))
+            appendLE16(&archive, 0)
+            archive.append(nameData)
+            archive.append(entry.data)
+
+            // Central directory header
+            appendLE32(&centralDir, 0x02014b50)
+            appendLE16(&centralDir, 20)
+            appendLE16(&centralDir, 20)
+            appendLE16(&centralDir, 0)
+            appendLE16(&centralDir, 0) // method 0: Stored
+            appendLE16(&centralDir, 0)
+            appendLE16(&centralDir, 0)
+            appendLE32(&centralDir, 0)
+            appendLE32(&centralDir, size)
+            appendLE32(&centralDir, size)
+            appendLE16(&centralDir, UInt16(nameData.count))
+            appendLE16(&centralDir, 0)
+            appendLE16(&centralDir, 0)
+            appendLE16(&centralDir, 0)
+            appendLE16(&centralDir, 0)
+            appendLE32(&centralDir, 0)
+            appendLE32(&centralDir, localOffset)
+            centralDir.append(nameData)
+        }
+
+        let cdOffset = UInt32(archive.count)
+        let cdSize = UInt32(centralDir.count)
+        archive.append(centralDir)
+
+        // End of central directory record
+        appendLE32(&archive, 0x06054b50)
+        appendLE16(&archive, 0)
+        appendLE16(&archive, 0)
+        appendLE16(&archive, UInt16(entries.count))
+        appendLE16(&archive, UInt16(entries.count))
+        appendLE32(&archive, cdSize)
+        appendLE32(&archive, cdOffset)
+        appendLE16(&archive, 0)
+        return archive
+    }
+}
+
+private final class LockedRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: [URLRequest] = []
+
+    var requests: [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
+
+    var urls: [String] {
+        requests.compactMap { $0.url?.absoluteString }
+    }
+
+    func record(_ req: URLRequest) {
+        lock.lock()
+        captured.append(req)
+        lock.unlock()
     }
 }
 

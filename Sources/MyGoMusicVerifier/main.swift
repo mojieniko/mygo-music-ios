@@ -125,9 +125,36 @@ struct MyGoMusicVerifier {
             position: 2.0,
             lockScreenLyricsEnabled: true
         )
-        try assertEqual(metaActive.title, "Hello 世界")
-        try assertEqual(metaActive.artist, "你好世界 · 春日影")
+        try assertEqual(metaActive.title, "Hello 世界 · 你好世界")
+        try assertEqual(metaActive.artist, "春日影 - MyGO!!!!!")
         try assertEqual(metaActive.lyricIndex, 1)
+
+        // 验证 Apple Music 歌词逐字流体扫光、景深柔焦、去模糊以及间奏引导窗口
+        let parts = LyricsEngine.splitWordTrailingWhitespace("rescue ")
+        try assertEqual(parts.core, "rescue")
+        try assertEqual(parts.trailing, " ")
+
+        let w = LyricWord(text: "rescue ", start: 4.0, end: 5.0)
+        let wMid = LyricsEngine.wordMotion(for: w, at: 4.5)
+        try assertTrue(wMid.wipeProgress > 0.45 && wMid.wipeProgress < 0.55)
+        try assertTrue(wMid.liftY < 0 && wMid.scale > 1.0 && wMid.glowIntensity > 0.5)
+
+        let wReduced = LyricsEngine.wordMotion(for: w, at: 4.5, reduceMotion: true)
+        try assertEqual(wReduced.liftY, 0.0)
+        try assertEqual(wReduced.scale, 1.0)
+
+        let pCurrent = LyricsEngine.linePresentation(index: 1, currentIndex: 1, isUserScrolling: false)
+        let pFar = LyricsEngine.linePresentation(index: 4, currentIndex: 1, isUserScrolling: false)
+        let pScroll = LyricsEngine.linePresentation(index: 4, currentIndex: 1, isUserScrolling: true)
+        try assertEqual(pCurrent.blurRadius, 0.0)
+        try assertTrue(pFar.blurRadius > 2.5 && pScroll.blurRadius == 0.0)
+
+        let interludeLines = [
+            LyricLine(at: 6.0, end: 9.0, text: "Line 1"),
+            LyricLine(at: 15.0, end: 18.0, text: "Line 2")
+        ]
+        try assertEqual(LyricsEngine.activeInterlude(in: interludeLines, at: 3.0, currentIndex: -1)?.insertAfterLineIndex, -1)
+        try assertEqual(LyricsEngine.activeInterlude(in: interludeLines, at: 12.0, currentIndex: 0)?.insertAfterLineIndex, 0)
     }
 
     static func verifyPluginRuntime() async throws {
@@ -372,6 +399,18 @@ struct MyGoMusicVerifier {
         try assertEqual(try PluginInstaller.parseRepo("git@github.com:AkinoKaede/mygo-music-netease-cloud-music.git"), "AkinoKaede/mygo-music-netease-cloud-music")
         try assertTrue(PluginInstaller.isNewerVersion("0.2.0", than: "0.1.20"))
         try assertTrue(!PluginInstaller.isNewerVersion("0.1.8", than: "0.1.20"))
+        try assertEqual(PluginInstaller.displayVersion("v1.2.3"), "v1.2.3")
+        try assertEqual(PluginInstaller.displayVersion("a1b2c3d4e5f6"), "a1b2c3d4")
+        try assertTrue(!PluginInstaller.hasNewerUpdate(candidate: "a1b2c3d4e5f6", current: "a1b2c3d4"))
+        try assertTrue(PluginInstaller.hasNewerUpdate(candidate: "fedcba987654", current: "a1b2c3d4e5f6"))
+        try assertEqual(PluginInstaller.parseOptionalGitHubRepo("https://not-github.example.com/foo/bar"), nil)
+        try assertEqual(PluginInstaller.parseOptionalGitHubRepo("https://github.com/egoist/mygo-music-youtube-music"), "egoist/mygo-music-youtube-music")
+        let extraPerm = PluginInstaller.expandedPermissions(
+            from: PluginPermissions(network: ["*.music.163.com"], process: nil),
+            to: PluginPermissions(network: ["interface.music.163.com", "api.new.example.com"], process: ["*"])
+        )
+        try assertEqual(extraPerm?.network, ["api.new.example.com"])
+        try assertEqual(extraPerm?.process, ["*"])
 
         // 验证 compression_stream 流式 ZIP Deflate 解压 + __MACOSX 跳过 + 深层根目录穿透
         let zipWorkDir = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-zip-\(UUID().uuidString)", isDirectory: true)

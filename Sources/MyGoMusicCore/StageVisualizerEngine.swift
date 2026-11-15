@@ -871,6 +871,27 @@ public enum BackdropFogMath {
         return (top, foot)
     }
 
+    /// 计算首页 Hero 黑胶卡片的三重主色（deep 深底、rich 浓郁渐变、glow 黑胶晕光，对应 ui_daily.go dailyColors）
+    public static func dailyCardColors(from tint: BackdropRGBColor?) -> (
+        deep: BackdropRGBColor,
+        rich: BackdropRGBColor,
+        glow: BackdropRGBColor
+    ) {
+        var h = 356.0
+        var s = 0.74
+        if let tint {
+            let (th, ts, _) = rgbToHSV(r: tint.r, g: tint.g, b: tint.b)
+            if ts > 0.15 {
+                h = th
+                s = min(max(ts * 1.2, 0.50), 0.78)
+            }
+        }
+        let deep = hsvToRGB(h: h, s: s, v: 0.24)
+        let rich = hsvToRGB(h: (h + 16.0).truncatingRemainder(dividingBy: 360.0), s: s * 0.90, v: 0.50)
+        let glow = hsvToRGB(h: (h + 32.0).truncatingRemainder(dividingBy: 360.0), s: s * 0.55, v: 1.0)
+        return (deep, rich, glow)
+    }
+
     /// 从缩放后的 RGBA8 像素缓冲区按 18 色相桶加权 (s*s*v) 提取封面最具代表性的主色调（对应 artwork.go dominantColor）
     public static func dominantColorFromRGBA(bytes: [UInt8], width: Int, height: Int) -> BackdropRGBColor? {
         let pixelCount = width * height
@@ -1005,5 +1026,83 @@ public struct BackdropMotionState: Sendable {
     /// 供测试或外部校准时重置时间锚点而不丢弃累积相位
     public mutating func resetClockAnchor() {
         lastTime = nil
+    }
+}
+
+/// 首页 Hero 卡片（每日推荐 / 最近播放）的数据汇总与栈叠封面解析（对应 ui_daily.go）
+public enum DailyFeatureCardMath {
+    /// 从曲目集合提取前 3 个去重后的主歌手与曲目总量摘要（例如 `"Phoebe Ryan, 筷子兄弟, 许嵩 等 · 10 首"`）
+    public static func artistSummary(for tracks: [Track]) -> String {
+        var seen = Set<String>()
+        var names: [String] = []
+        names.reserveCapacity(3)
+
+        for track in tracks {
+            guard let raw = track.artists?.first?.name else { continue }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
+            seen.insert(trimmed)
+            names.append(trimmed)
+            if names.count >= 3 { break }
+        }
+
+        if names.isEmpty {
+            return I18n.songs(tracks.count)
+        }
+        if tracks.count > names.count {
+            return I18n.tf("%s and more · %s", names.joined(separator: ", "), I18n.songs(tracks.count))
+        }
+        return "\(names.joined(separator: ", ")) · \(I18n.songs(tracks.count))"
+    }
+
+    /// 选取最多 `limit`（默认 3）张层叠展示的专辑封面 URL：优先挑选互不重复的专辑封面，同专辑连听时自动延后补位
+    public static func featuredCoverURLs(for tracks: [Track], limit: Int = 3) -> [String?] {
+        guard !tracks.isEmpty, limit > 0 else { return [] }
+        let targetCount = min(limit, tracks.count)
+
+        var result: [String?] = []
+        result.reserveCapacity(targetCount)
+        var seen = Set<String>()
+        var usedIndices = Set<Int>()
+
+        for (index, track) in tracks.enumerated() {
+            guard result.count < targetCount else { break }
+            let cleaned = track.album.imageUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !cleaned.isEmpty, !seen.contains(cleaned) else { continue }
+            seen.insert(cleaned)
+            usedIndices.insert(index)
+            result.append(cleaned)
+        }
+
+        // 若整体曲目全部/多首共享少数封面，则按原序补齐叠层槽位以保持叠放视觉层次
+        if result.count < targetCount {
+            for (index, track) in tracks.enumerated() where !usedIndices.contains(index) {
+                guard result.count < targetCount else { break }
+                let cleaned = track.album.imageUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+                result.append((cleaned?.isEmpty == false) ? cleaned : nil)
+                usedIndices.insert(index)
+            }
+        }
+
+        return result
+    }
+
+    /// 判断当前播放器队列是否正对应该 Hero 卡片的歌曲列表（对应 dailyPlaying）
+    public static func isQueueActive(
+        queue: [Track],
+        currentTrack: Track?,
+        sectionTracks: [Track]
+    ) -> Bool {
+        guard currentTrack != nil,
+              !sectionTracks.isEmpty,
+              queue.count == sectionTracks.count,
+              let firstQueue = queue.first,
+              let lastQueue = queue.last,
+              let firstSection = sectionTracks.first,
+              let lastSection = sectionTracks.last else {
+            return false
+        }
+        return firstQueue.compositeKey == firstSection.compositeKey
+            && lastQueue.compositeKey == lastSection.compositeKey
     }
 }

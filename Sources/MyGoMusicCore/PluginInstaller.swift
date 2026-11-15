@@ -15,6 +15,59 @@ public struct PluginOrigin: Codable, Hashable, Sendable {
     }
 }
 
+/// 可注入的网络请求传输层（生产环境走 URLSession，单元测试可注入 Mock）
+public typealias PluginHTTPTransport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+/// GitHub 远端 Release 或 Commit 元数据（仅通过轻量 API 获取，不预下载源码包）
+public struct PluginReleaseInfo: Codable, Hashable, Sendable {
+    public var repo: String
+    public var version: String
+    public var downloadURL: String
+    public var fallbackZipballURL: String?
+    public var isReleaseAssetAPI: Bool
+
+    public init(
+        repo: String,
+        version: String,
+        downloadURL: String,
+        fallbackZipballURL: String? = nil,
+        isReleaseAssetAPI: Bool = false
+    ) {
+        self.repo = repo
+        self.version = version
+        self.downloadURL = downloadURL
+        self.fallbackZipballURL = fallbackZipballURL
+        self.isReleaseAssetAPI = isReleaseAssetAPI
+    }
+}
+
+/// GitHub `topic:mygo-music-plugin` 社区插件目录条目
+public struct CommunityPluginEntry: Identifiable, Hashable, Sendable {
+    public var id: String { repo }
+    public var repo: String
+    public var shortName: String
+    public var owner: String
+    public var description: String
+    public var stars: Int
+    public var htmlURL: String
+
+    public init(
+        repo: String,
+        shortName: String,
+        owner: String,
+        description: String,
+        stars: Int,
+        htmlURL: String
+    ) {
+        self.repo = repo
+        self.shortName = shortName
+        self.owner = owner
+        self.description = description
+        self.stars = stars
+        self.htmlURL = htmlURL
+    }
+}
+
 /// 待确认安装的插件包（对应 plugin.Pending）
 public struct PendingPlugin: Identifiable, Sendable {
     public var id: String { manifest.id }
@@ -39,6 +92,7 @@ public struct PluginUpdateInfo: Sendable {
     public var latestVersion: String
     public var hasUpdate: Bool
     public var pending: PendingPlugin?
+    public var release: PluginReleaseInfo?
 
     public init(
         pluginID: String,
@@ -46,7 +100,8 @@ public struct PluginUpdateInfo: Sendable {
         currentVersion: String,
         latestVersion: String,
         hasUpdate: Bool,
-        pending: PendingPlugin? = nil
+        pending: PendingPlugin? = nil,
+        release: PluginReleaseInfo? = nil
     ) {
         self.pluginID = pluginID
         self.repo = repo
@@ -54,6 +109,7 @@ public struct PluginUpdateInfo: Sendable {
         self.latestVersion = latestVersion
         self.hasUpdate = hasUpdate
         self.pending = pending
+        self.release = release
     }
 }
 
@@ -144,6 +200,35 @@ public enum PluginInstaller {
         return general
     }
 
+    /// 规范化版本标签（去除空白与前导 v/V）
+    public static func normalizeVersionTag(_ raw: String) -> String {
+        var v = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while v.hasPrefix("v") || v.hasPrefix("V") {
+            v.removeFirst()
+        }
+        return v
+    }
+
+    /// 判断字符串是否为 Git 提交哈希短串（避免展示时误加 v 前缀）
+    public static func isHexCommitSHA(_ version: String) -> Bool {
+        let s = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.count >= 7, !s.contains(".") else { return false }
+        return s.unicodeScalars.allSatisfy {
+            (0x30...0x39).contains($0.value) || (0x61...0x66).contains($0.value) || (0x41...0x46).contains($0.value)
+        }
+    }
+
+    /// 格式化面向用户的版本展示文本（语义化版本显示 vX.Y.Z，提交哈希保留短串）
+    public static func displayVersion(_ version: String) -> String {
+        let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if isHexCommitSHA(trimmed) {
+            return String(trimmed.prefix(8))
+        }
+        let norm = normalizeVersionTag(trimmed)
+        return norm.isEmpty ? "" : "v\(norm)"
+    }
+
     /// 比较两个语义化版本号，判断 candidate 是否比 current 更新（对应 plugin.IsNewer）
     public static func isNewerVersion(_ candidate: String, than current: String) -> Bool {
         guard let a = parseVersionNumbers(candidate),
@@ -158,6 +243,60 @@ public enum PluginInstaller {
             }
         }
         return false
+    }
+
+    /// 统一判断 candidate 是否应视为相对 current 的新版本（兼容 semver、commit SHA 与旧 8 位 SHA）
+    public static func hasNewerUpdate(candidate: String, current: String) -> Bool {
+        let cand = normalizeVersionTag(candidate)
+        let cur = normalizeVersionTag(current)
+        guard !cand.isEmpty else { return false }
+        guard !cur.isEmpty else { return true }
+        if parseVersionNumbers(cand) != nil && parseVersionNumbers(cur) != nil {
+            return isNewerVersion(cand, than: cur)
+        }
+        if isHexCommitSHA(cand) && isHexCommitSHA(cur) {
+            let n = min(cand.count, cur.count)
+            return cand.prefix(n).lowercased() != cur.prefix(n).lowercased()
+        }
+        return cand != cur
+    }
+
+    /// 从任意配置字段（如 manifest.repository / homepage）严格提取 GitHub owner/repo（避免把非 GitHub 官网误认作仓库）
+    public static func parseOptionalGitHubRepo(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        let lower = trimmed.lowercased()
+        let isExplicitGitHub = lower.contains("github.com/") || lower.hasPrefix("git@github.com:")
+        let looksLikeOtherURL = lower.contains("://") && !isExplicitGitHub
+        if looksLikeOtherURL {
+            return nil
+        }
+        return try? parseRepo(trimmed)
+    }
+
+    /// 校验插件更新后是否请求了新的敏感权限（对应原项目 Pending.AsksForMore）
+    public static func expandedPermissions(from old: PluginPermissions?, to new: PluginPermissions?) -> PluginPermissions? {
+        let addedHosts = (new?.network ?? []).filter { rawHost in
+            let host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !host.isEmpty else { return false }
+            return !(old?.coversPattern(host) ?? false)
+        }
+        let oldProcesses = Set(
+            (old?.process ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        let addedProcesses = (new?.process ?? []).filter { rawProc in
+            let proc = rawProc.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !proc.isEmpty else { return false }
+            return !oldProcesses.contains("*") && !oldProcesses.contains(proc)
+        }
+        guard !addedHosts.isEmpty || !addedProcesses.isEmpty else { return nil }
+        return PluginPermissions(
+            network: addedHosts.isEmpty ? nil : addedHosts,
+            process: addedProcesses.isEmpty ? nil : addedProcesses
+        )
     }
 
     public static func parseVersionNumbers(_ version: String) -> [Int]? {
@@ -228,6 +367,32 @@ public enum PluginInstaller {
         return try? JSONDecoder().decode(PluginOrigin.self, from: data)
     }
 
+    /// 持久化插件的 GitHub 来源记录到 `.origin.json`
+    public static func saveOrigin(_ origin: PluginOrigin, in pluginDir: URL) throws {
+        let originURL = pluginDir.appendingPathComponent(".origin.json")
+        let data = try JSONEncoder().encode(origin)
+        try data.write(to: originURL, options: .atomic)
+    }
+
+    /// 获取插件有效更新源：优先读 `.origin.json`，其次从 `plugin.json` 的 `repository` / GitHub `homepage` 推断
+    public static func effectiveOrigin(for pluginDir: URL, manifest: PluginManifest? = nil) -> PluginOrigin? {
+        if let stored = readOrigin(in: pluginDir) {
+            return stored
+        }
+        let resolvedManifest: PluginManifest?
+        if let manifest {
+            resolvedManifest = manifest
+        } else if let data = try? Data(contentsOf: pluginDir.appendingPathComponent("plugin.json")) {
+            resolvedManifest = try? JSONDecoder().decode(PluginManifest.self, from: data)
+        } else {
+            resolvedManifest = nil
+        }
+        guard let m = resolvedManifest else { return nil }
+        let repo = parseOptionalGitHubRepo(m.repository) ?? parseOptionalGitHubRepo(m.homepage)
+        guard let repo else { return nil }
+        return PluginOrigin(repo: repo, version: normalizeVersionTag(m.version ?? ""))
+    }
+
     /// 从本地文件夹或 `.zip` 压缩包读取待安装插件
     public static func openFromLocal(_ url: URL) throws -> PendingPlugin {
         let didAccess = url.startAccessingSecurityScopedResource()
@@ -271,45 +436,31 @@ public enum PluginInstaller {
         return PendingPlugin(sourcePath: root, manifest: manifest)
     }
 
-    /// 检查已安装插件是否有 GitHub 更新
-    public static func checkUpdate(for pluginDir: URL, token: String? = nil) async throws -> PluginUpdateInfo {
-        guard let origin = readOrigin(in: pluginDir) else {
-            throw SourceError.message(I18n.t("Not installed via GitHub"))
-        }
+    /// 轻量检测已安装插件是否有 GitHub 更新（每次仅 1~2 次元数据请求，不预下载源码压缩包）
+    public static func checkUpdate(
+        for pluginDir: URL,
+        token: String? = nil,
+        transport: PluginHTTPTransport? = nil
+    ) async throws -> PluginUpdateInfo {
         let manifestData = try Data(contentsOf: pluginDir.appendingPathComponent("plugin.json"))
         let manifest = try JSONDecoder().decode(PluginManifest.self, from: manifestData)
-        let manifestVer = manifest.version ?? ""
-        let currentVersion = manifestVer.isEmpty ? origin.version : manifestVer
-
-        let pending = try await fetchFromGitHub(repoInput: origin.repo, token: token)
-        let latestManifestVer = pending.manifest.version ?? ""
-        let latestVersion = latestManifestVer.isEmpty ? (pending.version ?? "") : latestManifestVer
-        let hasUpdate: Bool
-        if !latestVersion.isEmpty && !currentVersion.isEmpty {
-            hasUpdate = isNewerVersion(latestVersion, than: currentVersion)
-                || (parseVersionNumbers(latestVersion) == nil && parseVersionNumbers(currentVersion) == nil && (pending.version ?? latestVersion) != origin.version)
-        } else {
-            hasUpdate = false
+        guard let origin = effectiveOrigin(for: pluginDir, manifest: manifest) else {
+            throw SourceError.message(I18n.t("Not installed via GitHub"))
         }
 
-        if !hasUpdate {
-            try? FileManager.default.removeItem(at: pending.sourcePath)
-            return PluginUpdateInfo(
-                pluginID: manifest.id,
-                repo: origin.repo,
-                currentVersion: currentVersion,
-                latestVersion: latestVersion.isEmpty ? currentVersion : latestVersion,
-                hasUpdate: false,
-                pending: nil
-            )
-        }
+        let release = try await latestRelease(repoInput: origin.repo, token: token, transport: transport)
+        let originVer = origin.version.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentVersion = originVer.isEmpty ? normalizeVersionTag(manifest.version ?? "") : originVer
+        let hasUpdate = hasNewerUpdate(candidate: release.version, current: currentVersion)
+
         return PluginUpdateInfo(
             pluginID: manifest.id,
             repo: origin.repo,
             currentVersion: currentVersion,
-            latestVersion: latestVersion,
-            hasUpdate: true,
-            pending: pending
+            latestVersion: release.version.isEmpty ? currentVersion : release.version,
+            hasUpdate: hasUpdate,
+            pending: nil,
+            release: release
         )
     }
 
@@ -325,6 +476,16 @@ public enum PluginInstaller {
         return req
     }
 
+    private static func performRequest(
+        _ request: URLRequest,
+        transport: PluginHTTPTransport?
+    ) async throws -> (Data, URLResponse) {
+        if let transport {
+            return try await transport(request)
+        }
+        return try await URLSession.shared.data(for: request)
+    }
+
     private static func checkGitHubHTTPStatus(_ http: HTTPURLResponse) throws {
         if http.statusCode == 404 {
             throw SourceError.message(I18n.t("There's no such public repository on GitHub"))
@@ -338,14 +499,23 @@ public enum PluginInstaller {
         }
     }
 
-    /// 从 GitHub 下载插件（优先下载最新 Release .zip 资产或 zipball，回退到有限深度递归 Contents API，支持可选 GitHub Token）
-    public static func fetchFromGitHub(repoInput: String, token: String? = nil) async throws -> PendingPlugin {
+    private static func isAppCompatibilityError(_ error: Error) -> Bool {
+        guard let srcErr = error as? SourceError else { return false }
+        let msg = srcErr.localizedDescription
+        return msg.contains("MyGo Music")
+    }
+
+    /// 获取 GitHub 仓库最新版本元数据（优先查 `/releases/latest`，404 时回退 `/commits/HEAD`，对应 plugin.Latest）
+    public static func latestRelease(
+        repoInput: String,
+        token: String? = nil,
+        transport: PluginHTTPTransport? = nil
+    ) async throws -> PluginReleaseInfo {
         let repo = try parseRepo(repoInput)
-        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-plugin-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
 
         struct GHAsset: Decodable {
             let name: String
+            let url: String?
             let browser_download_url: String
         }
         struct GHRelease: Decodable {
@@ -353,54 +523,163 @@ public enum PluginInstaller {
             let zipball_url: String?
             let assets: [GHAsset]?
         }
+        struct GHCommit: Decodable {
+            let sha: String
+        }
 
-        // 1. 优先尝试获取最新 GitHub Release（与原项目 internal/plugin/install.go 一致）
-        if let releaseURL = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") {
-            let relReq = makeGitHubRequest(url: releaseURL, token: token)
-            if let (relData, relResp) = try? await URLSession.shared.data(for: relReq),
-               let http = relResp as? HTTPURLResponse {
-                if (http.statusCode == 403 || http.statusCode == 429),
-                   http.value(forHTTPHeaderField: "X-RateLimit-Remaining") == "0" {
-                    try checkGitHubHTTPStatus(http)
+        let relURL = URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!
+        let (relData, relResp) = try await performRequest(makeGitHubRequest(url: relURL, token: token), transport: transport)
+        guard let relHTTP = relResp as? HTTPURLResponse else {
+            throw SourceError.message("GitHub network error")
+        }
+
+        if relHTTP.statusCode == 200 {
+            let release = try JSONDecoder().decode(GHRelease.self, from: relData)
+            let assets = release.assets ?? []
+            let idx = pickAsset(names: assets.map(\.name))
+            let rawTag = (release.tag_name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let version = normalizeVersionTag(rawTag.isEmpty ? "latest" : rawTag)
+            let defaultZipball = release.zipball_url
+                ?? "https://api.github.com/repos/\(repo)/zipball/\(rawTag.isEmpty ? "HEAD" : rawTag)"
+
+            let hasToken = !(token?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let downloadURL: String
+            let isAssetAPI: Bool
+            var fallbackZipball: String? = nil
+
+            if idx >= 0 && idx < assets.count {
+                let asset = assets[idx]
+                // 私有库在配置 Token 时需通过 API URL + Accept: application/octet-stream 拉取资产
+                if hasToken, let apiAssetURL = asset.url, !apiAssetURL.isEmpty {
+                    downloadURL = apiAssetURL
+                    isAssetAPI = true
+                } else {
+                    downloadURL = asset.browser_download_url
+                    isAssetAPI = false
                 }
-                if http.statusCode == 200,
-                   let release = try? JSONDecoder().decode(GHRelease.self, from: relData) {
-                    let assets = release.assets ?? []
-                    let idx = pickAsset(names: assets.map(\.name))
-                    let zipURLStr: String? = (idx >= 0 && idx < assets.count) ? assets[idx].browser_download_url : release.zipball_url
-                    if let zipURLStr, let zipURL = URL(string: zipURLStr) {
-                        // 对非 github API 域名仅在同域/api.github.com 上附带 Authorization，避免泄露 token 给外部重定向 CDN
-                        let zipToken = (zipURL.host == "api.github.com") ? token : nil
-                        let zipReq = makeGitHubRequest(url: zipURL, token: zipToken, accept: nil)
-                        let (zipData, zipResp) = try await URLSession.shared.data(for: zipReq)
-                        if let zHttp = zipResp as? HTTPURLResponse, (200...299).contains(zHttp.statusCode) {
-                            do {
-                                try extractZipData(zipData, into: tmpDir)
-                                var pending = try openFromFolder(tmpDir)
-                                pending.repo = repo
-                                pending.version = (release.tag_name ?? "latest").trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-                                return pending
-                            } catch let err as SourceError {
-                                // 版本兼容性等明确业务校验错误直接向上抛出，避免退回拉源码掩盖错误
-                                let msg = err.localizedDescription
-                                if msg.contains("MyGo Music") || msg.contains("version") {
-                                    try? FileManager.default.removeItem(at: tmpDir)
-                                    throw err
-                                }
-                                // 其余结构不完整（如源码未构建发布资产仅在 tag 等）清空临时目录后走回退逻辑
-                                try? FileManager.default.removeItem(at: tmpDir)
-                                try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-                            } catch {
-                                try? FileManager.default.removeItem(at: tmpDir)
-                                try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-                            }
-                        }
-                    }
+                if defaultZipball != downloadURL {
+                    fallbackZipball = defaultZipball
                 }
+            } else {
+                downloadURL = defaultZipball
+                isAssetAPI = false
+            }
+
+            return PluginReleaseInfo(
+                repo: repo,
+                version: version.isEmpty ? "latest" : version,
+                downloadURL: downloadURL,
+                fallbackZipballURL: fallbackZipball,
+                isReleaseAssetAPI: isAssetAPI
+            )
+        }
+
+        if relHTTP.statusCode != 404 {
+            try checkGitHubHTTPStatus(relHTTP)
+        }
+
+        // 无 Release 的仓库回退到默认分支最新提交（单次轻量 API，12 位 commit SHA 对齐桌面端）
+        let commitURL = URL(string: "https://api.github.com/repos/\(repo)/commits/HEAD")!
+        let (commitData, commitResp) = try await performRequest(makeGitHubRequest(url: commitURL, token: token), transport: transport)
+        guard let commitHTTP = commitResp as? HTTPURLResponse else {
+            throw SourceError.message("GitHub network error")
+        }
+        try checkGitHubHTTPStatus(commitHTTP)
+
+        let commit = try JSONDecoder().decode(GHCommit.self, from: commitData)
+        let fullSHA = commit.sha.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !fullSHA.isEmpty else {
+            throw SourceError.message("Empty commit SHA returned from GitHub")
+        }
+        return PluginReleaseInfo(
+            repo: repo,
+            version: String(fullSHA.prefix(12)),
+            downloadURL: "https://api.github.com/repos/\(repo)/zipball/\(fullSHA)",
+            fallbackZipballURL: nil,
+            isReleaseAssetAPI: false
+        )
+    }
+
+    /// 依据已查询到的 `PluginReleaseInfo` 下载并解压验证待安装插件，避免重复查 API
+    public static func fetchFromRelease(
+        _ release: PluginReleaseInfo,
+        token: String? = nil,
+        transport: PluginHTTPTransport? = nil
+    ) async throws -> PendingPlugin {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-plugin-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+
+        func resetTmpDir() throws {
+            try? FileManager.default.removeItem(at: tmpDir)
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        }
+
+        func downloadZipAndOpen(from urlStr: String, isAssetAPI: Bool) async throws -> PendingPlugin {
+            guard let zipURL = URL(string: urlStr) else {
+                throw SourceError.message("Invalid plugin archive URL")
+            }
+            // 对非 api.github.com 域名（如 release-assets 重定向 CDN）不发送 Authorization，避免令牌外泄
+            let zipToken = (zipURL.host == "api.github.com") ? token : nil
+            let accept = isAssetAPI ? "application/octet-stream" : nil
+            let zipReq = makeGitHubRequest(url: zipURL, token: zipToken, accept: accept)
+            let (zipData, zipResp) = try await performRequest(zipReq, transport: transport)
+            guard let zHttp = zipResp as? HTTPURLResponse else {
+                throw SourceError.message("GitHub network error")
+            }
+            try checkGitHubHTTPStatus(zHttp)
+            try extractZipData(zipData, into: tmpDir)
+            var pending = try openFromFolder(tmpDir)
+            pending.repo = release.repo
+            pending.version = release.version
+            return pending
+        }
+
+        do {
+            return try await downloadZipAndOpen(from: release.downloadURL, isAssetAPI: release.isReleaseAssetAPI)
+        } catch {
+            if isAppCompatibilityError(error) {
+                try? FileManager.default.removeItem(at: tmpDir)
+                throw error
+            }
+            try resetTmpDir()
+        }
+
+        if let fallbackZip = release.fallbackZipballURL, fallbackZip != release.downloadURL {
+            do {
+                return try await downloadZipAndOpen(from: fallbackZip, isAssetAPI: false)
+            } catch {
+                if isAppCompatibilityError(error) {
+                    try? FileManager.default.removeItem(at: tmpDir)
+                    throw error
+                }
+                try resetTmpDir()
             }
         }
 
-        // 2. 回退：通过 GitHub Contents API 有限深度递归拉取仓库文件（兼容无 Release、含多模块目录的插件仓库）
+        // 最后回退：通过 Contents API 递归拉取（兼容不支持 zipball 的极少数场景）
+        do {
+            var pending = try await fetchViaContentsAPI(
+                repo: release.repo,
+                into: tmpDir,
+                token: token,
+                transport: transport
+            )
+            if !release.version.isEmpty {
+                pending.version = release.version
+            }
+            return pending
+        } catch {
+            try? FileManager.default.removeItem(at: tmpDir)
+            throw error
+        }
+    }
+
+    private static func fetchViaContentsAPI(
+        repo: String,
+        into tmpDir: URL,
+        token: String?,
+        transport: PluginHTTPTransport?
+    ) async throws -> PendingPlugin {
         struct GHContentItem: Decodable {
             let name: String
             let path: String
@@ -417,7 +696,7 @@ public enum PluginInstaller {
         func downloadDirectory(apiURL: URL, localDir: URL, depth: Int) async throws {
             guard depth <= 4, fetchedFileCount < maxFiles else { return }
             let req = makeGitHubRequest(url: apiURL, token: token)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await performRequest(req, transport: transport)
             guard let http = resp as? HTTPURLResponse else {
                 throw SourceError.message("GitHub network error")
             }
@@ -437,7 +716,7 @@ public enum PluginInstaller {
                 if item.type == "file", let dl = item.download_url, let dlURL = URL(string: dl) {
                     fetchedFileCount += 1
                     let fileReq = makeGitHubRequest(url: dlURL, token: (dlURL.host == "api.github.com" ? token : nil), accept: nil)
-                    let (fileData, fileResp) = try await URLSession.shared.data(for: fileReq)
+                    let (fileData, fileResp) = try await performRequest(fileReq, transport: transport)
                     if let fHttp = fileResp as? HTTPURLResponse, !(200...299).contains(fHttp.statusCode) {
                         throw SourceError.message("Failed to download \(item.path): HTTP \(fHttp.statusCode)")
                     }
@@ -458,16 +737,61 @@ public enum PluginInstaller {
             }
         }
 
-        do {
-            let rootURL = URL(string: "https://api.github.com/repos/\(repo)/contents")!
-            try await downloadDirectory(apiURL: rootURL, localDir: tmpDir, depth: 0)
-            var pending = try openFromFolder(tmpDir)
-            pending.repo = repo
-            pending.version = latestSHA ?? "latest"
-            return pending
-        } catch {
-            try? FileManager.default.removeItem(at: tmpDir)
-            throw error
+        let rootURL = URL(string: "https://api.github.com/repos/\(repo)/contents")!
+        try await downloadDirectory(apiURL: rootURL, localDir: tmpDir, depth: 0)
+        var pending = try openFromFolder(tmpDir)
+        pending.repo = repo
+        pending.version = latestSHA ?? "latest"
+        return pending
+    }
+
+    /// 从 GitHub 下载最新版本插件（轻量查询最新 Release/Commit 后下载 zip 解压）
+    public static func fetchFromGitHub(
+        repoInput: String,
+        token: String? = nil,
+        transport: PluginHTTPTransport? = nil
+    ) async throws -> PendingPlugin {
+        let release = try await latestRelease(repoInput: repoInput, token: token, transport: transport)
+        return try await fetchFromRelease(release, token: token, transport: transport)
+    }
+
+    /// 从 GitHub 搜索带 `mygo-music-plugin` topic 的社区开源插件目录
+    public static func fetchCommunityPlugins(
+        token: String? = nil,
+        transport: PluginHTTPTransport? = nil
+    ) async throws -> [CommunityPluginEntry] {
+        struct GHSearchOwner: Decodable {
+            let login: String
+        }
+        struct GHSearchRepo: Decodable {
+            let full_name: String
+            let name: String
+            let owner: GHSearchOwner
+            let description: String?
+            let stargazers_count: Int?
+            let html_url: String
+        }
+        struct GHSearchResponse: Decodable {
+            let items: [GHSearchRepo]
+        }
+
+        let searchURL = URL(string: "https://api.github.com/search/repositories?q=topic:mygo-music-plugin+archived:false&sort=stars&order=desc&per_page=60")!
+        let (data, resp) = try await performRequest(makeGitHubRequest(url: searchURL, token: token), transport: transport)
+        guard let http = resp as? HTTPURLResponse else {
+            throw SourceError.message("GitHub network error")
+        }
+        try checkGitHubHTTPStatus(http)
+
+        let decoded = try JSONDecoder().decode(GHSearchResponse.self, from: data)
+        return decoded.items.map { item in
+            CommunityPluginEntry(
+                repo: item.full_name,
+                shortName: item.name,
+                owner: item.owner.login,
+                description: item.description ?? "",
+                stars: item.stargazers_count ?? 0,
+                htmlURL: item.html_url
+            )
         }
     }
 

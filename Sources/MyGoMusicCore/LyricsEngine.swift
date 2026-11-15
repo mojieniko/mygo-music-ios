@@ -332,4 +332,319 @@ public enum LyricsEngine {
         }
         return out
     }
+
+    /// 拆分词条的核心字符与尾随空白，确保逐字扫光与微缩放仅作用于实际字形而不偏移空白占位
+    public static func splitWordTrailingWhitespace(_ text: String) -> (core: String, trailing: String) {
+        guard !text.isEmpty else { return ("", "") }
+        var endIdx = text.endIndex
+        while endIdx > text.startIndex {
+            let prev = text.index(before: endIdx)
+            let ch = text[prev]
+            if ch.unicodeScalars.allSatisfy({ CharacterSet.whitespacesAndNewlines.contains($0) }) {
+                endIdx = prev
+            } else {
+                break
+            }
+        }
+        return (String(text[..<endIdx]), String(text[endIdx...]))
+    }
+
+    /// 计算单个歌词词条在指定播放时刻的流体扫光、轻抬呼吸与柔和辉光参数
+    public static func wordMotion(
+        for word: LyricWord,
+        at position: TimeInterval,
+        reduceMotion: Bool = false
+    ) -> LyricWordMotion {
+        let clamp01: (Double) -> Double = { min(1.0, max(0.0, $0)) }
+
+        if word.end <= word.start {
+            guard position >= word.start else {
+                return LyricWordMotion(wipeProgress: 0, liftY: 0, scale: 1.0, glowIntensity: 0, isActive: false)
+            }
+            let after = position - word.start
+            if after < 0.24 {
+                let fade = 1.0 - after / 0.24
+                return LyricWordMotion(
+                    wipeProgress: 1.0,
+                    liftY: reduceMotion ? 0 : -1.25 * fade,
+                    scale: reduceMotion ? 1.0 : 1.0 + 0.025 * fade,
+                    glowIntensity: 0.65 * fade,
+                    isActive: true
+                )
+            }
+            return LyricWordMotion(wipeProgress: 1.0, liftY: 0, scale: 1.0, glowIntensity: 0, isActive: false)
+        }
+
+        if position < word.start {
+            // 起唱前 30ms 内预留极其克制的预热微光（不影响文字点亮进度）
+            let pre = word.start - position
+            if !reduceMotion && pre < 0.03 {
+                let warm = 1.0 - pre / 0.03
+                return LyricWordMotion(wipeProgress: 0, liftY: -0.25 * warm, scale: 1.0, glowIntensity: 0.12 * warm, isActive: false)
+            }
+            return LyricWordMotion(wipeProgress: 0, liftY: 0, scale: 1.0, glowIntensity: 0, isActive: false)
+        }
+
+        let duration = max(0.06, word.end - word.start)
+        if position < word.end {
+            let raw = clamp01((position - word.start) / duration)
+            let smooth = raw * raw * (3.0 - 2.0 * raw)
+            // 结合线性扫过感与缓入缓出张力，适配短音节及拖腔长音
+            let wipe = clamp01(0.35 * raw + 0.65 * smooth)
+            let envelope = sin(pow(raw, 0.82) * .pi)
+            return LyricWordMotion(
+                wipeProgress: wipe,
+                liftY: reduceMotion ? 0 : -1.65 * envelope,
+                scale: reduceMotion ? 1.0 : 1.0 + 0.032 * envelope,
+                glowIntensity: 0.35 + 0.65 * envelope,
+                isActive: true
+            )
+        }
+
+        // 唱完后的 220ms 柔和尾音辉光消退
+        let after = position - word.end
+        if after < 0.22 {
+            let tail = 1.0 - after / 0.22
+            return LyricWordMotion(
+                wipeProgress: 1.0,
+                liftY: 0,
+                scale: 1.0,
+                glowIntensity: 0.35 * tail,
+                isActive: false
+            )
+        }
+        return LyricWordMotion(wipeProgress: 1.0, liftY: 0, scale: 1.0, glowIntensity: 0, isActive: false)
+    }
+
+    /// 计算 Apple Music 景深分层焦点样式（跟随播控时带景深虚化与级联延迟；用户滑屏浏览时清零模糊以保障可读性）
+    public static func linePresentation(
+        index: Int,
+        currentIndex: Int,
+        isUserScrolling: Bool,
+        isCredit: Bool = false,
+        reduceMotion: Bool = false
+    ) -> LyricLinePresentation {
+        let tier: LyricHighlightTier
+        if currentIndex < 0 {
+            if index == 0 {
+                tier = .near1
+            } else if index == 1 {
+                tier = .near2
+            } else {
+                tier = .far
+            }
+        } else {
+            let absDelta = abs(index - currentIndex)
+            switch absDelta {
+            case 0: tier = .current
+            case 1: tier = .near1
+            case 2: tier = .near2
+            default: tier = .far
+            }
+        }
+
+        if isUserScrolling {
+            return LyricLinePresentation(
+                tier: tier,
+                blurRadius: 0,
+                scale: tier == .current ? 1.0 : (reduceMotion ? 1.0 : (isCredit ? 0.88 : 0.92)),
+                primaryOpacity: tier == .current ? 1.0 : (isCredit ? 0.54 : 0.72),
+                translationOpacity: tier == .current ? 0.86 : 0.56,
+                staggerDelay: 0
+            )
+        }
+
+        if currentIndex < 0 {
+            switch index {
+            case 0:
+                return LyricLinePresentation(
+                    tier: tier,
+                    blurRadius: 0,
+                    scale: reduceMotion ? 1.0 : (isCredit ? 0.90 : 0.94),
+                    primaryOpacity: isCredit ? 0.52 : 0.68,
+                    translationOpacity: 0.52,
+                    staggerDelay: 0
+                )
+            case 1:
+                return LyricLinePresentation(
+                    tier: tier,
+                    blurRadius: reduceMotion ? 0 : 1.0,
+                    scale: reduceMotion ? 1.0 : 0.90,
+                    primaryOpacity: isCredit ? 0.38 : 0.46,
+                    translationOpacity: 0.34,
+                    staggerDelay: 0
+                )
+            default:
+                return LyricLinePresentation(
+                    tier: tier,
+                    blurRadius: reduceMotion ? 0 : min(3.8, 1.35 + Double(index - 1) * 0.65),
+                    scale: reduceMotion ? 1.0 : 0.87,
+                    primaryOpacity: isCredit ? 0.24 : 0.28,
+                    translationOpacity: 0.20,
+                    staggerDelay: 0
+                )
+            }
+        }
+
+        let delta = index - currentIndex
+        switch delta {
+        case 0:
+            return LyricLinePresentation(
+                tier: tier,
+                blurRadius: 0,
+                scale: isCredit ? (reduceMotion ? 1.0 : 0.92) : 1.0,
+                primaryOpacity: isCredit ? 0.88 : 1.0,
+                translationOpacity: 0.86,
+                staggerDelay: reduceMotion ? 0 : 0.015
+            )
+        case 1:
+            return LyricLinePresentation(
+                tier: tier,
+                blurRadius: reduceMotion ? 0 : 1.05,
+                scale: reduceMotion ? 1.0 : 0.91,
+                primaryOpacity: isCredit ? 0.36 : 0.46,
+                translationOpacity: 0.36,
+                staggerDelay: reduceMotion ? 0 : 0.04
+            )
+        case -1:
+            return LyricLinePresentation(
+                tier: tier,
+                blurRadius: reduceMotion ? 0 : 1.45,
+                scale: reduceMotion ? 1.0 : 0.89,
+                primaryOpacity: isCredit ? 0.30 : 0.38,
+                translationOpacity: 0.30,
+                staggerDelay: 0
+            )
+        case 2, -2:
+            return LyricLinePresentation(
+                tier: tier,
+                blurRadius: reduceMotion ? 0 : 2.40,
+                scale: reduceMotion ? 1.0 : 0.87,
+                primaryOpacity: delta > 0 ? (isCredit ? 0.25 : 0.30) : 0.24,
+                translationOpacity: delta > 0 ? 0.23 : 0.18,
+                staggerDelay: reduceMotion ? 0 : (delta > 0 ? 0.075 : 0)
+            )
+        default:
+            let extraDepth = Double(abs(delta) - 2) * 0.65
+            return LyricLinePresentation(
+                tier: tier,
+                blurRadius: reduceMotion ? 0 : min(4.2, 2.40 + extraDepth),
+                scale: reduceMotion ? 1.0 : 0.85,
+                primaryOpacity: delta > 0 ? 0.20 : 0.14,
+                translationOpacity: 0.13,
+                staggerDelay: reduceMotion ? 0 : (delta > 0 ? min(0.14, Double(delta) * 0.032) : 0)
+            )
+        }
+    }
+
+    /// 检测前奏或句间长间奏，用于在滚动歌词流中插入 Apple Music 风格三圆点呼吸引导
+    public static func activeInterlude(
+        in lines: [LyricLine],
+        at pos: TimeInterval,
+        currentIndex: Int
+    ) -> LyricInterludeWindow? {
+        guard !lines.isEmpty else { return nil }
+        let clamp01: (Double) -> Double = { min(1.0, max(0.0, $0)) }
+
+        if currentIndex < 0 {
+            let firstAt = lines[0].at
+            guard firstAt >= 2.2, pos >= 0, pos < firstAt - 0.12 else { return nil }
+            return LyricInterludeWindow(
+                insertAfterLineIndex: -1,
+                from: 0,
+                to: firstAt,
+                progress: clamp01(pos / max(0.1, firstAt))
+            )
+        }
+
+        guard currentIndex >= 0, currentIndex + 1 < lines.count else { return nil }
+        let curEnd = lines[currentIndex].end
+        let nextAt = lines[currentIndex + 1].at
+        let gap = nextAt - curEnd
+        let leadIn = curEnd + 0.65
+        guard gap >= 4.0, pos >= leadIn, pos < nextAt - 0.12 else { return nil }
+        return LyricInterludeWindow(
+            insertAfterLineIndex: currentIndex,
+            from: leadIn,
+            to: nextAt,
+            progress: clamp01((pos - leadIn) / max(0.1, nextAt - leadIn))
+        )
+    }
+}
+
+/// 歌词行焦点景深层级
+public enum LyricHighlightTier: Equatable, Sendable {
+    case current
+    case near1
+    case near2
+    case far
+}
+
+/// 单个歌词词条的实时动效参数
+public struct LyricWordMotion: Equatable, Sendable {
+    public var wipeProgress: Double
+    public var liftY: Double
+    public var scale: Double
+    public var glowIntensity: Double
+    public var isActive: Bool
+
+    public init(
+        wipeProgress: Double,
+        liftY: Double,
+        scale: Double,
+        glowIntensity: Double,
+        isActive: Bool
+    ) {
+        self.wipeProgress = wipeProgress
+        self.liftY = liftY
+        self.scale = scale
+        self.glowIntensity = glowIntensity
+        self.isActive = isActive
+    }
+}
+
+/// 单行歌词的景深柔焦、聚焦缩放与级联时差规格
+public struct LyricLinePresentation: Equatable, Sendable {
+    public var tier: LyricHighlightTier
+    public var blurRadius: Double
+    public var scale: Double
+    public var primaryOpacity: Double
+    public var translationOpacity: Double
+    public var staggerDelay: TimeInterval
+
+    public init(
+        tier: LyricHighlightTier,
+        blurRadius: Double,
+        scale: Double,
+        primaryOpacity: Double,
+        translationOpacity: Double,
+        staggerDelay: TimeInterval
+    ) {
+        self.tier = tier
+        self.blurRadius = blurRadius
+        self.scale = scale
+        self.primaryOpacity = primaryOpacity
+        self.translationOpacity = translationOpacity
+        self.staggerDelay = staggerDelay
+    }
+}
+
+/// 前奏或句间长间奏三圆点呼吸引导窗口
+public struct LyricInterludeWindow: Equatable, Sendable {
+    public var insertAfterLineIndex: Int
+    public var from: TimeInterval
+    public var to: TimeInterval
+    public var progress: Double
+
+    public init(
+        insertAfterLineIndex: Int,
+        from: TimeInterval,
+        to: TimeInterval,
+        progress: Double
+    ) {
+        self.insertAfterLineIndex = insertAfterLineIndex
+        self.from = from
+        self.to = to
+        self.progress = progress
+    }
 }
