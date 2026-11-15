@@ -1,12 +1,10 @@
 # MyGo Music for iOS
 
-MyGo Music for iOS 是基于 [egoist/mygo-music](https://github.com/egoist/mygo-music) 源码开发的非官方 iOS / iPadOS 移植与适配项目，使用 Swift、SwiftUI、JavaScriptCore 和 AVFoundation 构建，并尝试兼容原项目的 JavaScript 插件生态。
-
-本项目由社区独立维护，与 MyGo Music 上游作者及项目没有隶属或官方合作关系。它仍在持续完善中，功能覆盖、设备适配和插件兼容性都可能不完整；如果遇到问题，欢迎包涵并通过 Issues 反馈。
+MyGo Music 的非官方 iOS / iPadOS 移植版，支持在线音乐源、插件、本地音乐与歌词。项目由社区独立维护，与上游没有隶属或官方合作关系；功能覆盖与设备适配仍在持续完善。
 
 ## 下载
 
-请从 [GitHub Releases](https://github.com/mojieniko/mygo-music-ios/releases) 下载最新的 `MyGoMusic.ipa`。安装包采用 ad hoc 签名，通常需要使用自己的 Apple 开发者签名或侧载工具重新签名后安装。
+从 [GitHub Releases](https://github.com/mojieniko/mygo-music-ios/releases) 下载最新的 `MyGoMusic.ipa`。安装包采用 Ad Hoc 签名，安装前通常需要使用自己的 Apple 开发者签名或侧载工具重新签名。最低系统版本：iOS 17。
 
 ## 构建与运行
 
