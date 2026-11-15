@@ -2,6 +2,12 @@
 
 MyGo Music 的非官方 iOS / iPadOS 移植版，支持在线音乐源、插件、本地音乐与歌词。项目由社区独立维护，与上游没有隶属或官方合作关系；功能覆盖与设备适配仍在持续完善。
 
+## 界面预览
+
+![MyGo Music iOS 首页（iPhone 17 Pro 模拟器）](./mygo-music-ios-home.png)
+
+*截图来自 iPhone 17 Pro 模拟器，展示本地音乐界面。*
+
 ## 下载
 
 从 [GitHub Releases](https://github.com/mojieniko/mygo-music-ios/releases) 下载最新的 `MyGoMusic.ipa`。安装包采用 Ad Hoc 签名，安装前通常需要使用自己的 Apple 开发者签名或侧载工具重新签名。最低系统版本：iOS 17。
