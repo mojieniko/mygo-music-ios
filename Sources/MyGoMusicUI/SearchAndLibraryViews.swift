@@ -533,6 +533,11 @@ public struct LibraryView: View {
             .navigationDestination(for: NavigationTarget.self) { target in
                 HomeView.buildDestination(for: target)
             }
+            .onReceive(NotificationCenter.default.publisher(for: .mygoOpenLibraryTarget)) { note in
+                if let target = note.object as? NavigationTarget {
+                    navPath.append(target)
+                }
+            }
             .environment(\.mygoNavigate) { target in
                 navPath.append(target)
             }

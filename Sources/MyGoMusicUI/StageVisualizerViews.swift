@@ -14,6 +14,7 @@ import AppKit
 /// 律动歌词主舞台宿主（独立接收高精度时钟、拖动预览进度与音频频谱信号）
 public struct StageVisualizerHostView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject public var player: PlayerEngine
     @StateObject private var coverColorLoader = ArtworkImageLoader()
 
@@ -39,7 +40,8 @@ public struct StageVisualizerHostView: View {
         // 将 GeometryReader 置于 TimelineView 之外，并把 timeline.date 作为显式值传入帧视图，
         // 确保 SwiftUI 不会跳过未引用 context 的惰性重绘，同时直接订阅 PlayerEngine 实现零漏帧 60fps 驱动。
         GeometryReader { geo in
-            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !player.isPlaying && scrubbingPosition == nil)) { timeline in
+            let isPaused = (scenePhase != .active) || (!player.isPlaying && scrubbingPosition == nil)
+            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: isPaused)) { timeline in
                 StageVisualizerFrameView(
                     frameDate: timeline.date,
                     player: player,
@@ -92,10 +94,11 @@ private struct StageVisualizerFrameView: View {
         let _ = frameDate
         let lines = player.lyrics
         let loaded = player.lyricsLoaded
-        let rawPos = scrubbingPosition ?? player.livePlaybackPosition()
+        let rawPos = scrubbingPosition ?? player.acousticLyricPosition()
         let pos = StageMath.stagePosition(
             playbackPosition: rawPos,
-            scrubbingPosition: scrubbingPosition
+            scrubbingPosition: scrubbingPosition,
+            syncLead: 0
         )
         let rhythm = player.sampleAudioRhythm(
             at: rawPos,

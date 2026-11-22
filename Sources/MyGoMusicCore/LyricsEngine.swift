@@ -131,59 +131,31 @@ public enum LyricsEngine {
 
         for sl in rawLines {
             var line = LyricLine(
-                at: msToSec(sl.start),
-                end: msToSec(sl.end ?? 0),
+                at: max(0, msToSec(sl.start)),
+                end: max(0, msToSec(sl.end ?? 0)),
                 text: (sl.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                 translation: sl.translation ?? ""
             )
             if let rawWords = sl.words {
                 for w in rawWords {
-                    line.words.append(LyricWord(text: w.text, start: msToSec(w.start), end: msToSec(w.end)))
+                    line.words.append(LyricWord(text: w.text, start: max(0, msToSec(w.start)), end: max(0, msToSec(w.end))))
                 }
             }
-            if line.text.isEmpty {
-                let joined = line.words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-                line.text = joined
-            }
-            if line.text.isEmpty {
-                continue
+            if line.text.isEmpty && !line.words.isEmpty {
+                line.text = line.words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
             }
             out.append(line)
         }
 
-        out = out.enumerated().sorted { a, b in
-            if a.element.at == b.element.at {
-                return a.offset < b.offset
-            }
-            return a.element.at < b.element.at
-        }.map(\.element)
-
-        for i in out.indices {
-            if out[i].end <= out[i].at {
-                var end = out[i].at + 6.0
-                if i + 1 < out.count {
-                    end = min(end, out[i + 1].at)
-                }
-                out[i].end = end
-            }
-            if out[i].words.isEmpty {
-                out[i].words = spreadWords(text: out[i].text, start: out[i].at, end: out[i].end)
-            }
-        }
-        return out
+        out = sortPreservingOrder(out)
+        return finalizeTimeline(&out)
     }
 
     /// 由 LRC 与翻译构建歌词行（对应 lyrics.Build）
     public static func build(lrc: String, translation: String = "") -> [LyricLine] {
-        var lines = parseLRC(lrc).filter { !$0.text.isEmpty }
-        for i in lines.indices {
-            var end = lines[i].at + 6.0
-            if i + 1 < lines.count {
-                end = min(end, lines[i + 1].at)
-            }
-            lines[i].end = end
-            lines[i].words = spreadWords(text: lines[i].text, start: lines[i].at, end: end)
-        }
+        // 先保留空行时间标签作为前句结束边界（如 [00:25.00] 标示进入间奏），定好界限后再过滤空行
+        var parsed = parseLRC(lrc)
+        var lines = finalizeTimeline(&parsed)
 
         // 将翻译匹配到时间差在 1500ms 内最近的一行
         for tr in parseLRC(translation) where !tr.text.isEmpty {
@@ -201,6 +173,67 @@ public enum LyricsEngine {
             }
         }
         return lines
+    }
+
+    /// 稳定按时间戳升序排列（保持同时间戳行原有前后顺序）
+    private static func sortPreservingOrder(_ items: [LyricLine]) -> [LyricLine] {
+        items.enumerated().sorted { a, b in
+            if a.element.at == b.element.at {
+                return a.offset < b.offset
+            }
+            return a.element.at < b.element.at
+        }.map(\.element)
+    }
+
+    /// 统一规范化每行结束时间、过滤空边界标记、以及钳位逐字时间窗口
+    private static func finalizeTimeline(_ ordered: inout [LyricLine]) -> [LyricLine] {
+        let sameTimestampEpsilon: TimeInterval = 0.005
+        var result: [LyricLine] = []
+        result.reserveCapacity(ordered.count)
+
+        for i in ordered.indices {
+            let start = ordered[i].at
+            // 向后找第一个严格更晚的时间点，避免同时间戳双语行将首行时长压缩为 0
+            var nextDistinctAt: TimeInterval?
+            var j = i + 1
+            while j < ordered.count {
+                if ordered[j].at - start > sameTimestampEpsilon {
+                    nextDistinctAt = ordered[j].at
+                    break
+                }
+                j += 1
+            }
+
+            if ordered[i].end <= start {
+                var end = start + 6.0
+                if let nextAt = nextDistinctAt {
+                    end = min(end, nextAt)
+                }
+                ordered[i].end = max(start, end)
+            } else if let nextAt = nextDistinctAt, ordered[i].end > nextAt {
+                ordered[i].end = nextAt
+            }
+
+            guard !ordered[i].text.isEmpty else {
+                continue
+            }
+
+            let lineEnd = max(start, ordered[i].end)
+            if ordered[i].words.isEmpty {
+                ordered[i].words = spreadWords(text: ordered[i].text, start: start, end: lineEnd)
+            } else {
+                // 将源逐字时间戳钳位到 [line.at, line.end] 内并保证单调递增
+                var cursor = start
+                ordered[i].words = ordered[i].words.map { w in
+                    let clampedStart = max(cursor, min(w.start, lineEnd))
+                    let clampedEnd = max(clampedStart, min(w.end, lineEnd))
+                    cursor = clampedEnd
+                    return LyricWord(text: w.text, start: clampedStart, end: clampedEnd)
+                }
+            }
+            result.append(ordered[i])
+        }
+        return result
     }
 
     /// 将无逐字时间戳的文本切分为单词或 CJK 单字，并按 85% 演唱跨度均摊时长（对应 lyrics.SpreadWords）
@@ -276,7 +309,7 @@ public enum LyricsEngine {
         return ""
     }
 
-    /// 二分查找当前播放位置对应的歌词行索引（对应 lyrics.Index）
+    /// 二分查找当前播放位置对应的歌词行索引（对应 lyrics.Index；同时间戳多行时稳定对齐首行）
     public static func index(in lines: [LyricLine], at pos: TimeInterval) -> Int {
         var low = 0
         var high = lines.count
@@ -288,7 +321,11 @@ public enum LyricsEngine {
                 low = mid + 1
             }
         }
-        return low - 1
+        var idx = low - 1
+        while idx > 0 && abs(lines[idx].at - lines[idx - 1].at) <= 0.005 {
+            idx -= 1
+        }
+        return idx
     }
 
     /// 判断是否为作词/作曲等演职员行（对应 lyrics.IsCredit）

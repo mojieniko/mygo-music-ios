@@ -11,6 +11,9 @@ import SwiftUI
 
 @main
 struct MyGoMusicApp: App {
+    #if os(iOS) && canImport(UIKit)
+    @UIApplicationDelegateAdaptor(MyGoApplicationDelegate.self) private var appDelegate
+    #endif
     @StateObject private var appModel = AppModel(deferHeavyStartup: true)
 
     var body: some Scene {

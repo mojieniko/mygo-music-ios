@@ -3,6 +3,7 @@
 
 import Combine
 import Foundation
+import Network
 #if canImport(Speech)
 import Speech
 #endif
@@ -78,35 +79,115 @@ public enum AudioQuality: String, CaseIterable, Identifiable, Codable, Sendable 
     }
 }
 
-/// 全局设置模型（1:1 对应 internal/app/settings.go）
+/// 主题强调色预设（#15 支持苹果级多种高辨识度主题点缀切换）
+public enum AccentColorPreset: String, CaseIterable, Identifiable, Codable, Sendable {
+    case crimson = "crimson"
+    case amberGold = "amberGold"
+    case glacierBlue = "glacierBlue"
+    case dreamPurple = "dreamPurple"
+    case emeraldGreen = "emeraldGreen"
+
+    public var id: String { rawValue }
+
+    public var labelKey: String {
+        switch self {
+        case .crimson: return "Crimson"
+        case .amberGold: return "Amber Gold"
+        case .glacierBlue: return "Glacier Blue"
+        case .dreamPurple: return "Dream Purple"
+        case .emeraldGreen: return "Emerald Green"
+        }
+    }
+
+    public func rgba(isDark: Bool) -> (r: Double, g: Double, b: Double) {
+        switch self {
+        case .crimson:
+            // 深色 #FF375F，浅色 #FA233B（保持默认明暗对比不变）
+            return isDark ? (1.0, 0.216, 0.373) : (0.980, 0.137, 0.231)
+        case .amberGold:
+            return isDark ? (1.0, 0.720, 0.220) : (0.880, 0.560, 0.050)
+        case .glacierBlue:
+            return isDark ? (0.240, 0.660, 1.0) : (0.040, 0.480, 0.960)
+        case .dreamPurple:
+            return isDark ? (0.760, 0.440, 1.0) : (0.580, 0.220, 0.900)
+        case .emeraldGreen:
+            return isDark ? (0.220, 0.860, 0.560) : (0.080, 0.680, 0.380)
+        }
+    }
+}
+
+/// iOS 主屏幕自定义替换应用图标预设（需在 Info.plist `CFBundleAlternateIcons` 同步声明）
+public enum AppIconPreset: String, CaseIterable, Identifiable, Codable, Sendable {
+    case primary = "primary"
+    case appleMusic = "appleMusic"
+
+    public var id: String { rawValue }
+
+    public var labelKey: String {
+        switch self {
+        case .primary: return "MyGo Music"
+        case .appleMusic: return "Apple Music"
+        }
+    }
+
+    public var alternateIconName: String? {
+        switch self {
+        case .primary: return nil
+        case .appleMusic: return "AppIconAppleMusic"
+        }
+    }
+
+    public var previewAssetName: String {
+        switch self {
+        case .primary: return "AppIconPreviewPrimary"
+        case .appleMusic: return "AppIconPreviewAppleMusic"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? "primary"
+        self = AppIconPreset(rawValue: raw) ?? .primary
+    }
+}
+
+/// 全局设置模型（1:1 对应 internal/app/settings.go，扩展 12 项核心设置并兼容旧版配置解码）
 public struct AppSettings: Codable, Equatable, Sendable {
     public var language: AppLanguage = .system
     public var source: String = "kugou-lite"
     public var captions: Bool = false
     public var disabledPlugins: [String] = []
     public var quality: AudioQuality = .high
+    public var wifiQuality: AudioQuality = .lossless
+    public var cellularQuality: AudioQuality = .high
     public var appearance: AppAppearance = .system
+    public var accentPreset: AccentColorPreset = .crimson
+    public var appIconPreset: AppIconPreset = .primary
     public var growFromCover: Bool = true
     public var smoke: Bool = true
+    public var waveformProgressBar: Bool = false
     public var lyricsStage: Bool = false
+    public var coverPlayerMode: Bool = false
     public var stageStyle: StageStyle = .flow
     public var stageSparks: Bool = true
     public var volume: Double = 0.8
-    public var normalize: Bool = true
-    public var fade: Bool = true
+    public var gaplessPlayback: Bool = true
     public var hotComments: Bool = true
     public var fog: Bool = true
     public var lockScreenLyrics: Bool = true
     public var cacheMB: Int = 2048
     public var searchHistory: [String] = []
+    public var episodePositions: [String: TimeInterval] = [:]
     public var githubToken: String = ""
     public var pluginUpdates: [String: String] = [:]
     public var pluginsCheckedAt: TimeInterval = 0
 
     private enum CodingKeys: String, CodingKey {
-        case language, source, captions, disabledPlugins, quality, appearance
-        case growFromCover, smoke, lyricsStage, stageStyle, stageSparks, volume
-        case normalize, fade, hotComments, fog, lockScreenLyrics, cacheMB, searchHistory
+        case language, source, captions, disabledPlugins, quality, wifiQuality, cellularQuality
+        case appearance, accentPreset, appIconPreset
+        case growFromCover, smoke, waveformProgressBar, lyricsStage, coverPlayerMode, stageStyle, stageSparks, volume
+        case gaplessPlayback
+        case hotComments, fog, lockScreenLyrics, cacheMB, searchHistory, episodePositions
         case githubToken, pluginUpdates, pluginsCheckedAt
     }
 
@@ -118,21 +199,29 @@ public struct AppSettings: Codable, Equatable, Sendable {
         source = try values.decodeIfPresent(String.self, forKey: .source) ?? "kugou-lite"
         captions = try values.decodeIfPresent(Bool.self, forKey: .captions) ?? false
         disabledPlugins = try values.decodeIfPresent([String].self, forKey: .disabledPlugins) ?? []
-        quality = try values.decodeIfPresent(AudioQuality.self, forKey: .quality) ?? .high
+        let legacyQuality = try values.decodeIfPresent(AudioQuality.self, forKey: .quality) ?? .high
+        quality = legacyQuality
+        wifiQuality = try values.decodeIfPresent(AudioQuality.self, forKey: .wifiQuality) ?? legacyQuality
+        cellularQuality = try values.decodeIfPresent(AudioQuality.self, forKey: .cellularQuality)
+            ?? (legacyQuality == .lossless ? .high : legacyQuality)
         appearance = try values.decodeIfPresent(AppAppearance.self, forKey: .appearance) ?? .system
+        accentPreset = try values.decodeIfPresent(AccentColorPreset.self, forKey: .accentPreset) ?? .crimson
+        appIconPreset = try values.decodeIfPresent(AppIconPreset.self, forKey: .appIconPreset) ?? .primary
         growFromCover = try values.decodeIfPresent(Bool.self, forKey: .growFromCover) ?? true
         smoke = try values.decodeIfPresent(Bool.self, forKey: .smoke) ?? true
+        waveformProgressBar = try values.decodeIfPresent(Bool.self, forKey: .waveformProgressBar) ?? false
         lyricsStage = try values.decodeIfPresent(Bool.self, forKey: .lyricsStage) ?? false
+        coverPlayerMode = try values.decodeIfPresent(Bool.self, forKey: .coverPlayerMode) ?? false
         stageStyle = try values.decodeIfPresent(StageStyle.self, forKey: .stageStyle) ?? .flow
         stageSparks = try values.decodeIfPresent(Bool.self, forKey: .stageSparks) ?? true
         volume = try values.decodeIfPresent(Double.self, forKey: .volume) ?? 0.8
-        normalize = try values.decodeIfPresent(Bool.self, forKey: .normalize) ?? true
-        fade = try values.decodeIfPresent(Bool.self, forKey: .fade) ?? true
+        gaplessPlayback = try values.decodeIfPresent(Bool.self, forKey: .gaplessPlayback) ?? true
         hotComments = try values.decodeIfPresent(Bool.self, forKey: .hotComments) ?? true
         fog = try values.decodeIfPresent(Bool.self, forKey: .fog) ?? true
         lockScreenLyrics = try values.decodeIfPresent(Bool.self, forKey: .lockScreenLyrics) ?? true
         cacheMB = try values.decodeIfPresent(Int.self, forKey: .cacheMB) ?? 2048
         searchHistory = try values.decodeIfPresent([String].self, forKey: .searchHistory) ?? []
+        episodePositions = try values.decodeIfPresent([String: TimeInterval].self, forKey: .episodePositions) ?? [:]
         githubToken = try values.decodeIfPresent(String.self, forKey: .githubToken) ?? ""
         pluginUpdates = try values.decodeIfPresent([String: String].self, forKey: .pluginUpdates) ?? [:]
         pluginsCheckedAt = try values.decodeIfPresent(TimeInterval.self, forKey: .pluginsCheckedAt) ?? 0
@@ -141,6 +230,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
 
 /// 正在播放全屏页的子面板（对应 paneLyrics, paneStage, paneQueue, paneWall, paneComments, paneShow）
 public enum NowPlayingPane: Int, CaseIterable, Identifiable, Sendable {
+    case cover = 6
     case lyrics = 0
     case stage = 1
     case queue = 2
@@ -152,6 +242,7 @@ public enum NowPlayingPane: Int, CaseIterable, Identifiable, Sendable {
 
     public var labelKey: String {
         switch self {
+        case .cover: return "Cover"
         case .lyrics: return "Lyrics"
         case .stage: return "Stage"
         case .queue: return "Up Next"
@@ -176,6 +267,7 @@ public final class AppModel: ObservableObject {
             I18n.setLanguage(settings.language)
             player.volume = settings.volume
             player.diskCache.limitMB = settings.cacheMB
+            player.updateTransitionConfiguration(gapless: settings.gaplessPlayback)
             saveSettings()
             if oldValue.captions != settings.captions {
                 if settings.captions {
@@ -261,6 +353,10 @@ public final class AppModel: ObservableObject {
     // 插件安装、二维码/提示登录、加入歌单与 WebView 登录状态
     @Published public var toastMessage: String? = nil
     @Published public var pendingAddToPlaylistTrack: Track? = nil
+    @Published public var pendingQuickAction: QuickActionKind? = nil
+    @Published public private(set) var isOnCellularNetwork: Bool = false
+    @Published public private(set) var downloadingTrackKeys: Set<String> = []
+    @Published public private(set) var downloadedTrackKeys: Set<String> = []
     @Published public var isSignInSheetPresented: Bool = false
     @Published public var signInTargetSourceID: String? = nil
     @Published public var isSigningIn: Bool = false
@@ -270,7 +366,13 @@ public final class AppModel: ObservableObject {
     @Published public var isInstallingPlugin: Bool = false
     @Published public var installErrorMessage: String? = nil
 
+    #if canImport(UIKit)
+    /// 由 UI 层注入的同步封面缓存查找闭包，确保切歌瞬间灵动岛与锁屏立即拿到封面而不闪白
+    public var cachedArtworkImageProvider: ((String?) -> UIImage?)?
+    #endif
+
     private var webSignInContinuation: CheckedContinuation<String, Error>? = nil
+    private let pathMonitor = NWPathMonitor()
     private var playerCancellable: AnyCancellable?
     private var trackChangeCancellable: AnyCancellable?
     private var captionTask: Task<Void, Never>?
@@ -321,7 +423,9 @@ public final class AppModel: ObservableObject {
 
         self.player.volume = initialSettings.volume
         self.player.diskCache.limitMB = initialSettings.cacheMB
-        self.activeNowPlayingPane = initialSettings.lyricsStage ? .stage : .lyrics
+        self.player.updateTransitionConfiguration(gapless: initialSettings.gaplessPlayback)
+        self.downloadedTrackKeys = createdLocalSource.downloadedCompositeKeys()
+        self.activeNowPlayingPane = Self.preferredNowPlayingPane(for: initialSettings)
         if deferHeavyStartup {
             self.isStartupReady = false
             self.isLoadingHome = true
@@ -330,7 +434,9 @@ public final class AppModel: ObservableObject {
 
         createdLocalSource.onChange = { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self, self.isStartupReady, self.activeSourceID == LocalMusicSource.sourceID else { return }
+                guard let self else { return }
+                self.downloadedTrackKeys = self.localSource.downloadedCompositeKeys()
+                guard self.isStartupReady, self.activeSourceID == LocalMusicSource.sourceID else { return }
                 await self.refreshActiveSource()
             }
         }
@@ -340,16 +446,52 @@ public final class AppModel: ObservableObject {
             self?.source(forID: id)
         }
         self.player.qualityProvider = { [weak self] in
-            self?.settings.quality.rawValue ?? "high"
+            guard let self else { return "high" }
+            return Self.resolveEffectiveStreamingQuality(
+                isCellular: self.isOnCellularNetwork,
+                wifiQuality: self.settings.wifiQuality,
+                cellularQuality: self.settings.cellularQuality
+            ).rawValue
         }
-        self.player.normalizeProvider = { [weak self] in
-            self?.settings.normalize ?? true
+        self.player.localOfflineFileResolver = { [weak self] track in
+            self?.localSource.localFileURLForDownloadedTrack(compositeKey: track.compositeKey)
         }
-        self.player.fadeEnabledProvider = { [weak self] in
-            self?.settings.fade ?? true
+        self.player.episodePositionProvider = { [weak self] key in
+            self?.settings.episodePositions[key]
         }
+        self.player.onEpisodePositionUpdated = { [weak self] key, pos in
+            guard let self else { return }
+            if let pos, pos >= 1.0 {
+                if abs((self.settings.episodePositions[key] ?? -10) - pos) >= 3.0 {
+                    self.settings.episodePositions[key] = pos
+                }
+            } else if self.settings.episodePositions[key] != nil {
+                self.settings.episodePositions.removeValue(forKey: key)
+            }
+        }
+        self.pathMonitor.pathUpdateHandler = { [weak self] path in
+            let cellular = path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.wifi) && !path.usesInterfaceType(.wiredEthernet)
+            Task { @MainActor [weak self] in
+                guard let self, self.isOnCellularNetwork != cellular else { return }
+                self.isOnCellularNetwork = cellular
+            }
+        }
+        self.pathMonitor.start(queue: DispatchQueue.global(qos: .utility))
         self.player.lockScreenLyricsProvider = { [weak self] in
             self?.settings.lockScreenLyrics ?? true
+        }
+        self.player.isTrackLikedProvider = { [weak self] track in
+            self?.isTrackLiked(track) ?? false
+        }
+        self.player.onToggleLikeTrack = { [weak self] track in
+            Task { @MainActor [weak self] in
+                await self?.toggleLike(track)
+            }
+        }
+        self.player.onSleepTimerTriggered = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.showToast(I18n.t("Sleep timer ended · Playback paused"))
+            }
         }
         self.player.onSourceFailure = { [weak self] sourceID, err in
             Task { @MainActor in
@@ -634,9 +776,18 @@ public final class AppModel: ObservableObject {
     private func updateNowPlayingArtwork(for track: Track) async {
         artworkGeneration &+= 1
         let generation = artworkGeneration
-        player.setNowPlayingArtwork(data: nil)
+        let rawURL = sizedImageURL(track.album.imageUrl, px: 600)
 
-        guard let rawURL = sizedImageURL(track.album.imageUrl, px: 600), !rawURL.isEmpty else { return }
+        if let cached = cachedArtworkImageProvider?(track.album.imageUrl) {
+            player.setNowPlayingArtwork(image: cached)
+            if max(cached.size.width, cached.size.height) >= 480 || rawURL == nil || rawURL?.isEmpty == true {
+                return
+            }
+        } else {
+            player.setNowPlayingArtwork(data: nil)
+        }
+
+        guard let rawURL, !rawURL.isEmpty else { return }
         var data: Data?
 
         if rawURL.hasPrefix("data:image/"), let comma = rawURL.firstIndex(of: ",") {
@@ -781,6 +932,10 @@ public final class AppModel: ObservableObject {
         if src.can("home") {
             isLoadingHome = false
         }
+
+        // 第二阶段轻微让步错峰（120ms），确保切换音源后首屏点播与流获取优先占用 JS 队列与网络池
+        try? await Task.sleep(nanoseconds: 120_000_000)
+        guard sourceRefreshGeneration == generation, activeSourceID == srcID else { return }
 
         // 第二阶段：并发拉取其余资料库数据并合并更新，避免多次串行 RTT 与连续全屏重绘
         async let fetchedRecent: [Track]? = {
@@ -941,6 +1096,7 @@ public final class AppModel: ObservableObject {
             nextMap[key] = value
         }
         likedMap = nextMap
+        player.refreshRemoteLikeState()
     }
 
     public func toggleLike(_ track: Track) async {
@@ -949,6 +1105,7 @@ public final class AppModel: ObservableObject {
         let key = track.compositeKey
         let newState = !(likedMap[key] ?? false)
         likedMap[key] = newState
+        player.refreshRemoteLikeState()
         do {
             if track.isEpisode && src.can("likeEpisode") {
                 try await src.likeEpisode(id: track.id, on: newState)
@@ -961,6 +1118,7 @@ public final class AppModel: ObservableObject {
             }
         } catch {
             likedMap[key] = !newState
+            player.refreshRemoteLikeState()
             showToast(I18n.t("That didn't work. Try again later."))
         }
     }
@@ -974,6 +1132,189 @@ public final class AppModel: ObservableObject {
         } catch {
             showToast(I18n.t("Couldn't create the playlist. Try again later."))
         }
+    }
+
+    /// 将当前待播清单保存为新歌单（#6）
+    public func saveQueueAsNewPlaylist(name: String) async {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tracks = player.orderedQueue
+        guard !trimmed.isEmpty, !tracks.isEmpty else { return }
+        let activeID = activeSource.info().id
+        if activeSource.can("createPlaylist") && activeSource.can("addToPlaylist") {
+            let compatibleIDs = tracks
+                .filter { ($0.source ?? activeID) == activeID }
+                .map(\.id)
+            if !compatibleIDs.isEmpty {
+                do {
+                    let created = try await activeSource.createPlaylist(name: trimmed)
+                    try await activeSource.addToPlaylist(id: created.id, trackIds: compatibleIDs)
+                    await refreshActiveSource()
+                    showToast(I18n.t("Playlist saved"))
+                    return
+                } catch {
+                    showToast(I18n.t("Couldn't create the playlist. Try again later."))
+                    return
+                }
+            }
+        }
+        // 回退检查是否全为本地已下载歌曲并保存到本地歌单
+        let localIDs = tracks.compactMap { tr -> String? in
+            if (tr.source ?? "") == LocalMusicSource.sourceID { return tr.id }
+            return localSource.localFileURLForDownloadedTrack(compositeKey: tr.compositeKey)?.path
+        }
+        guard !localIDs.isEmpty else {
+            showToast(I18n.t("Couldn't create the playlist. Try again later."))
+            return
+        }
+        do {
+            let created = try await localSource.createPlaylist(name: trimmed)
+            try await localSource.addToPlaylist(id: created.id, trackIds: localIDs)
+            if activeID == LocalMusicSource.sourceID {
+                await refreshActiveSource()
+            }
+            showToast(I18n.t("Playlist saved"))
+        } catch {
+            showToast(I18n.t("Couldn't create the playlist. Try again later."))
+        }
+    }
+
+    // MARK: - 网络感知音质解析与主动离线下载管理（#4、#9）
+
+    /// 根据当前网络类型在 Wi-Fi 音质与移动网络省流音质之间实时裁决
+    nonisolated public static func resolveEffectiveStreamingQuality(
+        isCellular: Bool,
+        wifiQuality: AudioQuality,
+        cellularQuality: AudioQuality
+    ) -> AudioQuality {
+        isCellular ? cellularQuality : wifiQuality
+    }
+
+    /// 检查曲目是否已永久离线落盘到本地曲库（或本身即本地文件源曲目）
+    public func isTrackDownloaded(_ track: Track) -> Bool {
+        if track.source == LocalMusicSource.sourceID {
+            return true
+        }
+        return downloadedTrackKeys.contains(track.compositeKey)
+            || localSource.isTrackDownloaded(compositeKey: track.compositeKey)
+    }
+
+    /// 主动下载单首在线曲目（含音频流、双语 LRC 歌词与高清封面）到永久离线本地曲库
+    public func downloadTrackForOffline(_ track: Track) async {
+        guard track.source != LocalMusicSource.sourceID, track.unavailable != true else { return }
+        let compKey = track.compositeKey
+        if isTrackDownloaded(track) || downloadingTrackKeys.contains(compKey) {
+            return
+        }
+        let sid = track.source ?? activeSourceID
+        guard let src = source(forID: sid), src.info().playback != .remote else {
+            showToast(I18n.t("Download failed"))
+            return
+        }
+
+        downloadingTrackKeys.insert(compKey)
+        defer { downloadingTrackKeys.remove(compKey) }
+
+        do {
+            let targetQuality = settings.wifiQuality.rawValue
+            let cacheKey = AudioDiskCache.cacheKey(sourceID: sid, trackID: track.id, quality: targetQuality)
+            let streamInfo = try await src.stream(id: track.id, quality: targetQuality)
+            let rawURL = streamInfo.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let audioURL = URL(string: rawURL) ?? (rawURL.hasPrefix("/") ? URL(fileURLWithPath: rawURL) : nil) else {
+                showToast(I18n.t("Download failed"))
+                return
+            }
+
+            let tempAudioFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mygo-offline-\(UUID().uuidString).dat")
+            defer { try? FileManager.default.removeItem(at: tempAudioFile) }
+
+            let extHint: String
+            if let cached = player.diskCache.cachedFileURL(forKey: cacheKey) {
+                try FileManager.default.copyItem(at: cached.fileURL, to: tempAudioFile)
+                extHint = cached.fileURL.pathExtension
+            } else if audioURL.isFileURL {
+                try FileManager.default.copyItem(at: audioURL, to: tempAudioFile)
+                extHint = audioURL.pathExtension
+            } else {
+                var req = URLRequest(url: audioURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+                for (k, v) in PlayerEngine.directAssetHTTPHeaders(for: streamInfo) {
+                    req.setValue(v, forHTTPHeaderField: k)
+                }
+                let (downloadedTmp, response) = try await URLSession.shared.download(for: req)
+                defer { try? FileManager.default.removeItem(at: downloadedTmp) }
+                if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                    showToast(I18n.t("Download failed"))
+                    return
+                }
+                try FileManager.default.copyItem(at: downloadedTmp, to: tempAudioFile)
+                extHint = AudioStreamProxy.knownFileExtension(streamType: streamInfo.type, url: audioURL) ?? "mp3"
+            }
+
+            // 同步获取歌词并序列化为标准 LRC 文本
+            var lrcText: String? = nil
+            if src.can("lyrics"), !track.isEpisode, let rawLyrics = try? await src.lyrics(id: track.id) {
+                lrcText = Self.serializeRawLyricsToLRC(rawLyrics)
+            }
+
+            // 下载高清封面落盘
+            var coverData: Data? = nil
+            if let imgStr = sizedImageURL(track.album.imageUrl, px: 600),
+               let imgURL = URL(string: imgStr) {
+                var imgReq = URLRequest(url: imgURL)
+                for (k, v) in imageHeaders(for: imgURL) {
+                    imgReq.setValue(v, forHTTPHeaderField: k)
+                }
+                if let (data, resp) = try? await URLSession.shared.data(for: imgReq),
+                   (resp as? HTTPURLResponse)?.statusCode ?? 200 < 400 {
+                    coverData = data
+                }
+            }
+
+            try localSource.storeDownloadedTrack(
+                track: track,
+                tempAudioURL: tempAudioFile,
+                fileExtension: extHint,
+                lrcText: lrcText,
+                coverData: coverData
+            )
+            downloadedTrackKeys = localSource.downloadedCompositeKeys()
+            showToast(I18n.t("Downloaded for offline playback"))
+        } catch {
+            showToast(I18n.t("Download failed"))
+        }
+    }
+
+    /// 批量下载多首歌曲到离线曲库
+    public func downloadTracksForOffline(_ tracks: [Track]) async {
+        let targets = tracks.filter { $0.unavailable != true && !isTrackDownloaded($0) }
+        guard !targets.isEmpty else { return }
+        for tr in targets {
+            await downloadTrackForOffline(tr)
+        }
+    }
+
+    /// 移除已下载曲目的本地离线文件
+    public func removeOfflineDownload(for track: Track) {
+        localSource.removeDownloadedTrack(compositeKey: track.compositeKey)
+        downloadedTrackKeys = localSource.downloadedCompositeKeys()
+        showToast(I18n.t("Removed offline download"))
+    }
+
+    private static func serializeRawLyricsToLRC(_ raw: RawLyrics) -> String? {
+        if let lrc = raw.lrc, !lrc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return lrc
+        }
+        let parsed = LyricsEngine.fromSource(raw)
+        guard !parsed.isEmpty else { return nil }
+        return parsed.map { line in
+            let secTotal = max(0, line.at)
+            let mins = Int(secTotal) / 60
+            let secs = secTotal - Double(mins * 60)
+            let stamp = String(format: "[%02d:%05.2f]", mins, secs)
+            return line.translation.isEmpty
+                ? "\(stamp)\(line.text)"
+                : "\(stamp)\(line.text)\n\(stamp)\(line.translation)"
+        }.joined(separator: "\n")
     }
 
     public func renamePlaylist(id: String, name: String) async {
@@ -2263,6 +2604,53 @@ public final class AppModel: ObservableObject {
     }
     #endif
 
+    /// 主屏幕长按 App 图标触发的 iOS Quick Action 类型
+    public enum QuickActionKind: String, Sendable {
+        case resumePlayback = "com.egoist.mygomusic.resume"
+        case likedSongs = "com.egoist.mygomusic.liked"
+        case dailyMix = "com.egoist.mygomusic.daily"
+        case searchMusic = "com.egoist.mygomusic.search"
+    }
+
+    /// 注册或立即触发快捷操作（由 UI 场景在启动就绪后消费执行）
+    public func handleQuickAction(_ kind: QuickActionKind) {
+        pendingQuickAction = kind
+    }
+
+    /// 根据设置计算默认展示的播放面板（开启经典封面播放页时优先显示大封面；否则遵循律动舞台或歌词页）。
+    public static func preferredNowPlayingPane(for settings: AppSettings) -> NowPlayingPane {
+        if settings.coverPlayerMode {
+            return .cover
+        }
+        return settings.lyricsStage ? .stage : .lyrics
+    }
+
+    /// 获取当前设置对应的默认播放页签。
+    public func preferredDefaultNowPlayingPane() -> NowPlayingPane {
+        Self.preferredNowPlayingPane(for: settings)
+    }
+
+    /// 打开全屏正在播放页并按设置重置默认面板（确保开关关闭或开启后重进时立即可感知）。
+    public func presentNowPlaying(pane: NowPlayingPane? = nil) {
+        activeNowPlayingPane = pane ?? preferredDefaultNowPlayingPane()
+        isNowPlayingPresented = true
+    }
+
+    /// 直接执行桌面长按「继续播放」或作为无页面跳转的播放捷径入口
+    public func resumeOrStartQuickPlayback() {
+        if player.currentTrack != nil {
+            if !player.isPlaying {
+                player.resume()
+            }
+            presentNowPlaying()
+        } else if !recentTracks.isEmpty {
+            player.playTrack(recentTracks, at: 0)
+            presentNowPlaying()
+        } else {
+            showToast(I18n.t("No recent tracks available"))
+        }
+    }
+
     public func handleDeepLink(_ url: URL) {
         guard let scheme = url.scheme?.lowercased(),
               (scheme == "mygo-music" || scheme == "mygo-music-dev") else { return }
@@ -2313,5 +2701,9 @@ public final class AppModel: ObservableObject {
             return
         }
         player.restoreSession(session)
+    }
+
+    deinit {
+        pathMonitor.cancel()
     }
 }

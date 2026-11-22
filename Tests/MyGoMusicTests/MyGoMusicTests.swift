@@ -134,7 +134,7 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(minimal.quality, .high)
         XCTAssertTrue(minimal.fog)
         XCTAssertTrue(minimal.smoke)
-        XCTAssertTrue(minimal.fade)
+        XCTAssertTrue(minimal.gaplessPlayback)
         XCTAssertTrue(minimal.growFromCover)
         XCTAssertTrue(minimal.lockScreenLyrics)
         XCTAssertEqual(minimal.githubToken, "")
@@ -1421,6 +1421,44 @@ final class MyGoMusicTests: XCTestCase {
         let lyricsApp = AppModel(baseDataDir: lyricsDir)
         XCTAssertEqual(lyricsApp.activeNowPlayingPane, .lyrics, "未开启律动时默认应处于滚动歌词面板")
 
+        let coverDir = tempRoot.appendingPathComponent("cover-enabled", isDirectory: true)
+        try FileManager.default.createDirectory(at: coverDir, withIntermediateDirectories: true)
+        var coverSettings = AppSettings()
+        coverSettings.coverPlayerMode = true
+        coverSettings.lyricsStage = true
+        try JSONEncoder().encode(coverSettings).write(to: coverDir.appendingPathComponent("settings.json"))
+        let coverApp = AppModel(baseDataDir: coverDir)
+        XCTAssertEqual(coverApp.activeNowPlayingPane, .cover, "开启经典封面播放页后启动时应恢复为 .cover 面板")
+
+        // 验证关闭/开启经典封面开关与 presentNowPlaying 重进规则：临时切面板后退出再点进必须遵循开关状态
+        coverApp.activeNowPlayingPane = .queue
+        coverApp.presentNowPlaying()
+        XCTAssertTrue(coverApp.isNowPlayingPresented)
+        XCTAssertEqual(coverApp.activeNowPlayingPane, .cover, "开关开启时，重进播放页应默认回到经典封面模式")
+
+        coverApp.isNowPlayingPresented = false
+        coverApp.settings.coverPlayerMode = false
+        coverApp.settings.lyricsStage = false
+        coverApp.activeNowPlayingPane = .cover
+        coverApp.presentNowPlaying()
+        XCTAssertEqual(coverApp.activeNowPlayingPane, .lyrics, "开关关闭后，哪怕之前曾停留在封面页，重进也应退出封面回到歌词页")
+
+        // 验证长歌名跑马灯计算：不超宽静止无遮罩；超宽先停顿左对齐再匀速平滑向左滚并叠加羽化遮罩
+        let shortSample = MyGoMarqueeMath.sample(elapsed: 4.0, contentWidth: 120, containerWidth: 200)
+        XCTAssertEqual(shortSample.offsetX, 0)
+        XCTAssertEqual(shortSample.leftFadeWidth, 0)
+        XCTAssertEqual(shortSample.rightFadeWidth, 0)
+
+        let pauseSample = MyGoMarqueeMath.sample(elapsed: 1.0, contentWidth: 260, containerWidth: 180)
+        XCTAssertEqual(pauseSample.offsetX, 0)
+        XCTAssertEqual(pauseSample.leftFadeWidth, 0)
+        XCTAssertEqual(pauseSample.rightFadeWidth, 14)
+
+        let midSample = MyGoMarqueeMath.sample(elapsed: 5.0, contentWidth: 260, containerWidth: 180)
+        XCTAssertLessThan(midSample.offsetX, -20)
+        XCTAssertEqual(midSample.leftFadeWidth, 12, accuracy: 0.01)
+        XCTAssertEqual(midSample.rightFadeWidth, 14)
+
         // 2) 验证窄屏 Flow 断行与渲染间距一致，不再提前把「春日影」拆成两行
         let lrc = """
         [00:01.00]MyGO!!!!! - 春日影
@@ -1473,12 +1511,15 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertLessThan(exitOpacityMid, 1.0, "切换至下一句时旧行应在 0.4s 退场窗口内平滑叠化消隐")
 
         // 4) 验证 Flow 在 3s 整倍时间戳下真随机散落到九宫格不同方位（左上/正中/右下等）
-        let periodicLines = (0..<12).map { idx in
-            LyricLine(
-                at: TimeInterval(idx * 3),
-                end: TimeInterval(idx * 3 + 2),
-                text: "第\(idx)句示例歌词",
-                words: [LyricWord(text: "第\(idx)句示例歌词", start: TimeInterval(idx * 3), end: TimeInterval(idx * 3 + 2))]
+        let periodicLines: [LyricLine] = (0..<12).map { (idx: Int) -> LyricLine in
+            let start = TimeInterval(idx * 3)
+            let end = TimeInterval(idx * 3 + 2)
+            let lineText = "第\(idx)句示例歌词"
+            return LyricLine(
+                at: start,
+                end: end,
+                text: lineText,
+                words: [LyricWord(text: lineText, start: start, end: end)]
             )
         }
         let placements = periodicLines.map { StageMath.flowPlacement(for: $0, containerWidth: 345) }
@@ -1848,16 +1889,18 @@ final class MyGoMusicTests: XCTestCase {
 
     @MainActor
     func testFloatingTabBarMinimizeMathAndPrimaryTabMapping() {
-        // 1. 左侧主胶囊 2 槽映射（首页 / 音乐库）与搜索圆形分离一致性校验
-        XCTAssertEqual(MainTabMapping.primaryTabIDs, [0, 2])
+        // 1. 左侧主胶囊 3 槽映射（首页 / 音乐库 / 设置）与搜索圆形分离一致性校验
+        XCTAssertEqual(MainTabMapping.primaryTabIDs, [0, 2, 3])
         XCTAssertEqual(MainTabMapping.slotIndex(for: 0), 0)
         XCTAssertEqual(MainTabMapping.slotIndex(for: 2), 1)
-        XCTAssertNil(MainTabMapping.slotIndex(for: 3))
+        XCTAssertEqual(MainTabMapping.slotIndex(for: 3), 2)
         XCTAssertNil(MainTabMapping.slotIndex(for: MainTabMapping.searchTabID))
         XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 0), 0)
         XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 1), 2)
+        XCTAssertEqual(MainTabMapping.tabID(forSlotIndex: 2), 3)
         XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 2, lastPrimaryTab: 0), 2)
-        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 2), 2)
+        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 3, lastPrimaryTab: 0), 3)
+        XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 3), 3)
         XCTAssertEqual(MainTabMapping.effectivePrimaryTab(selectedTab: 1, lastPrimaryTab: 99), 0)
 
         // 2. 内容过短或处于顶部保护区域时绝不误收起
@@ -2898,6 +2941,448 @@ final class MyGoMusicTests: XCTestCase {
         appendLE32(&archive, cdOffset)
         appendLE16(&archive, 0)
         return archive
+    }
+
+    @MainActor
+    func testDynamicIslandNowPlayingStateQueuePlayNextSleepTimerAndQuickActions() throws {
+        let track1 = Track(
+            id: "di-1",
+            source: "netease",
+            name: "春日影",
+            artists: [Artist(id: "a1", name: "MyGO!!!!!")],
+            album: Album(id: "al1", name: "迷星叫"),
+            duration: 245_000
+        )
+        let track2 = Track(
+            id: "di-2",
+            source: "netease",
+            name: "碧天伴走",
+            artists: [Artist(id: "a1", name: "MyGO!!!!!")],
+            album: Album(id: "al2", name: "碧天伴走"),
+            duration: 230_000
+        )
+        let track3 = Track(
+            id: "di-3",
+            source: "netease",
+            name: "诗超绊",
+            artists: [Artist(id: "a1", name: "MyGO!!!!!")],
+            album: Album(id: "al3", name: "迷迹波"),
+            duration: 260_000
+        )
+
+        // 1. 灵动岛持久媒体标识与 playbackState 映射
+        let id1A = PlayerEngine.persistentMediaID(for: track1)
+        let id1B = PlayerEngine.persistentMediaID(for: track1)
+        let id2 = PlayerEngine.persistentMediaID(for: track2)
+        XCTAssertNotEqual(id1A, 0)
+        XCTAssertEqual(id1A, id1B)
+        XCTAssertNotEqual(id1A, id2)
+
+        XCTAssertEqual(PlayerEngine.resolveNowPlayingPlaybackState(hasTrack: false, isPlaying: false), .stopped)
+        XCTAssertEqual(PlayerEngine.resolveNowPlayingPlaybackState(hasTrack: false, isPlaying: true), .stopped)
+        XCTAssertEqual(PlayerEngine.resolveNowPlayingPlaybackState(hasTrack: true, isPlaying: false), .paused)
+        XCTAssertEqual(PlayerEngine.resolveNowPlayingPlaybackState(hasTrack: true, isPlaying: true), .playing)
+
+        // 2. 拔耳机/蓝牙断连（oldDeviceUnavailable = 2）自动暂停判定
+        XCTAssertTrue(PlayerEngine.shouldPauseForAudioRouteChange(reasonRawValue: 2, previousOutputPortTypes: ["Headphones"]))
+        XCTAssertFalse(PlayerEngine.shouldPauseForAudioRouteChange(reasonRawValue: 1, previousOutputPortTypes: ["Headphones"]))
+
+        // 3. 下一首插播（playNext）与队尾追加（enqueue）以及随机/循环模式设置
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-di-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let engine = PlayerEngine(cacheDir: tmpDir)
+        engine.playQueue([track1, track2], start: 0)
+        XCTAssertEqual(engine.orderedQueue.map(\.id), ["di-1", "di-2"])
+        engine.playNext(track3)
+        XCTAssertEqual(engine.orderedQueue.map(\.id), ["di-1", "di-3", "di-2"])
+        engine.enqueue(track1)
+        XCTAssertEqual(engine.orderedQueue.map(\.id), ["di-1", "di-3", "di-2", "di-1"])
+
+        engine.setRepeatMode(.one)
+        XCTAssertEqual(engine.repeatMode, .one)
+        engine.setShuffle(true)
+        XCTAssertTrue(engine.shuffle)
+        XCTAssertEqual(engine.orderedQueue.first?.id, "di-1")
+
+        // 4. 睡眠定时状态机验证
+        engine.setSleepTimer(.afterCurrentTrack)
+        XCTAssertTrue(engine.sleepTimerStopsAfterCurrentTrack)
+        XCTAssertNil(engine.sleepTimerRemainingSeconds)
+
+        engine.setSleepTimer(.minutes(15))
+        XCTAssertFalse(engine.sleepTimerStopsAfterCurrentTrack)
+        XCTAssertEqual(engine.sleepTimerRemainingSeconds, 900)
+
+        engine.setSleepTimer(.off)
+        XCTAssertFalse(engine.sleepTimerStopsAfterCurrentTrack)
+        XCTAssertNil(engine.sleepTimerRemainingSeconds)
+
+        // 5. 分享描述文本与桌面快捷操作类型常量对齐
+        XCTAssertEqual(MyGoShareHelper.shareText(for: track1), "春日影 - MyGO!!!!! (迷星叫)")
+        XCTAssertEqual(AppModel.QuickActionKind.resumePlayback.rawValue, "com.egoist.mygomusic.resume")
+        XCTAssertEqual(AppModel.QuickActionKind.likedSongs.rawValue, "com.egoist.mygomusic.liked")
+        XCTAssertEqual(AppModel.QuickActionKind.dailyMix.rawValue, "com.egoist.mygomusic.daily")
+        XCTAssertEqual(AppModel.QuickActionKind.searchMusic.rawValue, "com.egoist.mygomusic.search")
+    }
+
+    // MARK: - 14. 核心音频容器识别与播放过渡配置单元测试
+
+    func testResolvedCodecLabelsMatchAudioContainers() {
+        XCTAssertEqual(
+            PlayerEngine.resolvedCodecLabel(streamType: "flac", url: URL(string: "https://example.com/a.bin")!),
+            "FLAC"
+        )
+        XCTAssertEqual(
+            PlayerEngine.resolvedCodecLabel(streamType: nil, url: URL(string: "https://example.com/song.mp3")!),
+            "MP3"
+        )
+        XCTAssertEqual(
+            PlayerEngine.resolvedCodecLabel(streamType: "audio/mp4", url: URL(string: "https://example.com/track.m4a")!),
+            "AAC / M4A"
+        )
+        XCTAssertEqual(
+            PlayerEngine.resolvedCodecLabel(streamType: "wav", url: nil),
+            "WAV (PCM)"
+        )
+        XCTAssertEqual(
+            PlayerEngine.resolvedCodecLabel(streamType: "m4s", url: nil),
+            "DASH Audio"
+        )
+    }
+
+    @MainActor
+    func testQueueReorderingClearAndSignalPathAndWaveform() {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("queue-signal-tests-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let engine = PlayerEngine(cacheDir: tmpDir)
+        let tracks = [
+            Track(id: "q1", source: "mock", name: "Track 1"),
+            Track(id: "q2", source: "mock", name: "Track 2"),
+            Track(id: "q3", source: "mock", name: "Track 3"),
+            Track(id: "q4", source: "mock", name: "Track 4")
+        ]
+        engine.playQueue(tracks, start: 1) // 当前曲目 Track 2 (index 1)
+        XCTAssertEqual(engine.currentTrack?.id, "q2")
+        XCTAssertEqual(engine.currentOrderIndex, 1)
+
+        // #6 将 Track 4 (index 3) 移到 index 0（越过当前曲目）
+        engine.moveInQueue(fromOrderIndex: 3, toOrderIndex: 0)
+        XCTAssertEqual(engine.orderedQueue.map(\.id), ["q4", "q1", "q2", "q3"])
+        XCTAssertEqual(engine.currentOrderIndex, 2)
+        XCTAssertEqual(engine.currentTrack?.id, "q2")
+
+        // 下移当前曲目 Track 2 (index 2 -> index 3)
+        engine.moveInQueue(fromOrderIndex: 2, toOrderIndex: 3)
+        XCTAssertEqual(engine.orderedQueue.map(\.id), ["q4", "q1", "q3", "q2"])
+        XCTAssertEqual(engine.currentOrderIndex, 3)
+
+        // 清空队列仅保留当前播放曲目
+        engine.clearQueueKeepingCurrent()
+        XCTAssertEqual(engine.orderedQueue.map(\.id), ["q2"])
+        XCTAssertEqual(engine.currentOrderIndex, 0)
+
+        // 无缝过渡配置反射到音频信号路径快照
+        engine.updateTransitionConfiguration(gapless: true)
+        XCTAssertTrue(engine.gaplessPlaybackEnabled)
+
+        let path = engine.currentAudioSignalPath(sourceDisplayName: "本地音乐库")
+        XCTAssertEqual(path.sourceName, "本地音乐库")
+        XCTAssertEqual(path.codecFormat, "Audio")
+        XCTAssertEqual(path.transitionMode, I18n.t("Gapless Playback"))
+
+        engine.updateTransitionConfiguration(gapless: false)
+        let offPath = engine.currentAudioSignalPath(sourceDisplayName: "本地音乐库")
+        XCTAssertEqual(offPath.transitionMode, I18n.t("Off"))
+
+        // #12 全曲能量波形直方桶确定性与范围验证
+        let w1 = PlayerEngine.syntheticWaveformBuckets(seed: 123456, count: 56)
+        let w2 = PlayerEngine.syntheticWaveformBuckets(seed: 123456, count: 56)
+        let w3 = PlayerEngine.syntheticWaveformBuckets(seed: 654321, count: 56)
+        XCTAssertEqual(w1.count, 56)
+        XCTAssertEqual(w1, w2)
+        XCTAssertNotEqual(w1, w3)
+        XCTAssertTrue(w1.allSatisfy { $0 >= 0.10 && $0 <= 1.0 })
+    }
+
+    func testOfflineDownloadsPersistenceAndSettingsNetworkQuality() throws {
+        // #9 离线下载音频、LRC 歌词与封面持久存储与删除验证
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("offline-persist-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let tempAudio = tmpDir.appendingPathComponent("temp_stream.flac")
+        let fakeAudioBytes = Data("fLaC_FAKE_OFFLINE_AUDIO_DATA_2026".utf8)
+        try fakeAudioBytes.write(to: tempAudio)
+
+        let source = LocalMusicSource(dataDir: tmpDir)
+        let track = Track(
+            id: "off-001",
+            source: "netease",
+            name: "迷星叫",
+            artists: [Artist(id: "ar1", name: "MyGO!!!!!")],
+            album: Album(id: "al1", name: "迷跡波")
+        )
+        let savedURL = try source.storeDownloadedTrack(
+            track: track,
+            tempAudioURL: tempAudio,
+            fileExtension: "flac",
+            lrcText: "[00:01.00]迷星叫",
+            coverData: Data([0xFF, 0xD8, 0xFF, 0xE0])
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: savedURL.path))
+        XCTAssertTrue(source.isTrackDownloaded(compositeKey: track.compositeKey))
+        XCTAssertTrue(source.downloadedCompositeKeys().contains(track.compositeKey))
+
+        let resolvedAudio = source.localFileURLForDownloadedTrack(compositeKey: track.compositeKey)
+        XCTAssertEqual(resolvedAudio?.lastPathComponent, savedURL.lastPathComponent)
+        XCTAssertEqual(try Data(contentsOf: resolvedAudio!), fakeAudioBytes)
+
+        let lrcURL = savedURL.deletingPathExtension().appendingPathExtension("lrc")
+        XCTAssertEqual(try String(contentsOf: lrcURL, encoding: .utf8), "[00:01.00]迷星叫")
+
+        // 重新构造实例验证持久化加载不丢失
+        let reloaded = LocalMusicSource(dataDir: tmpDir)
+        XCTAssertTrue(reloaded.isTrackDownloaded(compositeKey: track.compositeKey))
+        XCTAssertNotNil(reloaded.localFileURLForDownloadedTrack(compositeKey: track.compositeKey))
+
+        reloaded.removeDownloadedTrack(compositeKey: track.compositeKey)
+        XCTAssertFalse(reloaded.isTrackDownloaded(compositeKey: track.compositeKey))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: savedURL.path))
+
+        // #4 网络音质分流 + #14 兼容解码验证
+        XCTAssertEqual(
+            AppModel.resolveEffectiveStreamingQuality(isCellular: false, wifiQuality: .lossless, cellularQuality: .standard),
+            .lossless
+        )
+        XCTAssertEqual(
+            AppModel.resolveEffectiveStreamingQuality(isCellular: true, wifiQuality: .lossless, cellularQuality: .standard),
+            .standard
+        )
+
+        let legacyJSON = """
+        {
+          "quality": "lossless",
+          "episodePositions": {"podcast:ep1": 142.5}
+        }
+        """
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decoded.wifiQuality, .lossless)
+        XCTAssertEqual(decoded.cellularQuality, .high)
+        XCTAssertEqual(decoded.episodePositions["podcast:ep1"] ?? 0, 142.5, accuracy: 0.01)
+        XCTAssertEqual(decoded.accentPreset, .crimson)
+        XCTAssertEqual(decoded.appIconPreset, .primary)
+    }
+
+    func testDynamicAccentThemesAndAlternateIconPlistConsistency() throws {
+        // #15 多主题强调色预设验证与无损还原
+        let previousPreset = MyGoTheme.currentAccentPreset()
+        defer { MyGoTheme.setAccentPreset(previousPreset) }
+
+        XCTAssertEqual(AccentColorPreset.allCases.count, 5)
+        for preset in AccentColorPreset.allCases {
+            let light = MyGoTheme.tokens(isDark: false, preset: preset)
+            let dark = MyGoTheme.tokens(isDark: true, preset: preset)
+            XCTAssertGreaterThanOrEqual(light.accent.r, 0.0)
+            XCTAssertLessThanOrEqual(dark.accent.g, 1.0)
+            XCTAssertEqual(dark.currentTrackFill.r, 1.0, accuracy: 0.001)
+            XCTAssertEqual(dark.currentTrackFill.g, 1.0, accuracy: 0.001)
+            XCTAssertEqual(dark.currentTrackFill.b, 1.0, accuracy: 0.001)
+            MyGoTheme.setAccentPreset(preset)
+            XCTAssertEqual(MyGoTheme.currentAccentPreset(), preset)
+        }
+
+        // #15 App/Info.plist 声明的替代图标名称必须与 AppIconPreset 枚举严格一致
+        XCTAssertEqual(AppIconPreset.allCases.count, 2)
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let plistURL = projectRoot.appendingPathComponent("App/Info.plist")
+        let plistData = try Data(contentsOf: plistURL)
+        let plist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any]
+        )
+        let bundleIcons = try XCTUnwrap(plist["CFBundleIcons"] as? [String: Any])
+        let altIcons = try XCTUnwrap(bundleIcons["CFBundleAlternateIcons"] as? [String: Any])
+        for preset in AppIconPreset.allCases {
+            if let altName = preset.alternateIconName {
+                XCTAssertNotNil(altIcons[altName], "Info.plist 缺少替换应用图标声明: \(altName)")
+            }
+        }
+    }
+
+    func testLyricsPrecisionSameTimestampAndEmptyStopMarkers() {
+        // 1) 空时间停顿行必须精确截断前一句 end 并保留有效间奏，但过滤后不出现在渲染数组
+        let lrc = """
+        [00:05.00]First sung line
+        [00:08.00]
+        [00:15.00]English same timestamp
+        [00:15.00]中文同时间戳第二行
+        [00:20.00]Third line
+        """
+        let lines = LyricsEngine.build(lrc: lrc)
+        XCTAssertEqual(lines.count, 4)
+        XCTAssertEqual(lines[0].end, 8.0, accuracy: 0.001, "空行时间戳应精确结束上一句")
+
+        // 2) 同时间戳组首行不得被压成 0 时长，且二分查找必须对齐组内首行
+        XCTAssertEqual(lines[1].text, "English same timestamp")
+        XCTAssertEqual(lines[1].end, 20.0, accuracy: 0.001)
+        XCTAssertGreaterThan(lines[1].words.last?.end ?? 0, lines[1].at)
+        XCTAssertEqual(LyricsEngine.index(in: lines, at: 16.2), 1)
+
+        // 3) fromSource 逐字越界钳位保护
+        let raw = RawLyrics(lines: [
+            RawLyricLine(
+                start: 1000,
+                end: 4000,
+                text: "AB",
+                words: [
+                    RawLyricWord(start: 500, end: 2500, text: "A"),
+                    RawLyricWord(start: 2200, end: 5200, text: "B")
+                ]
+            )
+        ])
+        let synced = LyricsEngine.fromSource(raw)
+        XCTAssertEqual(synced.count, 1)
+        XCTAssertEqual(synced[0].words[0].start, 1.0, accuracy: 0.001)
+        XCTAssertGreaterThanOrEqual(synced[0].words[1].start, synced[0].words[0].end)
+        XCTAssertEqual(synced[0].words[1].end, 4.0, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testPlayerEngineSeekSettledLatencyAndAdjacentTrackPreview() {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mygo-seek-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let engine = PlayerEngine(cacheDir: dir)
+        let tracks = [
+            Track(id: "t1", name: "Song One", artists: [Artist(id: "a1", name: "Art1")], duration: 120_000),
+            Track(id: "t2", name: "Song Two", artists: [Artist(id: "a2", name: "Art2")], duration: 180_000),
+            Track(id: "t3", name: "Song Three", artists: [Artist(id: "a3", name: "Art3")], duration: 200_000)
+        ]
+        engine.playQueue(tracks, start: 1)
+
+        // 1) 邻曲只读预览与直接跳过 3s 规则切上一首
+        XCTAssertEqual(engine.adjacentTrack(step: 1)?.id, "t3")
+        XCTAssertEqual(engine.adjacentTrack(step: -1)?.id, "t1")
+
+        // 2) Seek Revision 与 Settled Revision 同步及延迟限幅
+        let beforeSeek = engine.seekRevision
+        let beforeSettled = engine.seekSettledRevision
+        engine.seek(to: 42.5)
+        XCTAssertEqual(engine.seekRevision, beforeSeek + 1)
+        XCTAssertEqual(engine.seekSettledRevision, beforeSettled + 1)
+        XCTAssertEqual(engine.position, 42.5, accuracy: 0.001)
+        XCTAssertGreaterThanOrEqual(engine.currentAudioOutputLatency(), 0.0)
+        XCTAssertLessThanOrEqual(engine.currentAudioOutputLatency(), 0.35)
+        XCTAssertEqual(engine.acousticLyricPosition(), 42.5, accuracy: 0.001)
+
+        // 即使当前位置 > 3s，skipToPreviousTrack 仍直接切回 t1（而 previous() 回 0）
+        engine.previous()
+        XCTAssertEqual(engine.currentTrack?.id, "t2")
+        engine.seek(to: 25.0)
+        engine.skipToPreviousTrack()
+        XCTAssertEqual(engine.currentTrack?.id, "t1")
+    }
+
+    @MainActor
+    func testRemoteAssetDisablesPreciseTimingAndBackgroundCacheSkipsOversized() async throws {
+        // 1) 在线流（HTTP / HTTPS / mygostream://）默认禁用精确帧扫描以秒播，仅本地文件默认开启
+        let remoteDirect = PlayerEngine.makeAudioURLAsset(
+            url: URL(string: "http://fs.youthandroid2.kugou.com/track.flac")!
+        )
+        let proxyAsset = PlayerEngine.makeAudioURLAsset(
+            url: URL(string: "mygostream://track/123.flac")!
+        )
+        let localFile = PlayerEngine.makeAudioURLAsset(
+            url: URL(fileURLWithPath: "/tmp/offline-track.flac")
+        )
+        XCTAssertEqual(remoteDirect.url.scheme, "http")
+        XCTAssertEqual(proxyAsset.url.scheme, AudioStreamProxy.proxyScheme)
+        XCTAssertTrue(localFile.url.isFileURL)
+        // 验证通过 AudioStreamProxy 打开 WAV 自定义协议资产时不触发 CoreMedia -17770（即未显式注入 precise=false）
+        let wavData = Self.makeTestPCM16WAVData(durationSeconds: 0.25)
+        MockAudioStreamURLProtocol.configure(payload: wavData, supportsByteRange: true)
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [MockAudioStreamURLProtocol.self]
+        let wavProxy = AudioStreamProxy(
+            remoteURL: URL(string: "https://mock.music.126.net/precise-check.wav")!,
+            headers: [:],
+            streamTypeHint: "wav",
+            cacheKey: nil,
+            diskCache: nil,
+            sessionConfiguration: cfg
+        )
+        let wavAsset = PlayerEngine.makeAudioURLAsset(url: wavProxy.makeProxyAssetURL(), preferPreciseTiming: false)
+        wavAsset.resourceLoader.setDelegate(wavProxy, queue: wavProxy.delegateQueue)
+        let wavItem = AVPlayerItem(asset: wavAsset)
+        let wavPlayer = AVPlayer(playerItem: wavItem)
+        wavPlayer.isMuted = true
+        wavPlayer.play()
+        let wavReady = try await Self.waitForReadyToPlay(item: wavItem, timeoutSeconds: 4)
+        XCTAssertTrue(wavReady, "自定义协议 WAV 不得因精确时间选项误触发 CoreMedia -17770 错误")
+        wavPlayer.pause()
+        wavPlayer.replaceCurrentItem(with: nil as AVPlayerItem?)
+        wavProxy.invalidate()
+
+        // 2) 后台增强缓存体积门槛：超出 52MB 的 Hi-Res 无损流提前跳过，避免耗尽带宽后再丢弃
+        XCTAssertTrue(PlayerEngine.shouldProceedWithBackgroundCache(declaredSizeBytes: 36_507_181))
+        XCTAssertFalse(PlayerEngine.shouldProceedWithBackgroundCache(declaredSizeBytes: 60_000_000))
+        XCTAssertFalse(PlayerEngine.shouldProceedWithBackgroundCache(declaredSizeBytes: nil, expectedContentLength: 58_000_000))
+        XCTAssertTrue(PlayerEngine.shouldProceedWithBackgroundCache(declaredSizeBytes: nil, expectedContentLength: -1))
+    }
+
+    func testPluginStorageDebouncedPersistenceAndFlushConsistency() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-storage-debounce-\(UUID().uuidString)", isDirectory: true)
+        let pluginDir = root.appendingPathComponent("plugins/storage-demo", isDirectory: true)
+        let dataRoot = root.appendingPathComponent("plugin-data", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: pluginDir, withIntermediateDirectories: true)
+
+        let manifest = """
+        {
+          "id": "storage-demo",
+          "name": "Storage Demo",
+          "version": "1.0.0",
+          "main": "index.js",
+          "playback": "stream"
+        }
+        """
+        let script = """
+        export async function home() {
+          for (let i = 0; i < 40; i++) {
+            host.storage.set("fileids", { last: i });
+          }
+          host.storage.set("token", "abc-123");
+          return {
+            title: String(host.storage.get("token")) + ":" + String(host.storage.get("fileids")?.last),
+            sections: []
+          };
+        }
+        """
+        try manifest.write(to: pluginDir.appendingPathComponent("plugin.json"), atomically: true, encoding: .utf8)
+        try script.write(to: pluginDir.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        let src = try JSPluginSource(pluginDir: pluginDir, dataRootDir: dataRoot)
+        let browse = try await src.home()
+        XCTAssertEqual(browse.title, "abc-123:39", "高频连续写入后内存态应立即强一致可读")
+
+        src.flushStorage()
+        let reloaded = try JSPluginSource(pluginDir: pluginDir, dataRootDir: dataRoot)
+        let storageFile = dataRoot.appendingPathComponent("storage-demo/storage.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: storageFile.path))
+        let raw = try Data(contentsOf: storageFile)
+        let obj = try JSONSerialization.jsonObject(with: raw) as? [String: Any]
+        XCTAssertEqual(obj?["token"] as? String, "abc-123")
+        _ = reloaded
     }
 }
 

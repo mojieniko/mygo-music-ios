@@ -97,6 +97,17 @@ struct MyGoMusicVerifier {
         try assertEqual(LyricsEngine.index(in: lines, at: 5.0), 2)
         try assertEqual(LyricsEngine.index(in: lines, at: 11.0), 3)
 
+        // 校验空时间停顿行精准结束上句 + 同时间戳多行索引稳定
+        let edgeLines = LyricsEngine.build(lrc: """
+        [00:05.00]Line A
+        [00:07.50]
+        [00:12.00]Line B Primary
+        [00:12.00]Line B Secondary
+        """)
+        try assertEqual(edgeLines.count, 3)
+        try assertTrue(abs(edgeLines[0].end - 7.5) < 0.01, "空行标记应截止前一句 end")
+        try assertEqual(LyricsEngine.index(in: edgeLines, at: 13.0), 1, "同时间戳多行应稳定对齐首行")
+
         let quiets = LyricsEngine.quiets(in: lines, trackLength: 20.0, least: 2.0)
         try assertTrue(!quiets.isEmpty)
         try assertEqual(quiets.last?.from, 16.0)

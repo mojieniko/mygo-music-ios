@@ -264,15 +264,28 @@ public final class ArtworkImageLoader: ObservableObject {
 
     /// 从已解码内存缓存中零延迟同步获取 SwiftUI Image（避免主线程解码或列表滚动回弹闪烁）
     public static func cachedSwiftUIImage(rawURLString: String?, pixelSize: Int) -> Image? {
-        guard let key = cacheKey(rawURLString: rawURLString, pixelSize: pixelSize) else {
+        guard let cached = cachedPlatformImage(rawURLString: rawURLString, pixelSize: pixelSize) else {
             return nil
         }
-        guard let cached = decodedCache.object(forKey: key as NSString) else { return nil }
         #if canImport(UIKit)
         return Image(uiImage: cached)
         #elseif canImport(AppKit)
         return Image(nsImage: cached)
         #endif
+    }
+
+    /// 零延迟同步获取已解码平台原生图像（支持灵动岛与锁屏控制中心即时复用既有缓存封面）
+    public static func cachedPlatformImage(rawURLString: String?, pixelSize: Int) -> PlatformImage? {
+        guard let rawURLString, !rawURLString.isEmpty else { return nil }
+        let candidates = [pixelSize, 600, 480, 200, 120]
+        var seen = Set<Int>()
+        for px in candidates where seen.insert(px).inserted {
+            if let key = cacheKey(rawURLString: rawURLString, pixelSize: px),
+               let cached = decodedCache.object(forKey: key as NSString) {
+                return cached
+            }
+        }
+        return nil
     }
 
     /// 从主色调缓存中零延迟同步读取已提取的封面色彩（避免首页 Hero 卡片切回时闪回默认红色）
@@ -653,13 +666,68 @@ public struct MyGoThemeTokens: Equatable, Sendable {
     public let artworkBorder: RGBA
 }
 
+private final class MyGoThemePresetStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var preset: AccentColorPreset = .crimson
+
+    func get() -> AccentColorPreset {
+        lock.lock()
+        defer { lock.unlock() }
+        return preset
+    }
+
+    func set(_ newValue: AccentColorPreset) {
+        lock.lock()
+        defer { lock.unlock() }
+        preset = newValue
+    }
+}
+
 public enum MyGoTheme {
+    private static let presetStore = MyGoThemePresetStore()
+
+    /// 更新当前全局主题强调色预设（建议同步触发 AppModel 状态刷新以驱动界面重绘）
+    public static func setAccentPreset(_ preset: AccentColorPreset) {
+        presetStore.set(preset)
+    }
+
+    /// 读取当前生效的主题强调色预设
+    public static func currentAccentPreset() -> AccentColorPreset {
+        presetStore.get()
+    }
+
+    /// 获取指定预设在当前外观下的动态强调色
+    public static func color(for preset: AccentColorPreset) -> Color {
+        let light = preset.rgba(isDark: false)
+        let dark = preset.rgba(isDark: true)
+        #if canImport(UIKit)
+        return Color(uiColor: UIColor { traits in
+            let c = traits.userInterfaceStyle == .dark ? dark : light
+            return UIColor(red: c.r, green: c.g, blue: c.b, alpha: 1.0)
+        })
+        #elseif canImport(AppKit)
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let c = isDark ? dark : light
+            return NSColor(red: c.r, green: c.g, blue: c.b, alpha: 1.0)
+        })
+        #else
+        return Color(red: dark.r, green: dark.g, blue: dark.b)
+        #endif
+    }
+
     /// Apple Music 浅色/深色统一色彩规范（单一数据源驱动动态颜色与单元测试）
     public static func tokens(isDark: Bool) -> MyGoThemeTokens {
+        tokens(isDark: isDark, preset: .crimson)
+    }
+
+    /// 按指定主题色预设生成浅色/深色完整色彩令牌
+    public static func tokens(isDark: Bool, preset: AccentColorPreset) -> MyGoThemeTokens {
+        let accentRGB = preset.rgba(isDark: isDark)
+        let accent = MyGoThemeTokens.RGBA(r: accentRGB.r, g: accentRGB.g, b: accentRGB.b)
         if isDark {
             return MyGoThemeTokens(
-                // Apple Music 深色模式标准亮绯红 #FF375F
-                accent: .init(r: 1.0, g: 0.216, b: 0.373),
+                accent: accent,
                 // OLED 纯黑画布 #000000
                 pageBackground: .init(r: 0.0, g: 0.0, b: 0.0),
                 // Apple 系统暗色卡片二级层级 #1C1C1E
@@ -668,7 +736,7 @@ public enum MyGoTheme {
                 pillSurface: .init(r: 0.145, g: 0.145, b: 0.157),
                 // 暗底上的克制微光描边
                 surfaceStroke: .init(r: 1.0, g: 1.0, b: 1.0, a: 0.09),
-                // 深色下正在播放曲目采用纯净高雅炭灰浮层，避免暗红透明度叠纯黑发棕
+                // 深色下正在播放曲目采用纯净高雅炭灰浮层，避免彩色透明度叠纯黑发灰脏
                 currentTrackFill: .init(r: 1.0, g: 1.0, b: 1.0, a: 0.095),
                 // 无封面的暗色圆角占位底 #1C1C1E
                 placeholderFill: .init(r: 0.110, g: 0.110, b: 0.118),
@@ -677,20 +745,19 @@ public enum MyGoTheme {
             )
         }
         return MyGoThemeTokens(
-            // Apple Music 浅色模式生动绯红 #FA233B
-            accent: .init(r: 0.980, g: 0.137, b: 0.231),
+            accent: accent,
             pageBackground: .init(r: 1.0, g: 1.0, b: 1.0),
             elevatedSurface: .init(r: 0.0, g: 0.0, b: 0.0, a: 0.045),
             pillSurface: .init(r: 0.0, g: 0.0, b: 0.0, a: 0.068),
             surfaceStroke: .init(r: 0.0, g: 0.0, b: 0.0, a: 0.06),
-            currentTrackFill: .init(r: 0.980, g: 0.137, b: 0.231, a: 0.075),
+            currentTrackFill: .init(r: accentRGB.r, g: accentRGB.g, b: accentRGB.b, a: 0.075),
             placeholderFill: .init(r: 0.0, g: 0.0, b: 0.0, a: 0.065),
             artworkBorder: .init(r: 0.0, g: 0.0, b: 0.0, a: 0.07)
         )
     }
 
-    private static let lightTokens = tokens(isDark: false)
-    private static let darkTokens = tokens(isDark: true)
+    private static let lightTokens = tokens(isDark: false, preset: .crimson)
+    private static let darkTokens = tokens(isDark: true, preset: .crimson)
 
     private static func dynamic(_ keyPath: KeyPath<MyGoThemeTokens, MyGoThemeTokens.RGBA>) -> Color {
         let light = lightTokens[keyPath: keyPath]
@@ -711,8 +778,31 @@ public enum MyGoTheme {
         #endif
     }
 
-    /// 主强调色（浅色 #FA233B / 深色 #FF375F）
-    public static let accent = dynamic(\.accent)
+    private static func dynamicAccentAware(_ keyPath: KeyPath<MyGoThemeTokens, MyGoThemeTokens.RGBA>) -> Color {
+        #if canImport(UIKit)
+        return Color(uiColor: UIColor { traits in
+            let preset = currentAccentPreset()
+            let t = tokens(isDark: traits.userInterfaceStyle == .dark, preset: preset)
+            let c = t[keyPath: keyPath]
+            return UIColor(red: c.r, green: c.g, blue: c.b, alpha: c.a)
+        })
+        #elseif canImport(AppKit)
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            let preset = currentAccentPreset()
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let t = tokens(isDark: isDark, preset: preset)
+            let c = t[keyPath: keyPath]
+            return NSColor(red: c.r, green: c.g, blue: c.b, alpha: c.a)
+        })
+        #else
+        let t = tokens(isDark: true, preset: currentAccentPreset())
+        let c = t[keyPath: keyPath]
+        return Color(red: c.r, green: c.g, blue: c.b, opacity: c.a)
+        #endif
+    }
+
+    /// 主强调色（支持 5 套动态主题色预设切换）
+    public static var accent: Color { dynamicAccentAware(\.accent) }
     /// 主画布背景色（浅色纯白 / 深色 OLED 纯黑）
     public static let pageBackground = dynamic(\.pageBackground)
     /// 卡片与输入区域次级抬升表面
@@ -722,7 +812,7 @@ public enum MyGoTheme {
     /// 卡片与胶囊细边框微光
     public static let surfaceStroke = dynamic(\.surfaceStroke)
     /// 列表中当前正在播放曲目高亮底色
-    public static let currentTrackFill = dynamic(\.currentTrackFill)
+    public static var currentTrackFill: Color { dynamicAccentAware(\.currentTrackFill) }
     /// 无封面的媒体圆角占位底色
     public static let placeholderFill = dynamic(\.placeholderFill)
     /// 专辑/歌单封面防融边极细轮廓
@@ -856,6 +946,72 @@ public struct ArtworkView: View {
         Image(systemName: systemIcon)
             .font(.system(size: size * 0.36, weight: .semibold))
             .foregroundStyle(.secondary.opacity(0.55))
+    }
+}
+
+/// 沉浸式全宽填充图片视图（专用于歌手 Hero 大图与氛围光背景，不受固定方形约束）
+public struct FullBleedArtworkImage: View {
+    @Environment(\.mygoImageHeadersProvider) private var imageHeadersProvider
+    @StateObject private var loader = ArtworkImageLoader()
+
+    public let urlString: String?
+    public let pixelSize: Int
+    public var fallbackIcon: String = "person.wave.2"
+    public var alignment: Alignment = .center
+
+    public init(
+        urlString: String?,
+        pixelSize: Int = 900,
+        fallbackIcon: String = "person.wave.2",
+        alignment: Alignment = .center
+    ) {
+        self.urlString = urlString
+        self.pixelSize = pixelSize
+        self.fallbackIcon = fallbackIcon
+        self.alignment = alignment
+    }
+
+    private var renderedImage: Image? {
+        if let targetKey = ArtworkImageLoader.cacheKey(rawURLString: urlString, pixelSize: pixelSize) {
+            if loader.loadedCacheKey == targetKey, let img = loader.image {
+                return img
+            }
+            return ArtworkImageLoader.cachedSwiftUIImage(rawURLString: urlString, pixelSize: pixelSize)
+        }
+        return nil
+    }
+
+    public var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        MyGoTheme.accent.opacity(0.28),
+                        Color(red: 0.11, green: 0.11, blue: 0.14)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                if let image = renderedImage {
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height, alignment: alignment)
+                        .clipped()
+                } else {
+                    Image(systemName: fallbackIcon)
+                        .font(.system(size: 56, weight: .ultraLight))
+                        .foregroundStyle(.white.opacity(0.32))
+                }
+            }
+        }
+        .clipped()
+        .task(id: urlString) {
+            await loader.load(rawURLString: urlString, pixelSize: pixelSize) { url in
+                imageHeadersProvider(url)
+            }
+        }
     }
 }
 
@@ -1442,11 +1598,27 @@ public struct TrackRowView: View {
     @Environment(\.mygoNavigate) private var navigate
     public let track: Track
     public let index: Int?
+    public let isSelectionMode: Bool
+    public let isSelected: Bool
+    public let onToggleSelect: (() -> Void)?
     public let onPlay: () -> Void
 
-    public init(track: Track, index: Int? = nil, onPlay: @escaping () -> Void) {
+    @State private var swipeOffset: CGFloat = 0
+    @State private var didTriggerSwipeHaptic = false
+
+    public init(
+        track: Track,
+        index: Int? = nil,
+        isSelectionMode: Bool = false,
+        isSelected: Bool = false,
+        onToggleSelect: (() -> Void)? = nil,
+        onPlay: @escaping () -> Void
+    ) {
         self.track = track
         self.index = index
+        self.isSelectionMode = isSelectionMode
+        self.isSelected = isSelected
+        self.onToggleSelect = onToggleSelect
         self.onPlay = onPlay
     }
 
@@ -1454,8 +1626,102 @@ public struct TrackRowView: View {
         app.player.currentTrack?.compositeKey == track.compositeKey
     }
 
+    private var isDownloaded: Bool {
+        app.isTrackDownloaded(track)
+    }
+
+    private var isDownloading: Bool {
+        app.downloadingTrackKeys.contains(track.compositeKey)
+    }
+
     public var body: some View {
+        ZStack {
+            // 双向水平滑动底部动作提示背景
+            if !isSelectionMode && abs(swipeOffset) > 2 {
+                HStack(spacing: 0) {
+                    if swipeOffset > 0 {
+                        HStack(spacing: 6) {
+                            Image(systemName: "text.insert")
+                                .font(.system(size: 14, weight: .bold))
+                                .scaleEffect(swipeOffset >= 72 ? 1.18 : 0.95)
+                            Text(I18n.t("Next"))
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .frame(maxHeight: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(MyGoTheme.accent.opacity(swipeOffset >= 72 ? 1.0 : 0.78))
+                        )
+                        Spacer()
+                    } else {
+                        Spacer()
+                        let leftActionIcon: String = {
+                            if !isDownloaded { return "arrow.down.circle.fill" }
+                            if app.activeSource.can("like") {
+                                return app.isTrackLiked(track) ? "heart.slash.fill" : "heart.fill"
+                            }
+                            return "trash.fill"
+                        }()
+                        let leftActionText: String = {
+                            if !isDownloaded { return I18n.t("Download") }
+                            if app.activeSource.can("like") {
+                                return app.isTrackLiked(track) ? I18n.t("Unlike") : I18n.t("Like")
+                            }
+                            return I18n.t("Remove")
+                        }()
+                        let leftActionColor: Color = {
+                            if !isDownloaded { return .blue }
+                            if app.activeSource.can("like") { return .pink }
+                            return .orange
+                        }()
+                        HStack(spacing: 6) {
+                            Text(leftActionText)
+                                .font(.system(size: 12, weight: .semibold))
+                            Image(systemName: leftActionIcon)
+                                .font(.system(size: 14, weight: .bold))
+                                .scaleEffect(swipeOffset <= -72 ? 1.18 : 0.95)
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .frame(maxHeight: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(leftActionColor.opacity(swipeOffset <= -72 ? 0.96 : 0.76))
+                        )
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+
+            rowForegroundContent
+                .offset(x: isSelectionMode ? 0 : swipeOffset)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onChange(of: isSelectionMode) { _, active in
+            if active && swipeOffset != 0 {
+                swipeOffset = 0
+                didTriggerSwipeHaptic = false
+            }
+        }
+    }
+
+    private var rowForegroundContent: some View {
         HStack(spacing: 12) {
+            if isSelectionMode {
+                Button {
+                    MyGoHaptics.impact(.light)
+                    onToggleSelect?()
+                } label: {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 21))
+                        .foregroundStyle(isSelected ? MyGoTheme.accent : .secondary.opacity(0.65))
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.plain)
+            }
+
             ZStack {
                 ArtworkView(urlString: track.album.imageUrl, pixelSize: 120, size: 44, cornerRadius: 8)
                 if isCurrent {
@@ -1469,7 +1735,14 @@ public struct TrackRowView: View {
                     )
                 }
             }
-            .onTapGesture(perform: onPlay)
+            .onTapGesture {
+                if isSelectionMode {
+                    MyGoHaptics.impact(.light)
+                    onToggleSelect?()
+                } else {
+                    onPlay()
+                }
+            }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
@@ -1493,6 +1766,15 @@ public struct TrackRowView: View {
                 }
 
                 HStack(spacing: 4) {
+                    if isDownloading {
+                        ProgressView()
+                            .scaleEffect(0.55)
+                            .frame(width: 12, height: 12)
+                    } else if isDownloaded {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(MyGoTheme.accent)
+                    }
                     if !track.artistNames.isEmpty {
                         Text(track.artistNames)
                     }
@@ -1506,7 +1788,14 @@ public struct TrackRowView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .onTapGesture(perform: onPlay)
+            .onTapGesture {
+                if isSelectionMode {
+                    MyGoHaptics.impact(.light)
+                    onToggleSelect?()
+                } else {
+                    onPlay()
+                }
+            }
 
             if track.duration > 0 {
                 Text(MyGoTheme.formatClock(track.durationSeconds))
@@ -1514,79 +1803,189 @@ public struct TrackRowView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if app.activeSource.can("like") {
-                let liked = app.isTrackLiked(track)
-                Button {
-                    Task { await app.toggleLike(track) }
-                } label: {
-                    Image(systemName: liked ? "heart.fill" : "heart")
-                        .font(.system(size: 15))
-                        .foregroundStyle(liked ? MyGoTheme.accent : .secondary.opacity(0.7))
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-            }
-
-            Menu {
-                Button(action: onPlay) {
-                    Label(I18n.t("Play"), systemImage: "play.fill")
-                }
+            if !isSelectionMode {
                 if app.activeSource.can("like") {
                     let liked = app.isTrackLiked(track)
                     Button {
+                        MyGoHaptics.impact(liked ? .light : .medium)
                         Task { await app.toggleLike(track) }
                     } label: {
-                        Label(liked ? I18n.t("Unlike") : I18n.t("Like"), systemImage: liked ? "heart.slash" : "heart")
+                        Image(systemName: liked ? "heart.fill" : "heart")
+                            .font(.system(size: 15))
+                            .foregroundStyle(liked ? MyGoTheme.accent : .secondary.opacity(0.7))
+                            .frame(width: 28, height: 28)
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(I18n.t(liked ? "Unlike" : "Like"))
                 }
-                if app.activeSource.can("addToPlaylist"), app.myPlaylists.contains(where: { $0.fixed != true }) {
-                    Button {
-                        app.pendingAddToPlaylistTrack = track
-                    } label: {
-                        Label(I18n.t("Add to Playlist"), systemImage: "text.badge.plus")
-                    }
+
+                Menu {
+                    trackActionMenuItems()
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
                 }
-                let trackArtists = track.resolvedArtistsForNavigation
-                if trackArtists.count == 1, let artist = trackArtists.first {
-                    Button {
-                        navigate(.artist(id: artist.id, name: artist.name, sourceID: track.source))
-                    } label: {
-                        Label(I18n.tf("Go to Artist: %s", artist.name), systemImage: "person.wave.2")
-                    }
-                } else if trackArtists.count > 1 {
-                    Menu(I18n.t("Artists")) {
-                        ForEach(Array(trackArtists.enumerated()), id: \.offset) { _, artist in
-                            Button {
-                                navigate(.artist(id: artist.id, name: artist.name, sourceID: track.source))
-                            } label: {
-                                Label(artist.name, systemImage: "person.wave.2")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 28, height: 28)
+                .buttonStyle(.plain)
+                .accessibilityLabel(I18n.t("More Actions"))
             }
-            .buttonStyle(.plain)
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 12)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isCurrent ? MyGoTheme.currentTrackFill : Color.clear)
+                .fill(isCurrent ? MyGoTheme.currentTrackFill : MyGoTheme.pageBackground.opacity(0.001))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .strokeBorder(isCurrent ? MyGoTheme.surfaceStroke : Color.clear, lineWidth: 0.5)
                 )
         )
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .opacity(track.unavailable == true ? 0.45 : 1.0)
+        .gesture(
+            DragGesture(minimumDistance: 28, coordinateSpace: .local)
+                .onChanged { value in
+                    guard !isSelectionMode, track.unavailable != true else { return }
+                    let dx = value.translation.width
+                    let dy = value.translation.height
+                    // 严格水平方向锁：防止抢占外层 ScrollView 纵向滚动
+                    guard abs(swipeOffset) > 1 || abs(dx) > abs(dy) * 1.5 else { return }
+                    let maxPull: CGFloat = 104
+                    let clamped: CGFloat
+                    if abs(dx) > 72 {
+                        let excess = abs(dx) - 72
+                        clamped = (dx >= 0 ? 1 : -1) * min(maxPull, 72 + excess * 0.42)
+                    } else {
+                        clamped = dx
+                    }
+                    swipeOffset = clamped
+                    if abs(clamped) >= 72 && !didTriggerSwipeHaptic {
+                        didTriggerSwipeHaptic = true
+                        MyGoHaptics.impact(.light)
+                    } else if abs(clamped) < 60 {
+                        didTriggerSwipeHaptic = false
+                    }
+                }
+                .onEnded { _ in
+                    guard !isSelectionMode, track.unavailable != true else { return }
+                    let trigger = swipeOffset
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.78)) {
+                        swipeOffset = 0
+                    }
+                    didTriggerSwipeHaptic = false
+                    if trigger >= 72 {
+                        app.player.playNext(track)
+                        app.showToast(I18n.t("Playing next"))
+                    } else if trigger <= -72 {
+                        if !isDownloaded {
+                            Task { await app.downloadTrackForOffline(track) }
+                        } else if app.activeSource.can("like") {
+                            Task { await app.toggleLike(track) }
+                        } else {
+                            app.removeOfflineDownload(for: track)
+                            app.showToast(I18n.t("Removed offline download"))
+                        }
+                    }
+                }
+        )
+        .contextMenu {
+            if !isSelectionMode {
+                trackActionMenuItems()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func trackActionMenuItems() -> some View {
+        Button {
+            MyGoHaptics.impact(.light)
+            onPlay()
+        } label: {
+            Label(I18n.t("Play"), systemImage: "play.fill")
+        }
+        if track.unavailable != true {
+            Button {
+                MyGoHaptics.impact(.light)
+                app.player.playNext(track)
+                app.showToast(I18n.t("Playing next"))
+            } label: {
+                Label(I18n.t("Play Next"), systemImage: "text.insert")
+            }
+            Button {
+                MyGoHaptics.impact(.light)
+                app.player.enqueue(track)
+                app.showToast(I18n.t("Added to queue"))
+            } label: {
+                Label(I18n.t("Add to Queue"), systemImage: "text.append")
+            }
+            if isDownloaded {
+                Button(role: .destructive) {
+                    MyGoHaptics.impact(.light)
+                    app.removeOfflineDownload(for: track)
+                    app.showToast(I18n.t("Removed offline download"))
+                } label: {
+                    Label(I18n.t("Remove Download"), systemImage: "trash")
+                }
+            } else if !isDownloading {
+                Button {
+                    MyGoHaptics.impact(.light)
+                    Task { await app.downloadTrackForOffline(track) }
+                } label: {
+                    Label(I18n.t("Download Offline"), systemImage: "arrow.down.circle")
+                }
+            }
+        }
+        if app.activeSource.can("like") {
+            let liked = app.isTrackLiked(track)
+            Button {
+                MyGoHaptics.impact(liked ? .light : .medium)
+                Task { await app.toggleLike(track) }
+            } label: {
+                Label(liked ? I18n.t("Unlike") : I18n.t("Like"), systemImage: liked ? "heart.slash" : "heart")
+            }
+        }
+        if app.activeSource.can("addToPlaylist"), app.myPlaylists.contains(where: { $0.fixed != true }) {
+            Button {
+                app.pendingAddToPlaylistTrack = track
+            } label: {
+                Label(I18n.t("Add to Playlist"), systemImage: "text.badge.plus")
+            }
+        }
+        if !track.album.id.isEmpty {
+            Button {
+                navigate(.album(id: track.album.id, name: track.album.name, sourceID: track.source))
+            } label: {
+                Label(I18n.t("Go to Album"), systemImage: "square.stack")
+            }
+        }
+        let trackArtists = track.resolvedArtistsForNavigation
+        if trackArtists.count == 1, let artist = trackArtists.first {
+            Button {
+                navigate(.artist(id: artist.id, name: artist.name, sourceID: track.source))
+            } label: {
+                Label(I18n.tf("Go to Artist: %s", artist.name), systemImage: "person.wave.2")
+            }
+        } else if trackArtists.count > 1 {
+            Menu(I18n.t("Artists")) {
+                ForEach(Array(trackArtists.enumerated()), id: \.offset) { _, artist in
+                    Button {
+                        navigate(.artist(id: artist.id, name: artist.name, sourceID: track.source))
+                    } label: {
+                        Label(artist.name, systemImage: "person.wave.2")
+                    }
+                }
+            }
+        }
+        Divider()
+        let shareSummary = MyGoShareHelper.shareText(for: track)
+        ShareLink(item: shareSummary, subject: Text(track.name), message: Text(shareSummary)) {
+            Label(I18n.t("Share"), systemImage: "square.and.arrow.up")
+        }
     }
 }
 
-// MARK: - 高性能懒加载歌曲列表容器（统一消除数千首大曲库全量实例化与重复 compositeKey 冲突）
+// MARK: - 高性能懒加载歌曲列表容器（统一消除数千首大曲库全量实例化与重复 compositeKey 冲突，支持多选批量操作）
 
 public struct LazyTrackRowEntry: Identifiable {
     public let id: String
@@ -1595,18 +1994,42 @@ public struct LazyTrackRowEntry: Identifiable {
 }
 
 public struct LazyTrackRowsView: View {
+    @EnvironmentObject private var app: AppModel
     public let tracks: [Track]
     public var horizontalPadding: CGFloat = 8
+    private var externalIsSelecting: Binding<Bool>?
     public let onPlay: ([Track], Int) -> Void
+
+    @State private var internalIsSelecting = false
+    @State private var selectedKeys: Set<String> = []
+    @State private var showBatchPlaylistSheet = false
 
     public init(
         tracks: [Track],
         horizontalPadding: CGFloat = 8,
+        isSelecting: Binding<Bool>? = nil,
         onPlay: @escaping ([Track], Int) -> Void
     ) {
         self.tracks = tracks
         self.horizontalPadding = horizontalPadding
+        self.externalIsSelecting = isSelecting
         self.onPlay = onPlay
+    }
+
+    private var selectingBinding: Binding<Bool> {
+        externalIsSelecting ?? $internalIsSelecting
+    }
+
+    private var isSelectionActive: Bool {
+        selectingBinding.wrappedValue
+    }
+
+    private var selectedTracks: [Track] {
+        var seen: Set<String> = []
+        return tracks.filter { track in
+            guard selectedKeys.contains(track.compositeKey) else { return false }
+            return seen.insert(track.compositeKey).inserted
+        }
     }
 
     /// 为大列表生成稳定且无重复碰撞的行 ID，同一首曲目出现多次时按次序附加后缀
@@ -1627,14 +2050,234 @@ public struct LazyTrackRowsView: View {
 
     public var body: some View {
         let entries = Self.buildRowEntries(for: tracks)
-        LazyVStack(spacing: 2) {
-            ForEach(entries) { entry in
-                TrackRowView(track: entry.track, index: entry.index) {
-                    onPlay(tracks, entry.index)
+        VStack(spacing: 8) {
+            if isSelectionActive {
+                batchActionBar
+                    .padding(.horizontal, horizontalPadding + 6)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
+            LazyVStack(spacing: 2) {
+                ForEach(entries) { entry in
+                    let key = entry.track.compositeKey
+                    TrackRowView(
+                        track: entry.track,
+                        index: entry.index,
+                        isSelectionMode: isSelectionActive,
+                        isSelected: selectedKeys.contains(key),
+                        onToggleSelect: {
+                            if selectedKeys.contains(key) {
+                                selectedKeys.remove(key)
+                            } else {
+                                selectedKeys.insert(key)
+                            }
+                        },
+                        onPlay: {
+                            onPlay(tracks, entry.index)
+                        }
+                    )
+                    .padding(.horizontal, horizontalPadding)
                 }
-                .padding(.horizontal, horizontalPadding)
             }
         }
+        .onChange(of: isSelectionActive) { _, active in
+            if !active {
+                selectedKeys.removeAll()
+            }
+        }
+        .onChange(of: tracks.count) { _, _ in
+            let valid = Set(tracks.map(\.compositeKey))
+            selectedKeys = selectedKeys.intersection(valid)
+        }
+        .sheet(isPresented: $showBatchPlaylistSheet) {
+            BatchPlaylistPickerSheet(tracks: selectedTracks) {
+                selectingBinding.wrappedValue = false
+            }
+            .environmentObject(app)
+        }
+    }
+
+    private var batchActionBar: some View {
+        let picked = selectedTracks
+        let playableAllKeys = Set(tracks.filter { $0.unavailable != true }.map(\.compositeKey))
+        let allSelected = !playableAllKeys.isEmpty && playableAllKeys.isSubset(of: selectedKeys)
+
+        return VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Text(I18n.tf("%d Selected", picked.count))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+
+                Spacer()
+
+                Button {
+                    MyGoHaptics.impact(.light)
+                    if allSelected {
+                        selectedKeys.removeAll()
+                    } else {
+                        selectedKeys = playableAllKeys
+                    }
+                } label: {
+                    Text(allSelected ? I18n.t("Deselect All") : I18n.t("Select All"))
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(MyGoTheme.accent)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    MyGoHaptics.impact(.light)
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        selectingBinding.wrappedValue = false
+                    }
+                } label: {
+                    Text(I18n.t("Done"))
+                        .font(.system(size: 12.5, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(MyGoTheme.accent))
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    let valid = picked.filter { $0.unavailable != true }
+                    guard !valid.isEmpty else { return }
+                    MyGoHaptics.impact(.medium)
+                    for track in valid.reversed() {
+                        app.player.playNext(track)
+                    }
+                    app.showToast(I18n.tf("Playing next %d tracks", valid.count))
+                    selectingBinding.wrappedValue = false
+                } label: {
+                    Label(I18n.t("Play Next"), systemImage: "text.insert")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(MyGoTheme.pillSurface)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(picked.isEmpty)
+
+                if app.myPlaylists.contains(where: { $0.fixed != true }) {
+                    Button {
+                        guard !picked.isEmpty else { return }
+                        MyGoHaptics.impact(.light)
+                        showBatchPlaylistSheet = true
+                    } label: {
+                        Label(I18n.t("Add to Playlist"), systemImage: "text.badge.plus")
+                            .font(.system(size: 12, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(MyGoTheme.pillSurface)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(picked.isEmpty)
+                }
+
+                Button {
+                    let valid = picked.filter { $0.unavailable != true }
+                    guard !valid.isEmpty else { return }
+                    MyGoHaptics.impact(.medium)
+                    Task { await app.downloadTracksForOffline(valid) }
+                    selectingBinding.wrappedValue = false
+                } label: {
+                    Label(I18n.t("Download"), systemImage: "arrow.down.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(MyGoTheme.pillSurface)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(picked.isEmpty)
+            }
+            .foregroundStyle(.primary)
+            .opacity(picked.isEmpty ? 0.45 : 1.0)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(MyGoTheme.elevatedSurface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.7)
+                )
+        )
+    }
+}
+
+/// 多选批量添加曲目到自建歌单弹窗
+private struct BatchPlaylistPickerSheet: View {
+    @EnvironmentObject private var app: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let tracks: [Track]
+    let onCompleted: () -> Void
+    @State private var isSubmitting = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                let writable = app.myPlaylists.filter { $0.fixed != true }
+                if writable.isEmpty {
+                    Text(I18n.t("No editable playlists"))
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(writable) { pl in
+                        Button {
+                            guard !isSubmitting else { return }
+                            isSubmitting = true
+                            Task {
+                                for track in tracks {
+                                    await app.addTrack(track, toPlaylist: pl.id)
+                                }
+                                app.showToast(I18n.tf("Added %d tracks to playlist", tracks.count))
+                                isSubmitting = false
+                                onCompleted()
+                                dismiss()
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                ArtworkView(urlString: pl.imageUrl, pixelSize: 120, size: 42, cornerRadius: 8)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(pl.name)
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundStyle(.primary)
+                                    Text(I18n.tf("%d tracks", pl.trackCount ?? pl.tracks?.count ?? 0))
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if isSubmitting {
+                                    ProgressView().scaleEffect(0.8)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(I18n.t("Batch Add to Playlist"))
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(I18n.t("Cancel")) { dismiss() }
+                }
+            }
+        }
+        #if os(iOS)
+        .presentationDetents([.medium, .large])
+        #endif
     }
 }
 
@@ -1646,6 +2289,7 @@ public struct CoverCardView: View {
     public let imageURL: String?
     public var systemIcon: String = "music.note"
     public var isCircular: Bool = false
+    public var cardSize: CGFloat = 148
     public var onPlay: (() -> Void)? = nil
     public var onTap: (() -> Void)? = nil
 
@@ -1655,6 +2299,7 @@ public struct CoverCardView: View {
         imageURL: String? = nil,
         systemIcon: String = "music.note",
         isCircular: Bool = false,
+        cardSize: CGFloat = 148,
         onPlay: (() -> Void)? = nil,
         onTap: (() -> Void)? = nil
     ) {
@@ -1663,18 +2308,19 @@ public struct CoverCardView: View {
         self.imageURL = imageURL
         self.systemIcon = systemIcon
         self.isCircular = isCircular
+        self.cardSize = cardSize
         self.onPlay = onPlay
         self.onTap = onTap
     }
 
     public var body: some View {
-        let shadowRadius: CGFloat = isCircular ? 74 : 12
+        let shadowRadius: CGFloat = isCircular ? (cardSize / 2) : 13
         let cardContent = VStack(alignment: isCircular ? .center : .leading, spacing: 8) {
             ZStack(alignment: .bottomTrailing) {
                 ArtworkView(
                     urlString: imageURL,
-                    pixelSize: 400,
-                    size: 148,
+                    pixelSize: cardSize > 155 ? 480 : 400,
+                    size: cardSize,
                     cornerRadius: shadowRadius,
                     systemIcon: systemIcon
                 )
@@ -1713,7 +2359,7 @@ public struct CoverCardView: View {
                     .lineLimit(1)
             }
         }
-        .frame(width: 148)
+        .frame(width: cardSize)
         .contentShape(Rectangle())
 
         if let onTap {
@@ -1838,9 +2484,7 @@ public final class SystemVolumeObserver: ObservableObject {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         if !session.isOtherAudioPlaying {
-            if session.category != .playback {
-                try? session.setCategory(.playback, mode: .default, options: [])
-            }
+            PlayerEngine.configurePlaybackAudioSessionCategory()
             // 提前激活音频会话，确保尚未点击播放前按硬件音量键也能触发 outputVolume KVO
             try? session.setActive(true)
         }
@@ -2336,5 +2980,674 @@ extension View {
             .overlay(
                 shape.strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.6)
             )
+    }
+}
+
+// MARK: - iOS 系统触觉反馈与分享文案助手
+
+/// 统一全应用的 iOS 原生细腻触觉反馈封装（非 iOS 平台静默降级）
+@MainActor
+public enum MyGoHaptics {
+    public enum ImpactWeight {
+        case soft
+        case light
+        case medium
+    }
+
+    public enum NotificationKind {
+        case success
+        case warning
+        case error
+    }
+
+    public static func impact(_ weight: ImpactWeight = .light) {
+        #if os(iOS) && canImport(UIKit)
+        let style: UIImpactFeedbackGenerator.FeedbackStyle
+        switch weight {
+        case .soft: style = .soft
+        case .light: style = .light
+        case .medium: style = .medium
+        }
+        let gen = UIImpactFeedbackGenerator(style: style)
+        gen.prepare()
+        gen.impactOccurred()
+        #endif
+    }
+
+    public static func selection() {
+        #if os(iOS) && canImport(UIKit)
+        let gen = UISelectionFeedbackGenerator()
+        gen.prepare()
+        gen.selectionChanged()
+        #endif
+    }
+
+    public static func notify(_ kind: NotificationKind) {
+        #if os(iOS) && canImport(UIKit)
+        let type: UINotificationFeedbackGenerator.FeedbackType
+        switch kind {
+        case .success: type = .success
+        case .warning: type = .warning
+        case .error: type = .error
+        }
+        let gen = UINotificationFeedbackGenerator()
+        gen.prepare()
+        gen.notificationOccurred(type)
+        #endif
+    }
+}
+
+/// 生成供系统 Share Sheet 分享的标准曲目文本描述
+public enum MyGoShareHelper {
+    public static func shareText(for track: Track) -> String {
+        var parts = [track.name]
+        if !track.artistNames.isEmpty {
+            parts.append(track.artistNames)
+        }
+        var summary = parts.joined(separator: " - ")
+        if !track.album.name.isEmpty {
+            summary += " (\(track.album.name))"
+        }
+        return summary
+    }
+}
+
+// MARK: - 专辑 / 歌单 / 歌手详情页弹性视差头部（#7）
+
+public enum MyGoDetailScrollSpace {
+    public static let name = "mygoDetailParallaxScrollSpace"
+}
+
+private struct ParallaxHeaderOffsetPreferenceKey: PreferenceKey {
+    nonisolated(unsafe) static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+public struct ParallaxDetailHeaderView: View {
+    public let title: String
+    public let subtitle: String
+    public var accentSubtitle: String? = nil
+    public var badgeText: String? = nil
+    public let artworkURL: String?
+    public var artworkSize: CGFloat = 236
+    public var isCircleArtwork: Bool = false
+    public var onAccentSubtitleTap: (() -> Void)? = nil
+    @Binding public var isCollapsed: Bool
+
+    public init(
+        title: String,
+        subtitle: String,
+        accentSubtitle: String? = nil,
+        badgeText: String? = nil,
+        artworkURL: String?,
+        artworkSize: CGFloat = 236,
+        isCircleArtwork: Bool = false,
+        onAccentSubtitleTap: (() -> Void)? = nil,
+        isCollapsed: Binding<Bool>
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.accentSubtitle = accentSubtitle
+        self.badgeText = badgeText
+        self.artworkURL = artworkURL
+        self.artworkSize = artworkSize
+        self.isCircleArtwork = isCircleArtwork
+        self.onAccentSubtitleTap = onAccentSubtitleTap
+        self._isCollapsed = isCollapsed
+    }
+
+    public var body: some View {
+        VStack(spacing: 14) {
+            GeometryReader { geo in
+                let minY = geo.frame(in: .named(MyGoDetailScrollSpace.name)).minY
+                let pullDown = max(0, minY)
+                let scrollUp = min(0, minY)
+                let scale = 1.0 + min(0.24, pullDown / max(artworkSize * 1.4, 260))
+                let collapseProgress = min(1.0, max(0.0, -scrollUp / max(artworkSize * 0.72, 130)))
+
+                ZStack {
+                    // Apple Music 专属顶部延伸氛围光幕（向上延展透出状态栏之后并柔和融入画布）
+                    if let artworkURL, !artworkURL.isEmpty {
+                        FullBleedArtworkImage(urlString: artworkURL, pixelSize: 220, fallbackIcon: "opticaldisc")
+                            .frame(width: geo.size.width, height: artworkSize + 240 + pullDown)
+                            .blur(radius: 56)
+                            .saturation(1.25)
+                            .opacity(0.36 * (1.0 - collapseProgress * 0.7))
+                            .mask(
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: .white, location: 0.0),
+                                        .init(color: .white.opacity(0.85), location: 0.52),
+                                        .init(color: .clear, location: 1.0)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .offset(y: -95 - pullDown * 0.5)
+                            .allowsHitTesting(false)
+                    }
+
+                    Group {
+                        if isCircleArtwork {
+                            ArtworkView(
+                                urlString: artworkURL,
+                                pixelSize: 500,
+                                size: artworkSize,
+                                cornerRadius: artworkSize / 2
+                            )
+                            .clipShape(Circle())
+                            .overlay(
+                                Circle().strokeBorder(MyGoTheme.artworkBorder, lineWidth: 0.7)
+                            )
+                            .shadow(color: .black.opacity(0.28), radius: 24, y: 14)
+                        } else {
+                            ArtworkView(
+                                urlString: artworkURL,
+                                pixelSize: 700,
+                                size: artworkSize,
+                                cornerRadius: 14
+                            )
+                            .shadow(color: .black.opacity(0.32), radius: 26, y: 14)
+                        }
+                    }
+                    .scaleEffect(scale)
+                    .offset(y: -scrollUp * 0.18 - pullDown * 0.42)
+                    .opacity(1.0 - collapseProgress * 0.45)
+                }
+                .frame(width: geo.size.width, height: artworkSize + pullDown)
+                .offset(y: -pullDown)
+                .preference(key: ParallaxHeaderOffsetPreferenceKey.self, value: minY)
+            }
+            .frame(height: artworkSize)
+
+            VStack(spacing: 4) {
+                Text(title)
+                    .font(.system(size: 21, weight: .bold))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+
+                if let accentSubtitle, !accentSubtitle.isEmpty {
+                    if let onAccentSubtitleTap {
+                        Button(action: onAccentSubtitleTap) {
+                            Text(accentSubtitle)
+                                .font(.system(size: 18, weight: .medium))
+                                .foregroundStyle(MyGoTheme.accent)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Text(accentSubtitle)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(MyGoTheme.accent)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(1)
+                    }
+                }
+
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .padding(.top, 1)
+                }
+
+                if let badgeText, !badgeText.isEmpty {
+                    Text(badgeText)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(MyGoTheme.pillSurface))
+                        .padding(.top, 3)
+                }
+            }
+            .padding(.horizontal, 20)
+        }
+        .onPreferenceChange(ParallaxHeaderOffsetPreferenceKey.self) { minY in
+            let shouldCollapse = minY < -(artworkSize * 0.85)
+            if shouldCollapse != isCollapsed {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isCollapsed = shouldCollapse
+                }
+            }
+        }
+    }
+}
+
+/// Apple Music 专辑 / 歌单标志性等宽双大按钮（▶ 播放 · 🔀 随机播放）
+public struct AppleMusicPlayShuffleBar: View {
+    public let hasTracks: Bool
+    public let onPlay: () -> Void
+    public let onShuffle: () -> Void
+
+    public init(hasTracks: Bool, onPlay: @escaping () -> Void, onShuffle: @escaping () -> Void) {
+        self.hasTracks = hasTracks
+        self.onPlay = onPlay
+        self.onShuffle = onShuffle
+    }
+
+    public var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                MyGoHaptics.impact(.light)
+                onPlay()
+            } label: {
+                Label(I18n.t("Play"), systemImage: "play.fill")
+                    .font(.system(size: 15.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 46)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(MyGoTheme.accent)
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasTracks)
+
+            Button {
+                MyGoHaptics.impact(.light)
+                onShuffle()
+            } label: {
+                Label(I18n.t("Shuffle"), systemImage: "shuffle")
+                    .font(.system(size: 15.5, weight: .semibold))
+                    .foregroundStyle(MyGoTheme.accent)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 46)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(MyGoTheme.elevatedSurface)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.6)
+                            )
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasTracks)
+        }
+        .opacity(hasTracks ? 1.0 : 0.45)
+        .padding(.horizontal, 16)
+    }
+}
+
+/// Apple Music 原生风格全宽沉浸歌手大片头图（真全出血穿透状态栏、人脸顶部对齐防削头、下拉弹性拉伸、高对比白字标题与圆角按钮）
+public struct AppleMusicArtistHeroHeader: View {
+    public let artistName: String
+    public let subtitle: String
+    public let imageURL: String?
+    public var fallbackArtworkURL: String? = nil
+    public let hasTracks: Bool
+    @Binding public var isCollapsed: Bool
+    public let onPlay: () -> Void
+    public let onShuffle: () -> Void
+
+    public init(
+        artistName: String,
+        subtitle: String,
+        imageURL: String?,
+        fallbackArtworkURL: String? = nil,
+        hasTracks: Bool,
+        isCollapsed: Binding<Bool>,
+        onPlay: @escaping () -> Void,
+        onShuffle: @escaping () -> Void
+    ) {
+        self.artistName = artistName
+        self.subtitle = subtitle
+        self.imageURL = imageURL
+        self.fallbackArtworkURL = fallbackArtworkURL
+        self.hasTracks = hasTracks
+        self._isCollapsed = isCollapsed
+        self.onPlay = onPlay
+        self.onShuffle = onShuffle
+    }
+
+    private static let baseHeight: CGFloat = 370
+
+    public var body: some View {
+        let trimmedPrimary = imageURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmedFallback = fallbackArtworkURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        GeometryReader { geo in
+            let minY = geo.frame(in: .named(MyGoDetailScrollSpace.name)).minY
+            let pullDown = max(0, minY)
+            let expandedH = Self.baseHeight + pullDown
+
+            ZStack(alignment: .bottom) {
+                // 全宽背景层：下拉时仅以顶边死死贴合屏幕物理顶部放大拉伸，彻底消除 -140pt 错位断层
+                Group {
+                    if !trimmedPrimary.isEmpty {
+                        FullBleedArtworkImage(
+                            urlString: trimmedPrimary,
+                            pixelSize: 960,
+                            fallbackIcon: "music.mic",
+                            alignment: .top
+                        )
+                    } else if !trimmedFallback.isEmpty {
+                        ZStack {
+                            FullBleedArtworkImage(
+                                urlString: trimmedFallback,
+                                pixelSize: 500,
+                                fallbackIcon: "opticaldisc",
+                                alignment: .center
+                            )
+                            .blur(radius: 26)
+                            .scaleEffect(1.12)
+                            .overlay(Color.black.opacity(0.28))
+
+                            ArtworkView(
+                                urlString: trimmedFallback,
+                                pixelSize: 640,
+                                size: 152,
+                                cornerRadius: 76,
+                                systemIcon: "person.wave.2"
+                            )
+                            .overlay(Circle().strokeBorder(.white.opacity(0.28), lineWidth: 1.2))
+                            .shadow(color: .black.opacity(0.45), radius: 22, y: 10)
+                            .offset(y: -16)
+                        }
+                    } else {
+                        ZStack {
+                            LinearGradient(
+                                colors: [
+                                    MyGoTheme.accent.opacity(0.42),
+                                    Color(red: 0.13, green: 0.13, blue: 0.17)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            Circle()
+                                .fill(.white.opacity(0.08))
+                                .frame(width: 118, height: 118)
+                                .overlay(Circle().strokeBorder(.white.opacity(0.16), lineWidth: 1))
+                                .overlay(
+                                    Image(systemName: "waveform")
+                                        .font(.system(size: 46, weight: .light))
+                                        .foregroundStyle(.white.opacity(0.75))
+                                )
+                                .offset(y: -16)
+                        }
+                    }
+                }
+                .frame(width: geo.size.width, height: expandedH)
+                .overlay(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black.opacity(0.38), location: 0.0),
+                            .init(color: .clear, location: 0.28),
+                            .init(color: .black.opacity(0.18), location: 0.56),
+                            .init(color: .black.opacity(0.68), location: 0.84),
+                            .init(color: MyGoTheme.pageBackground, location: 1.0)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+                // 左下大片粗体艺名 + 右下液态玻璃随机 & 主题实心主播放双圆键
+                HStack(alignment: .bottom, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(artistName)
+                            .font(.system(size: 34, weight: .bold))
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.42), radius: 8, y: 2)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.70)
+
+                        if !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(.system(size: 13.5, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.78))
+                                .shadow(color: .black.opacity(0.35), radius: 4, y: 1)
+                        }
+                    }
+
+                    Spacer()
+
+                    if hasTracks {
+                        HStack(spacing: 10) {
+                            Button {
+                                MyGoHaptics.impact(.light)
+                                onShuffle()
+                            } label: {
+                                Image(systemName: "shuffle")
+                                    .font(.system(size: 15.5, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 42, height: 42)
+                                    .background(.ultraThinMaterial, in: Circle())
+                                    .overlay(Circle().strokeBorder(.white.opacity(0.24), lineWidth: 0.7))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(I18n.t("Shuffle"))
+
+                            Button {
+                                MyGoHaptics.impact(.medium)
+                                onPlay()
+                            } label: {
+                                Image(systemName: "play.fill")
+                                    .font(.system(size: 19, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .offset(x: 1.5)
+                                    .frame(width: 48, height: 48)
+                                    .background(MyGoTheme.accent, in: Circle())
+                                    .shadow(color: MyGoTheme.accent.opacity(0.40), radius: 12, y: 4)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(I18n.t("Play"))
+                        }
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 16)
+            }
+            .frame(width: geo.size.width, height: expandedH, alignment: .bottom)
+            .offset(y: -pullDown)
+            .preference(key: ParallaxHeaderOffsetPreferenceKey.self, value: minY)
+        }
+        .frame(height: Self.baseHeight)
+        .onPreferenceChange(ParallaxHeaderOffsetPreferenceKey.self) { minY in
+            let shouldCollapse = minY < -(Self.baseHeight * 0.68)
+            if shouldCollapse != isCollapsed {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isCollapsed = shouldCollapse
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Apple Music 质感平滑跑马灯文本组件（支持超宽自动滚动与双端羽化遮罩）
+
+public struct MyGoMarqueeSample: Sendable, Equatable {
+    public let offsetX: CGFloat
+    public let leftFadeWidth: CGFloat
+    public let rightFadeWidth: CGFloat
+}
+
+public enum MyGoMarqueeMath {
+    /// 计算跑马灯在给定流逝时间下的水平偏移量与左右边缘渐变遮罩宽度。
+    public static func sample(
+        elapsed: TimeInterval,
+        contentWidth: CGFloat,
+        containerWidth: CGFloat,
+        speed: CGFloat = 30.0,
+        initialPause: TimeInterval = 2.0,
+        gap: CGFloat = 44.0
+    ) -> MyGoMarqueeSample {
+        guard contentWidth > containerWidth + 1.5, containerWidth > 0, speed > 0 else {
+            return MyGoMarqueeSample(offsetX: 0, leftFadeWidth: 0, rightFadeWidth: 0)
+        }
+        let cycleDistance = contentWidth + max(0, gap)
+        let scrollDuration = TimeInterval(cycleDistance / speed)
+        let period = max(0.1, initialPause + scrollDuration)
+        let safeElapsed = max(0, elapsed)
+        let phase = safeElapsed.truncatingRemainder(dividingBy: period)
+        if phase < initialPause || scrollDuration <= 0 {
+            return MyGoMarqueeSample(offsetX: 0, leftFadeWidth: 0, rightFadeWidth: 14)
+        }
+        let progress = min(1.0, max(0.0, (phase - initialPause) / scrollDuration))
+        let offsetX = -CGFloat(progress) * cycleDistance
+        let moved = -offsetX
+        let remaining = max(0, cycleDistance - moved)
+        let leftFade = min(12, min(moved, remaining))
+        return MyGoMarqueeSample(offsetX: offsetX, leftFadeWidth: leftFade, rightFadeWidth: 14)
+    }
+}
+
+private struct MyGoMarqueeWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let next = nextValue()
+        if next > 0 { value = next }
+    }
+}
+
+/// 仅当文本单行实际渲染宽度超过可用容器宽度时，自动停顿后匀速向左滚动并叠加两侧柔化遮罩。
+public struct MyGoMarqueeText: View {
+    public let text: String
+    public var font: Font
+    public var foregroundStyle: Color
+    public var speed: CGFloat
+    public var initialPause: TimeInterval
+    public var gap: CGFloat
+    public var isActive: Bool
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.mygoIsViewVisible) private var isViewVisible
+    @Environment(\.scenePhase) private var scenePhase
+
+    @State private var measuredTextWidth: CGFloat = 0
+    @State private var cycleStartDate: Date = .now
+
+    public init(
+        _ text: String,
+        font: Font = .body,
+        foregroundStyle: Color = .primary,
+        speed: CGFloat = 30.0,
+        initialPause: TimeInterval = 2.0,
+        gap: CGFloat = 44.0,
+        isActive: Bool = true
+    ) {
+        self.text = text
+        self.font = font
+        self.foregroundStyle = foregroundStyle
+        self.speed = speed
+        self.initialPause = initialPause
+        self.gap = gap
+        self.isActive = isActive
+    }
+
+    public var body: some View {
+        Text(text)
+            .font(font)
+            .lineLimit(1)
+            .opacity(0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .leading) {
+                GeometryReader { geo in
+                    let containerWidth = geo.size.width
+                    let overflows = measuredTextWidth > containerWidth + 1.5 && containerWidth > 24
+                    let shouldAnimate = overflows && isActive && isViewVisible && scenePhase == .active && !reduceMotion
+
+                    ZStack(alignment: .leading) {
+                        // 隐式单行测量，确保精确获取文本渲染宽度
+                        Text(text)
+                            .font(font)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .hidden()
+                            .background(
+                                GeometryReader { textGeo in
+                                    Color.clear.preference(key: MyGoMarqueeWidthPreferenceKey.self, value: textGeo.size.width)
+                                }
+                            )
+
+                        if !overflows || reduceMotion {
+                            Text(text)
+                                .font(font)
+                                .foregroundStyle(foregroundStyle)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .frame(width: containerWidth, alignment: .leading)
+                        } else {
+                            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !shouldAnimate)) { timeline in
+                                let sample = shouldAnimate
+                                    ? MyGoMarqueeMath.sample(
+                                        elapsed: timeline.date.timeIntervalSince(cycleStartDate),
+                                        contentWidth: measuredTextWidth,
+                                        containerWidth: containerWidth,
+                                        speed: speed,
+                                        initialPause: initialPause,
+                                        gap: gap
+                                    )
+                                    : MyGoMarqueeSample(offsetX: 0, leftFadeWidth: 0, rightFadeWidth: 14)
+
+                                HStack(spacing: gap) {
+                                    Text(text)
+                                        .font(font)
+                                        .foregroundStyle(foregroundStyle)
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+
+                                    Text(text)
+                                        .font(font)
+                                        .foregroundStyle(foregroundStyle)
+                                        .lineLimit(1)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                }
+                                .offset(x: sample.offsetX)
+                                .frame(width: containerWidth, alignment: .leading)
+                                .clipped()
+                                .mask {
+                                    edgeFadeMask(
+                                        width: containerWidth,
+                                        leftFade: sample.leftFadeWidth,
+                                        rightFade: sample.rightFadeWidth
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    .frame(width: containerWidth, height: geo.size.height, alignment: .leading)
+                }
+            }
+            .allowsHitTesting(false)
+            .onPreferenceChange(MyGoMarqueeWidthPreferenceKey.self) { width in
+                if abs(width - measuredTextWidth) > 0.5 {
+                    measuredTextWidth = width
+                    cycleStartDate = .now
+                }
+            }
+            .onChange(of: text) { _, _ in
+                cycleStartDate = .now
+            }
+            .onChange(of: isActive) { _, active in
+                if active {
+                    cycleStartDate = .now
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func edgeFadeMask(width: CGFloat, leftFade: CGFloat, rightFade: CGFloat) -> some View {
+        let safeWidth = max(width, 1)
+        let leftStop = min(0.25, max(0, leftFade / safeWidth))
+        let rightStop = max(0.75, min(1.0, 1.0 - rightFade / safeWidth))
+        LinearGradient(
+            stops: [
+                .init(color: leftStop > 0.002 ? .clear : .black, location: 0),
+                .init(color: .black, location: leftStop),
+                .init(color: .black, location: rightStop),
+                .init(color: .clear, location: 1.0)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
     }
 }

@@ -429,6 +429,7 @@ private final class PluginHTTPClient: NSObject, URLSessionTaskDelegate, @uncheck
         cfg.httpCookieStorage = nil
         cfg.timeoutIntervalForRequest = 15
         cfg.timeoutIntervalForResource = 60
+        cfg.waitsForConnectivity = true
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }()
@@ -1799,6 +1800,8 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
 
     private let lock = NSLock()
     private let jsQueue = DispatchQueue(label: "com.mygomusic.plugin.js")
+    private let storageIOQueue = DispatchQueue(label: "com.mygomusic.plugin.storage.io", qos: .utility)
+    private var pendingStorageWriteWorkItem: DispatchWorkItem?
     private let timerCenter = PluginTimerCenter()
     private let httpClient = PluginHTTPClient()
     private let startTimeNs = DispatchTime.now().uptimeNanoseconds
@@ -1876,6 +1879,7 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
     }
 
     deinit {
+        flushStorageSync()
         timerCenter.cancelAll()
         httpClient.invalidate()
     }
@@ -1940,13 +1944,49 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
         try data.write(to: target, options: .atomic)
     }
 
-    private func saveAnyJSON(_ obj: Any, fileName: String) throws {
-        guard let data = Self.encodeAnyJSON(obj, pretty: true) else {
+    private func saveAnyJSON(_ obj: Any, fileName: String, pretty: Bool = false) throws {
+        guard let data = Self.encodeAnyJSON(obj, pretty: pretty) else {
             throw SourceError.message("Invalid JSON payload for \(fileName)")
         }
         try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
         let target = dataDir.appendingPathComponent(fileName)
         try data.write(to: target, options: .atomic)
+    }
+
+    /// 安排异步防抖持久化插件 storage.json（避免批量写入 fileids 时在串行 jsQueue 上阻塞流调度）
+    private func scheduleStoragePersistenceLocked() {
+        pendingStorageWriteWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.writeStorageSnapshotToDisk()
+        }
+        pendingStorageWriteWorkItem = work
+        storageIOQueue.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func writeStorageSnapshotToDisk() {
+        lock.lock()
+        let snapshot = storageMap
+        lock.unlock()
+        try? saveAnyJSON(snapshot, fileName: "storage.json", pretty: false)
+    }
+
+    /// 立即将内存中待落盘的插件 storage 同步写入磁盘
+    public func flushStorage() {
+        flushStorageSync()
+    }
+
+    private func flushStorageSync() {
+        lock.lock()
+        let hadPending = pendingStorageWriteWorkItem != nil
+        pendingStorageWriteWorkItem?.cancel()
+        pendingStorageWriteWorkItem = nil
+        let snapshot = storageMap
+        lock.unlock()
+        if hadPending {
+            storageIOQueue.sync {
+                try? saveAnyJSON(snapshot, fileName: "storage.json", pretty: false)
+            }
+        }
     }
 
     /// 插件内置翻译查找（对应 Plugin.t，兼容精确语言码与前缀匹配）
@@ -2940,14 +2980,14 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
             self.lock.lock()
             defer { self.lock.unlock() }
             self.storageMap[key] = obj
-            try? self.saveAnyJSON(self.storageMap, fileName: "storage.json")
+            self.scheduleStoragePersistenceLocked()
         }
         let storageRemove: @convention(block) (String) -> Void = { [weak self] key in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
             self.storageMap.removeValue(forKey: key)
-            try? self.saveAnyJSON(self.storageMap, fileName: "storage.json")
+            self.scheduleStoragePersistenceLocked()
         }
         storageObj.setObject(storageGet, forKeyedSubscript: "get" as NSString)
         storageObj.setObject(storageSet, forKeyedSubscript: "set" as NSString)
@@ -3475,6 +3515,7 @@ public final class JSPluginSource: MusicSource, @unchecked Sendable {
 
     public func signOut() async throws {
         _ = try await callJSJSON("signOut")
+        flushStorageSync()
     }
 
     public func account() async throws -> Account? {

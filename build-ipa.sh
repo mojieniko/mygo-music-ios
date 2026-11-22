@@ -7,10 +7,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PRIMARY_ICON_NAME="AppIcon"
+ALTERNATE_ICON_NAME="AppIconAppleMusic"
+DISPLAY_NAME="MyGo Music"
+IPA_FILENAME="MyGoMusic.ipa"
+
+for arg in "$@"; do
+    case "$arg" in
+        --apple-music-icon)
+            PRIMARY_ICON_NAME="AppIconAppleMusic"
+            ALTERNATE_ICON_NAME="AppIcon"
+            DISPLAY_NAME="Apple Music"
+            IPA_FILENAME="Apple Music.ipa"
+            ;;
+    esac
+done
+
 BUILD_DIR="${SCRIPT_DIR}/.build-ipa"
 PAYLOAD_DIR="${BUILD_DIR}/Payload"
 APP_BUNDLE="${PAYLOAD_DIR}/MyGoMusic.app"
-IPA_OUT="${SCRIPT_DIR}/MyGoMusic.ipa"
+IPA_OUT="${SCRIPT_DIR}/${IPA_FILENAME}"
 TARGET_TRIPLE="${IOS_TARGET_TRIPLE:-arm64-apple-ios17.0}"
 
 echo "==> [1/4] 检查 iOS SDK 环境..."
@@ -81,18 +97,62 @@ sed \
 
 printf "APPL????" > "${APP_BUNDLE}/PkgInfo"
 
-# 编译 AppIcon 资源目录（Assets.xcassets -> Assets.car + AppIcon*.png）
+# 编译 AppIcon 与备用桌面图标资源目录（Assets.xcassets -> Assets.car + 主图标 PNG）
 if [ -d "${SCRIPT_DIR}/App/Assets.xcassets" ]; then
     xcrun actool "${SCRIPT_DIR}/App/Assets.xcassets" \
         --compile "${APP_BUNDLE}" \
         --platform iphoneos \
         --minimum-deployment-target 17.0 \
-        --app-icon AppIcon \
+        --app-icon "${PRIMARY_ICON_NAME}" \
+        --alternate-app-icon "${ALTERNATE_ICON_NAME}" \
         --output-partial-info-plist "${BUILD_DIR}/assetcatalog_generated_info.plist" >/dev/null 2>&1 || true
-    if [ -f "${BUILD_DIR}/assetcatalog_generated_info.plist" ]; then
-        /usr/libexec/PlistBuddy -c "Merge ${BUILD_DIR}/assetcatalog_generated_info.plist" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
-    fi
 fi
+
+python3 - "${APP_BUNDLE}/Info.plist" "${BUILD_DIR}/assetcatalog_generated_info.plist" "${PRIMARY_ICON_NAME}" "${ALTERNATE_ICON_NAME}" "${DISPLAY_NAME}" << 'PY_EOF'
+import os, plistlib, sys
+
+plist_path = sys.argv[1]
+partial_path = sys.argv[2]
+primary_icon = sys.argv[3]
+alternate_icon = sys.argv[4]
+display_name = sys.argv[5]
+
+with open(plist_path, "rb") as f:
+    data = plistlib.load(f)
+
+data["CFBundleDisplayName"] = display_name
+data["CFBundleName"] = display_name
+data["CFBundleIconName"] = primary_icon
+
+if os.path.exists(partial_path):
+    with open(partial_path, "rb") as pf:
+        partial = plistlib.load(pf)
+    for key in ("CFBundleIcons", "CFBundleIcons~ipad"):
+        if key in partial:
+            data[key] = partial[key]
+
+alt = {
+    alternate_icon: {
+        "CFBundleIconName": alternate_icon
+    }
+}
+
+for key, default_files in (
+    ("CFBundleIcons", [f"{primary_icon}60x60"]),
+    ("CFBundleIcons~ipad", [f"{primary_icon}60x60", f"{primary_icon}76x76"]),
+):
+    sec = dict(data.get(key) or {})
+    if "CFBundlePrimaryIcon" not in sec:
+        sec["CFBundlePrimaryIcon"] = {
+            "CFBundleIconFiles": default_files,
+            "CFBundleIconName": primary_icon,
+        }
+    sec["CFBundleAlternateIcons"] = alt
+    data[key] = sec
+
+with open(plist_path, "wb") as f:
+    plistlib.dump(data, f)
+PY_EOF
 
 # 进行 Ad-hoc 签名（便于爱思助手/AltStore/Sideloadly 重签或 TrollStore 直接安装）
 codesign --force --deep --sign - "${APP_BUNDLE}"

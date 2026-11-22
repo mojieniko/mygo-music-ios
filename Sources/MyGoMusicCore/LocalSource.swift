@@ -49,6 +49,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     private var orderedAlbums: [Album] = []
     private var artistsByID: [String: ArtistPage] = [:]
     private var orderedArtists: [Artist] = []
+    private var offlineDownloadsMap: [String: String] = [:]
     private var isScanningFlag = false
     private var scanGeneration: Int = 0
     private var activeScanTask: Task<Void, Never>?
@@ -85,6 +86,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
             saveLibraryLocked()
             lock.unlock()
         }
+        loadOfflineDownloadsMap()
         if eagerSyncScan {
             rebuildCatalogSynchronously()
         } else {
@@ -195,6 +197,185 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         }
         if importedCount > 0 { rescan() }
         return importedCount
+    }
+
+    // MARK: - 主动离线下载持久化与本地曲库联动
+
+    private func loadOfflineDownloadsMap() {
+        let mapURL = dataDir.appendingPathComponent("offline_downloads.json")
+        guard let data = try? Data(contentsOf: mapURL),
+              let raw = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return
+        }
+        let fm = FileManager.default
+        var cleaned: [String: String] = [:]
+        var changed = false
+        for (key, rawPath) in raw {
+            let relocated = Self.relocateSandboxPath(rawPath, to: dataDir)
+            if fm.fileExists(atPath: relocated) {
+                cleaned[key] = relocated
+                if relocated != rawPath { changed = true }
+            } else {
+                changed = true
+            }
+        }
+        withLock {
+            self.offlineDownloadsMap = cleaned
+            if changed {
+                saveOfflineDownloadsLocked()
+            }
+        }
+    }
+
+    private func saveOfflineDownloadsLocked() {
+        let mapURL = dataDir.appendingPathComponent("offline_downloads.json")
+        if let data = try? JSONEncoder().encode(offlineDownloadsMap) {
+            try? data.write(to: mapURL, options: .atomic)
+        }
+    }
+
+    /// 返回当前所有已永久离线保存的原曲目 compositeKey 集合
+    public func downloadedCompositeKeys() -> Set<String> {
+        withLock {
+            let fm = FileManager.default
+            var keys = Set<String>()
+            for (key, path) in offlineDownloadsMap where fm.fileExists(atPath: path) {
+                keys.insert(key)
+            }
+            return keys
+        }
+    }
+
+    /// 查询指定曲目（支持在线源 compositeKey 或本地曲目）是否已离线下载落盘
+    public func isTrackDownloaded(compositeKey: String) -> Bool {
+        localFileURLForDownloadedTrack(compositeKey: compositeKey) != nil
+    }
+
+    /// 获取已离线下载曲目的本地音频文件 URL
+    public func localFileURLForDownloadedTrack(compositeKey: String) -> URL? {
+        withLock {
+            guard let path = offlineDownloadsMap[compositeKey],
+                  FileManager.default.fileExists(atPath: path) else {
+                return nil
+            }
+            return URL(fileURLWithPath: path)
+        }
+    }
+
+    /// 将下载好的在线音轨、LRC 歌词与高清封面永久存入本地曲库目录，并预写入精确元数据索引
+    @discardableResult
+    public func storeDownloadedTrack(
+        track: Track,
+        tempAudioURL: URL,
+        fileExtension: String,
+        lrcText: String?,
+        coverData: Data?
+    ) throws -> URL {
+        let fm = FileManager.default
+        try fm.createDirectory(at: defaultMusicFolder, withIntermediateDirectories: true)
+
+        let rawExt = fileExtension.trimmingCharacters(in: CharacterSet(charactersIn: ". ")).lowercased()
+        let cleanExt = Self.supportedExtensions.contains(rawExt) ? rawExt : "mp3"
+        let baseTitle = Self.sanitizedDownloadFileName(
+            artist: track.artistNames,
+            title: track.name
+        )
+        let destURL = uniqueImportURL(for: "\(baseTitle).\(cleanExt)")
+        let stagingURL = defaultMusicFolder.appendingPathComponent(".dl-\(UUID().uuidString)")
+        do {
+            try fm.copyItem(at: tempAudioURL, to: stagingURL)
+            try fm.moveItem(at: stagingURL, to: destURL)
+        } catch {
+            try? fm.removeItem(at: stagingURL)
+            throw error
+        }
+
+        if let lrcText, !lrcText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let lrcURL = destURL.deletingPathExtension().appendingPathExtension("lrc")
+            try? Data(lrcText.utf8).write(to: lrcURL, options: .atomic)
+        }
+
+        let canonicalPath = destURL.standardizedFileURL.path
+        var savedCoverURL: String? = nil
+        if let coverData, !coverData.isEmpty {
+            let coversDir = dataDir.appendingPathComponent("covers", isDirectory: true)
+            try? fm.createDirectory(at: coversDir, withIntermediateDirectories: true)
+            let hash = PluginCrypto.md5Hex(canonicalPath)
+            let coverFile = coversDir.appendingPathComponent("\(hash).jpg")
+            try? coverData.write(to: coverFile, options: .atomic)
+            savedCoverURL = coverFile.absoluteString
+        }
+
+        let vals = try? destURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let mtime = vals?.contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
+        let fsize = Int64(vals?.fileSize ?? 0)
+
+        let localArtists = track.artists?.isEmpty == false ? track.artists : nil
+        let localAlbum = Album(
+            id: "album:" + (track.album.name.isEmpty ? "offline" : track.album.name.lowercased()),
+            name: track.album.name.isEmpty ? I18n.t("Offline Downloads") : track.album.name,
+            imageUrl: savedCoverURL ?? track.album.imageUrl,
+            artists: localArtists
+        )
+        let storedTrack = Track(
+            id: canonicalPath,
+            source: Self.sourceID,
+            name: track.name,
+            artists: localArtists,
+            album: localAlbum,
+            duration: track.duration
+        )
+
+        withLock {
+            // 若此前存在同 key 的旧离线文件，先替换登记
+            offlineDownloadsMap[track.compositeKey] = canonicalPath
+            saveOfflineDownloadsLocked()
+
+            var cache = loadMetadataCache()
+            cache[canonicalPath] = CachedMetadataEntry(
+                modTime: mtime,
+                fileSize: fsize,
+                track: storedTrack
+            )
+            saveMetadataCache(cache)
+        }
+
+        rescan()
+        return destURL
+    }
+
+    /// 移除指定曲目的离线下载本地文件及元数据记录
+    public func removeDownloadedTrack(compositeKey: String) {
+        let removedPath: String? = withLock {
+            guard let path = offlineDownloadsMap.removeValue(forKey: compositeKey) else {
+                return nil
+            }
+            saveOfflineDownloadsLocked()
+            return path
+        }
+        guard let removedPath else { return }
+
+        let fm = FileManager.default
+        let audioURL = URL(fileURLWithPath: removedPath)
+        let lrcURL = audioURL.deletingPathExtension().appendingPathExtension("lrc")
+        try? fm.removeItem(at: audioURL)
+        try? fm.removeItem(at: lrcURL)
+
+        withLock {
+            var cache = loadMetadataCache()
+            cache.removeValue(forKey: removedPath)
+            saveMetadataCache(cache)
+        }
+        rescan()
+    }
+
+    private static func sanitizedDownloadFileName(artist: String, title: String) -> String {
+        let raw = artist.isEmpty ? title : "\(artist) - \(title)"
+        let invalid = CharacterSet(charactersIn: "/\\:*?\"<>|\r\n\t")
+        let parts = raw.components(separatedBy: invalid)
+        let cleaned = parts.joined(separator: "_").trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty { return "Track" }
+        return String(cleaned.prefix(96))
     }
 
     private func uniqueImportURL(for filename: String) -> URL {

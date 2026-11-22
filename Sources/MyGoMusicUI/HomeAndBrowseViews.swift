@@ -90,9 +90,7 @@ public struct HomeView: View {
     public var body: some View {
         NavigationStack(path: $navPath) {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 26) {
-                    headerGreetingSection
-
+                LazyVStack(alignment: .leading, spacing: 24) {
                     if app.isLoadingHome && app.homeBrowse == nil && app.recentTracks.isEmpty {
                         ProgressView(I18n.t("Loading…"))
                             .frame(maxWidth: .infinity, minHeight: 220)
@@ -119,22 +117,26 @@ public struct HomeView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     SourceSwitcherMenu()
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    HomeSettingsToolbarButton(
-                        badgeCount: app.availablePluginUpdateCount
-                    ) {
-                        openSettingsIfNeeded()
+                if let account = app.currentAccount {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        HomeAccountToolbarPill(account: account) {
+                            if let page = account.page, !page.isEmpty {
+                                navPath.append(NavigationTarget.browse(page: page, title: I18n.t("My Page")))
+                            }
+                        }
                     }
                 }
                 #else
                 ToolbarItem(placement: .navigation) {
                     SourceSwitcherMenu()
                 }
-                ToolbarItem(placement: .primaryAction) {
-                    HomeSettingsToolbarButton(
-                        badgeCount: app.availablePluginUpdateCount
-                    ) {
-                        openSettingsIfNeeded()
+                if let account = app.currentAccount {
+                    ToolbarItem(placement: .primaryAction) {
+                        HomeAccountToolbarPill(account: account) {
+                            if let page = account.page, !page.isEmpty {
+                                navPath.append(NavigationTarget.browse(page: page, title: I18n.t("My Page")))
+                            }
+                        }
                     }
                 }
                 #endif
@@ -145,8 +147,23 @@ public struct HomeView: View {
             .navigationDestination(for: NavigationTarget.self) { target in
                 destinationView(for: target)
             }
-            .onReceive(NotificationCenter.default.publisher(for: .mygoOpenSettings)) { _ in
-                openSettingsIfNeeded()
+            .onReceive(NotificationCenter.default.publisher(for: .mygoOpenHomeTarget)) { note in
+                if let target = note.object as? NavigationTarget {
+                    navPath.append(target)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .mygoOpenHomeDaily)) { _ in
+                if let firstSection = app.homeBrowse?.sections?.first(where: { !($0.tracks ?? []).isEmpty }) {
+                    if let morePage = firstSection.morePage, !morePage.isEmpty {
+                        navPath.append(NavigationTarget.browse(page: morePage, title: firstSection.title))
+                    } else if let tracks = firstSection.tracks {
+                        navPath.append(NavigationTarget.sectionTracks(
+                            title: firstSection.title ?? I18n.t("Daily Mix"),
+                            subtitle: firstSection.subtitle,
+                            tracks: tracks
+                        ))
+                    }
+                }
             }
             .environment(\.mygoNavigate) { target in
                 navPath.append(target)
@@ -154,69 +171,8 @@ public struct HomeView: View {
         }
     }
 
-    private var headerGreetingSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(I18n.today())
-                .font(.system(size: 12.5, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
-            HStack(alignment: .center) {
-                // 左侧保持纯粹干练的大标题问候，不再与右侧用户名重复拼接，空间豁然开朗
-                Text(I18n.greeting())
-                    .font(.system(size: 28, weight: .bold))
-
-                Spacer(minLength: 16)
-
-                // 右侧展示精致账户胶囊（头像 + 姓名 + 箭头引导）
-                if let acc = app.currentAccount {
-                    Button {
-                        if let page = acc.page, !page.isEmpty {
-                            navPath.append(NavigationTarget.browse(page: page, title: I18n.t("My Page")))
-                        }
-                    } label: {
-                        HStack(spacing: 7) {
-                            if let img = acc.imageUrl, !img.isEmpty {
-                                ArtworkView(
-                                    urlString: img,
-                                    pixelSize: 120,
-                                    size: 26,
-                                    cornerRadius: 13,
-                                    systemIcon: "person.crop.circle.fill"
-                                )
-                            } else {
-                                Image(systemName: "person.crop.circle.fill")
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(width: 26, height: 26)
-                                    .foregroundStyle(MyGoTheme.accent)
-                            }
-                            Text(acc.name)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundStyle(.secondary.opacity(0.6))
-                        }
-                        .padding(.leading, 4)
-                        .padding(.trailing, 9)
-                        .padding(.vertical, 4)
-                        .background(MyGoTheme.elevatedSurface, in: Capsule())
-                        .overlay(
-                            Capsule().strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.7)
-                        )
-                        .shadow(color: .black.opacity(0.06), radius: 4, x: 0, y: 2)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-    }
-
     private var fallbackHomeSections: some View {
-        LazyVStack(alignment: .leading, spacing: 24) {
+        VStack(alignment: .leading, spacing: 24) {
             if !app.recentTracks.isEmpty {
                 let recentSection = MusicSection(
                     title: I18n.t("Recently Played"),
@@ -362,12 +318,6 @@ public struct HomeView: View {
     private func destinationView(for target: NavigationTarget) -> some View {
         Self.buildDestination(for: target)
     }
-
-    private func openSettingsIfNeeded() {
-        if navPath.last != .settings {
-            navPath.append(.settings)
-        }
-    }
 }
 
 // MARK: - 音源切换下拉菜单（对应 sourceSwitcher）
@@ -425,40 +375,49 @@ public struct SourceSwitcherMenu: View {
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .mygoPillSurface()
+            .padding(.horizontal, 4)
         }
     }
 }
 
-/// 首页导航栏右上角设置入口按钮（与左上角音源切换药丸保持统一高度与表面材质，支持插件更新红点）
-private struct HomeSettingsToolbarButton: View {
-    let badgeCount: Int
+/// 首页导航栏右上角账户按钮（紧致贴合头像与用户名，直承 iOS 26 系统工具栏玻璃外框，杜绝双层套娃与多余留白）
+private struct HomeAccountToolbarPill: View {
+    let account: Account
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: "gearshape")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.primary)
-                .frame(width: 30, height: 30)
-                .mygoCircleSurface()
-                .overlay(alignment: .topTrailing) {
-                    if badgeCount > 0 {
-                        Circle()
-                            .fill(MyGoTheme.accent)
-                            .frame(width: 8, height: 8)
-                            .overlay(
-                                Circle()
-                                    .stroke(Color.black.opacity(0.28), lineWidth: 0.8)
-                            )
-                            .offset(x: 1, y: -1)
-                    }
+            HStack(spacing: 6) {
+                if let img = account.imageUrl, !img.isEmpty {
+                    ArtworkView(
+                        urlString: img,
+                        pixelSize: 120,
+                        size: 24,
+                        cornerRadius: 12,
+                        systemIcon: "person.crop.circle.fill"
+                    )
+                } else {
+                    Image(systemName: "person.crop.circle.fill")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 24, height: 24)
+                        .foregroundStyle(MyGoTheme.accent)
                 }
+                Text(account.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                if let page = account.page, !page.isEmpty {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(.secondary.opacity(0.65))
+                }
+            }
+            .padding(.horizontal, 4)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(I18n.t("Settings"))
+        .accessibilityLabel(account.name)
     }
 }
 
@@ -481,7 +440,7 @@ public struct BrowseSectionsStack: View {
 
         ForEach(Array(sections.enumerated()), id: \.offset) { idx, section in
             let isLeadFeature = idx == firstTrackSectionIndex && !(section.tracks ?? []).isEmpty
-            LazyVStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
                 // 首页第一个歌曲分区展示为 3 封面错落黑胶 Hero 卡片（对应 ui_daily.go）
                 if isLeadFeature {
                     HomeSectionFeatureCard(section: section, onNavigate: onNavigate)
@@ -756,6 +715,106 @@ public struct BrowsePageView: View {
     }
 }
 
+/// 详情页顶部滚动收起后在导航栏右上角浮现的快捷播放胶囊（#7）
+private struct CollapsedToolbarPlayButtons: View {
+    @EnvironmentObject private var app: AppModel
+    let tracks: [Track]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button {
+                MyGoHaptics.impact(.light)
+                app.player.playQueue(tracks, start: 0)
+            } label: {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(MyGoTheme.accent, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(I18n.t("Play"))
+
+            Button {
+                MyGoHaptics.impact(.light)
+                app.player.playShuffled(tracks)
+            } label: {
+                Image(systemName: "shuffle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 28, height: 28)
+                    .mygoCircleSurface()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(I18n.t("Shuffle"))
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+    }
+}
+
+/// 详情页操作按钮条：全部离线下载与批量多选开关（支持工具栏紧致尺寸与常规尺寸）
+private struct DetailDownloadAndSelectButtons: View {
+    @EnvironmentObject private var app: AppModel
+    let tracks: [Track]
+    @Binding var isSelecting: Bool
+    var compact: Bool = false
+    var onBeforeEnableSelect: (() -> Void)? = nil
+
+    private var playableTracks: [Track] {
+        tracks.filter { $0.unavailable != true }
+    }
+
+    private var allDownloaded: Bool {
+        !playableTracks.isEmpty && playableTracks.allSatisfy { app.isTrackDownloaded($0) }
+    }
+
+    var body: some View {
+        let size: CGFloat = compact ? 30 : 34
+        let iconSize: CGFloat = compact ? 13 : 14
+        HStack(spacing: compact ? 6 : 8) {
+            Button {
+                guard !playableTracks.isEmpty else { return }
+                MyGoHaptics.impact(.medium)
+                Task { await app.downloadTracksForOffline(playableTracks) }
+            } label: {
+                Image(systemName: allDownloaded ? "checkmark.circle.fill" : "arrow.down.circle")
+                    .font(.system(size: iconSize, weight: .semibold))
+                    .foregroundStyle(allDownloaded ? MyGoTheme.accent : .primary)
+                    .frame(width: size, height: size)
+                    .mygoCircleSurface()
+            }
+            .buttonStyle(.plain)
+            .disabled(playableTracks.isEmpty)
+            .accessibilityLabel(I18n.t("Download All"))
+
+            Button {
+                MyGoHaptics.impact(.light)
+                if !isSelecting {
+                    onBeforeEnableSelect?()
+                }
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isSelecting.toggle()
+                }
+            } label: {
+                Image(systemName: isSelecting ? "checkmark.circle.fill" : "checklist")
+                    .font(.system(size: iconSize - 0.5, weight: .semibold))
+                    .foregroundStyle(isSelecting ? .white : .primary)
+                    .frame(width: size, height: size)
+                    .background {
+                        if isSelecting {
+                            Circle().fill(MyGoTheme.accent)
+                        } else {
+                            Circle().fill(Color.clear).mygoCircleSurface()
+                        }
+                    }
+            }
+            .buttonStyle(.plain)
+            .disabled(tracks.isEmpty)
+            .accessibilityLabel(I18n.t("Select"))
+        }
+    }
+}
+
 public struct SectionTracksPageView: View {
     @EnvironmentObject private var app: AppModel
     public let title: String
@@ -765,43 +824,30 @@ public struct SectionTracksPageView: View {
     public var isLoadingMore: Bool = false
     public var onLoadMore: (() async -> Void)? = nil
 
+    @State private var isSelecting = false
+    @State private var isHeaderCollapsed = false
+
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 12) {
-                    Button {
-                        app.player.playQueue(tracks, start: 0)
-                    } label: {
-                        Label(I18n.t("Play"), systemImage: "play.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
-                            .background(MyGoTheme.accent, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(spacing: 16) {
+                    ParallaxDetailHeaderView(
+                        title: title,
+                        subtitle: subtitle ?? I18n.songs(tracks.count),
+                        artworkURL: tracks.first?.album.imageUrl,
+                        artworkSize: 210,
+                        isCollapsed: $isHeaderCollapsed
+                    )
+                    .padding(.top, 8)
 
-                    Button {
-                        app.player.playShuffled(tracks)
-                    } label: {
-                        Label(I18n.t("Shuffle"), systemImage: "shuffle")
-                            .font(.system(size: 14, weight: .semibold))
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
-                            .mygoPillSurface()
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-
-                if let subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
+                    AppleMusicPlayShuffleBar(
+                        hasTracks: !tracks.isEmpty,
+                        onPlay: { app.player.playQueue(tracks, start: 0) },
+                        onShuffle: { app.player.playShuffled(tracks) }
+                    )
                 }
 
-                LazyTrackRowsView(tracks: tracks) { list, idx in
+                LazyTrackRowsView(tracks: tracks, isSelecting: $isSelecting) { list, idx in
                     app.player.playTrack(list, at: idx)
                 }
 
@@ -811,16 +857,31 @@ public struct SectionTracksPageView: View {
                     }
                 }
             }
-            .padding(.vertical, 12)
+            .padding(.bottom, 20)
         }
+        .coordinateSpace(name: MyGoDetailScrollSpace.name)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
-        .navigationTitle(title)
+        .navigationTitle(isHeaderCollapsed ? title : "")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .toolbar {
+            ToolbarItemGroup(placement: .automatic) {
+                if isHeaderCollapsed && !tracks.isEmpty {
+                    CollapsedToolbarPlayButtons(tracks: tracks)
+                }
+                if !tracks.isEmpty {
+                    DetailDownloadAndSelectButtons(tracks: tracks, isSelecting: $isSelecting, compact: true)
+                }
+            }
+        }
     }
 }
 
 public struct AlbumDetailView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.mygoNavigate) private var navigate
     public let albumID: String
     public let fallbackName: String
     public let sourceID: String?
@@ -829,6 +890,8 @@ public struct AlbumDetailView: View {
     @State private var resolvedSourceID: String? = nil
     @State private var isLoading = true
     @State private var isSaved = false
+    @State private var isSelecting = false
+    @State private var isHeaderCollapsed = false
 
     public init(albumID: String, fallbackName: String, sourceID: String? = nil) {
         self.albumID = albumID
@@ -839,87 +902,90 @@ public struct AlbumDetailView: View {
     public var body: some View {
         let targetSourceID = resolvedSourceID ?? sourceID ?? app.activeSourceID
         let targetSource = app.source(forID: targetSourceID) ?? app.activeSource
+        let tracks = albumPage?.tracks ?? []
+        let albumTitle = albumPage?.album.name ?? fallbackName
+
         ScrollView {
             if isLoading {
                 ProgressView()
                     .frame(maxWidth: .infinity, minHeight: 240)
             } else if let page = albumPage {
-                let tracks = page.tracks ?? []
-                LazyVStack(spacing: 20) {
-                    VStack(spacing: 12) {
-                        ArtworkView(
-                            urlString: page.album.imageUrl,
-                            pixelSize: 600,
-                            size: 200,
-                            cornerRadius: 16,
-                            systemIcon: "opticaldisc"
-                        )
-                        .background(
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .fill(MyGoTheme.placeholderFill)
-                                .shadow(color: .black.opacity(0.24), radius: 16, x: 0, y: 8)
-                        )
-
-                        Text(page.album.name)
-                            .font(.system(size: 22, weight: .bold))
-                            .multilineTextAlignment(.center)
-
-                        Text([page.album.artistNames, page.album.released].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
-                            .font(.system(size: 13.5))
-                            .foregroundStyle(.secondary)
-
-                        HStack(spacing: 10) {
-                            Button {
-                                app.player.playQueue(tracks, start: 0)
-                            } label: {
-                                Label(I18n.t("Play"), systemImage: "play.fill")
-                                    .font(.system(size: 14, weight: .bold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 20)
-                                    .padding(.vertical, 10)
-                                    .background(MyGoTheme.accent, in: Capsule())
-                            }
-                            .buttonStyle(.plain)
-
-                            Button {
-                                app.player.playShuffled(tracks)
-                            } label: {
-                                Label(I18n.t("Shuffle"), systemImage: "shuffle")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .padding(.horizontal, 20)
-                                    .padding(.vertical, 10)
-                                    .mygoPillSurface()
-                            }
-                            .buttonStyle(.plain)
-
-                            if targetSource.can("saveAlbum") {
-                                Button {
-                                    Task {
-                                        isSaved = await app.toggleSaveAlbum(sourceID: targetSourceID, albumID: albumID, currentlySaved: isSaved)
-                                    }
-                                } label: {
-                                    Image(systemName: isSaved ? "heart.fill" : "heart")
-                                        .font(.system(size: 15, weight: .semibold))
-                                        .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
-                                        .frame(width: 40, height: 40)
-                                        .mygoCircleSurface()
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel(I18n.t(isSaved ? "Saved" : "Save Album"))
-                            }
-                        }
+                let metaLine: String = {
+                    var parts: [String] = []
+                    if let rel = page.album.released, !rel.isEmpty {
+                        parts.append(rel)
                     }
-                    .padding(.top, 12)
+                    if !tracks.isEmpty {
+                        parts.append(I18n.songs(tracks.count))
+                    }
+                    return parts.joined(separator: " · ")
+                }()
+                let primaryArtist = page.album.artists?.first(where: { !$0.id.isEmpty })
 
-                    LazyTrackRowsView(tracks: tracks) { list, idx in
+                LazyVStack(spacing: 18) {
+                    VStack(spacing: 16) {
+                        ParallaxDetailHeaderView(
+                            title: page.album.name,
+                            subtitle: metaLine,
+                            accentSubtitle: page.album.artistNames,
+                            artworkURL: page.album.imageUrl,
+                            artworkSize: 236,
+                            onAccentSubtitleTap: primaryArtist.map { artist in
+                                {
+                                    navigate(.artist(id: artist.id, name: artist.name, sourceID: targetSourceID))
+                                }
+                            },
+                            isCollapsed: $isHeaderCollapsed
+                        )
+                        .padding(.top, 10)
+
+                        AppleMusicPlayShuffleBar(
+                            hasTracks: !tracks.isEmpty,
+                            onPlay: { app.player.playQueue(tracks, start: 0) },
+                            onShuffle: { app.player.playShuffled(tracks) }
+                        )
+                    }
+
+                    LazyTrackRowsView(tracks: tracks, isSelecting: $isSelecting) { list, idx in
                         app.player.playTrack(list, at: idx)
                     }
                 }
+                .padding(.bottom, 20)
             }
         }
+        .coordinateSpace(name: MyGoDetailScrollSpace.name)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
-        .navigationTitle(albumPage?.album.name ?? fallbackName)
+        .navigationTitle(isHeaderCollapsed ? albumTitle : "")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .toolbar {
+            ToolbarItemGroup(placement: .automatic) {
+                if isHeaderCollapsed && !tracks.isEmpty {
+                    CollapsedToolbarPlayButtons(tracks: tracks)
+                }
+                if targetSource.can("saveAlbum") && albumPage != nil {
+                    Button {
+                        MyGoHaptics.impact(isSaved ? .light : .medium)
+                        Task {
+                            isSaved = await app.toggleSaveAlbum(sourceID: targetSourceID, albumID: albumID, currentlySaved: isSaved)
+                        }
+                    } label: {
+                        Image(systemName: isSaved ? "heart.fill" : "heart")
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
+                            .frame(width: 30, height: 30)
+                            .mygoCircleSurface()
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(I18n.t(isSaved ? "Saved" : "Save Album"))
+                }
+                if !tracks.isEmpty {
+                    DetailDownloadAndSelectButtons(tracks: tracks, isSelecting: $isSelecting, compact: true)
+                }
+            }
+        }
         .task {
             isLoading = true
             if let loaded = await app.loadAlbumPage(albumID: albumID, sourceID: sourceID) {
@@ -937,6 +1003,7 @@ public struct AlbumDetailView: View {
 
 public struct ArtistDetailView: View {
     @EnvironmentObject private var app: AppModel
+    @Environment(\.mygoBottomOverlayInset) private var bottomOverlayInset
     public let artistID: String
     public let fallbackName: String
     public let sourceID: String?
@@ -948,6 +1015,9 @@ public struct ArtistDetailView: View {
     @State private var searchOffset = 0
     @State private var hasMoreSearchTracks = false
     @State private var isLoadingMoreTracks = false
+    @State private var isSelecting = false
+    @State private var showAllTracks = false
+    @State private var isHeaderCollapsed = false
 
     public init(artistID: String, fallbackName: String, sourceID: String? = nil) {
         self.artistID = artistID
@@ -999,120 +1069,41 @@ public struct ArtistDetailView: View {
         ScrollView {
             if isLoading {
                 ProgressView()
-                    .frame(maxWidth: .infinity, minHeight: 240)
+                    .frame(maxWidth: .infinity, minHeight: 280)
             } else if let page = artistPage {
                 let tracks = page.tracks ?? []
                 let albums = page.albums ?? []
-                let effectiveArtistID = page.artist.id.isEmpty ? artistID : page.artist.id
-                LazyVStack(alignment: .leading, spacing: 22) {
-                    VStack(spacing: 12) {
-                        ArtworkView(
-                            urlString: page.artist.imageUrl,
-                            pixelSize: 600,
-                            size: 140,
-                            cornerRadius: 70,
-                            systemIcon: "person.wave.2"
-                        )
-                        Text(page.artist.name)
-                            .font(.system(size: 24, weight: .bold))
+                let fallbackHeroURL = albums.first?.imageUrl ?? tracks.first?.album.imageUrl
+                let visibleTracks: [Track] = showAllTracks ? tracks : Array(tracks.prefix(5))
 
-                        HStack(spacing: 10) {
-                            if !tracks.isEmpty {
-                                Button {
-                                    app.player.playQueue(tracks, start: 0)
-                                } label: {
-                                    Label(I18n.t("Play"), systemImage: "play.fill")
-                                        .font(.system(size: 14, weight: .bold))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 20)
-                                        .padding(.vertical, 9)
-                                        .background(MyGoTheme.accent, in: Capsule())
-                                }
-                                .buttonStyle(.plain)
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    AppleMusicArtistHeroHeader(
+                        artistName: page.artist.name,
+                        subtitle: tracks.isEmpty ? "" : "\(tracks.count)\(hasMoreSearchTracks ? "+" : "") \(I18n.t("Songs"))",
+                        imageURL: page.artist.imageUrl,
+                        fallbackArtworkURL: fallbackHeroURL,
+                        hasTracks: !tracks.isEmpty,
+                        isCollapsed: $isHeaderCollapsed,
+                        onPlay: { app.player.playQueue(tracks, start: 0) },
+                        onShuffle: { app.player.playShuffled(tracks) }
+                    )
 
-                                Button {
-                                    app.player.playShuffled(tracks)
-                                } label: {
-                                    Label(I18n.t("Shuffle"), systemImage: "shuffle")
-                                        .font(.system(size: 14, weight: .semibold))
-                                        .padding(.horizontal, 20)
-                                        .padding(.vertical, 9)
-                                        .mygoPillSurface()
-                                }
-                                .buttonStyle(.plain)
-                            }
-
-                            if targetSource.can("followArtist") && !effectiveArtistID.isEmpty {
-                                Button {
-                                    Task {
-                                        isFollowing = await app.toggleFollowArtist(sourceID: targetSourceID, artistID: effectiveArtistID, currentlyFollowing: isFollowing)
-                                    }
-                                } label: {
-                                    Label(
-                                        I18n.t(isFollowing ? "Following" : "Follow"),
-                                        systemImage: isFollowing ? "checkmark" : "plus"
-                                    )
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(isFollowing ? MyGoTheme.accent : .primary)
-                                    .padding(.horizontal, 18)
-                                    .padding(.vertical, 9)
-                                    .mygoPillSurface()
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
+                    // 1. 「最新发行 / 主打专辑」高光卡片（Apple Music Spotlight Card）
+                    if let latestAlbum = albums.first {
+                        artistLatestReleaseSection(album: latestAlbum, targetSourceID: targetSourceID)
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 12)
 
+                    // 2. 热门歌曲 Top 5 与一键展开全部
                     if !tracks.isEmpty {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(I18n.t("Songs"))
-                                    .font(.system(size: 19, weight: .bold))
-                                Text("\(tracks.count)\(hasMoreSearchTracks ? "+" : "")")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.horizontal, 16)
-
-                            LazyTrackRowsView(tracks: tracks) { list, idx in
-                                app.player.playTrack(list, at: idx)
-                            }
-
-                            if hasMoreSearchTracks {
-                                LoadMoreButton(isLoading: isLoadingMoreTracks) {
-                                    Task { await loadMoreSongs() }
-                                }
-                            }
-                        }
+                        artistTopSongsSection(tracks: tracks, visibleTracks: visibleTracks)
                     }
 
+                    // 3. 大尺寸专辑与唱片集横向画廊
                     if !albums.isEmpty {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(I18n.t("Albums"))
-                                .font(.system(size: 19, weight: .bold))
-                                .padding(.horizontal, 16)
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                LazyHStack(spacing: 16) {
-                                    ForEach(albums) { album in
-                                        NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name, sourceID: targetSourceID)) {
-                                            CoverCardView(
-                                                title: album.name,
-                                                subtitle: album.released,
-                                                imageURL: album.imageUrl,
-                                                systemIcon: "opticaldisc"
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .padding(.horizontal, 16)
-                            }
-                        }
+                        artistAlbumsGallerySection(albums: albums, targetSourceID: targetSourceID)
                     }
                 }
-                .padding(.bottom, 24)
+                .padding(.bottom, max(28, bottomOverlayInset))
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "person.wave.2")
@@ -1133,13 +1124,177 @@ public struct ArtistDetailView: View {
                     .buttonStyle(.plain)
                 }
                 .frame(maxWidth: .infinity, minHeight: 260)
+                .padding(.bottom, max(28, bottomOverlayInset))
             }
         }
+        .coordinateSpace(name: MyGoDetailScrollSpace.name)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
+        #if os(iOS)
+        .ignoresSafeArea(edges: .top)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
         .mygoTrackVerticalScroll()
-        .navigationTitle(artistPage?.artist.name ?? fallbackName)
+        .navigationTitle(isHeaderCollapsed ? (artistPage?.artist.name ?? fallbackName) : "")
+        .toolbar {
+            let tracks = artistPage?.tracks ?? []
+            let effectiveArtistID = (artistPage?.artist.id.isEmpty == false ? artistPage?.artist.id : nil) ?? artistID
+            ToolbarItemGroup(placement: .automatic) {
+                if isHeaderCollapsed && !tracks.isEmpty {
+                    CollapsedToolbarPlayButtons(tracks: tracks)
+                }
+                if targetSource.can("followArtist") && !effectiveArtistID.isEmpty && artistPage != nil {
+                    Button {
+                        MyGoHaptics.impact(isFollowing ? .light : .medium)
+                        Task {
+                            isFollowing = await app.toggleFollowArtist(sourceID: targetSourceID, artistID: effectiveArtistID, currentlyFollowing: isFollowing)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isFollowing ? "checkmark" : "plus")
+                                .font(.system(size: 11.5, weight: .bold))
+                            Text(I18n.t(isFollowing ? "Following" : "Follow"))
+                                .font(.system(size: 12.5, weight: .semibold))
+                        }
+                        .foregroundStyle(isFollowing ? MyGoTheme.accent : .primary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .mygoPillSurface()
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
         .task {
             await loadArtistDetails()
+        }
+    }
+
+    @ViewBuilder
+    private func artistLatestReleaseSection(album: Album, targetSourceID: String) -> some View {
+        NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name, sourceID: targetSourceID)) {
+            HStack(spacing: 14) {
+                ArtworkView(
+                    urlString: album.imageUrl,
+                    pixelSize: 320,
+                    size: 88,
+                    cornerRadius: 12,
+                    systemIcon: "opticaldisc"
+                )
+                .shadow(color: .black.opacity(0.18), radius: 8, y: 4)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(I18n.t("Latest Release"))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(MyGoTheme.accent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(MyGoTheme.accent.opacity(0.14), in: Capsule())
+
+                    Text(album.name)
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+
+                    if let released = album.released, !released.isEmpty {
+                        Text(released)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(12)
+            .background(MyGoTheme.elevatedSurface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(MyGoTheme.surfaceStroke, lineWidth: 0.6)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+    }
+
+    @ViewBuilder
+    private func artistTopSongsSection(tracks: [Track], visibleTracks: [Track]) -> some View {
+        LazyVStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(I18n.t("Top Songs"))
+                        .font(.system(size: 21, weight: .bold))
+                    Text("\(tracks.count)\(hasMoreSearchTracks ? "+" : "")")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if showAllTracks || tracks.count <= 5 {
+                    DetailDownloadAndSelectButtons(tracks: tracks, isSelecting: $isSelecting, compact: true)
+                }
+
+                if tracks.count > 5 {
+                    Button {
+                        MyGoHaptics.selection()
+                        withAnimation(.spring(response: 0.36, dampingFraction: 0.82)) {
+                            showAllTracks.toggle()
+                            if !showAllTracks {
+                                isSelecting = false
+                            }
+                        }
+                    } label: {
+                        Text(showAllTracks ? I18n.t("Show Less") : I18n.t("See All"))
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(MyGoTheme.accent)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(MyGoTheme.accent.opacity(0.12), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+
+            LazyTrackRowsView(tracks: visibleTracks, isSelecting: $isSelecting) { _, idx in
+                app.player.playTrack(tracks, at: idx)
+            }
+
+            if showAllTracks && hasMoreSearchTracks {
+                LoadMoreButton(isLoading: isLoadingMoreTracks) {
+                    Task { await loadMoreSongs() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func artistAlbumsGallerySection(albums: [Album], targetSourceID: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(I18n.t("Albums"))
+                .font(.system(size: 21, weight: .bold))
+                .padding(.horizontal, 16)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 16) {
+                    ForEach(albums) { album in
+                        NavigationLink(value: NavigationTarget.album(id: album.id, name: album.name, sourceID: targetSourceID)) {
+                            CoverCardView(
+                                title: album.name,
+                                subtitle: album.released,
+                                imageURL: album.imageUrl,
+                                systemIcon: "opticaldisc",
+                                cardSize: 164
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
         }
     }
 }
@@ -1153,105 +1308,52 @@ public struct PlaylistDetailView: View {
     @State private var isLoading = true
     @State private var isSaved = false
     @State private var isEditingOrder = false
+    @State private var isSelecting = false
+    @State private var isHeaderCollapsed = false
 
     public var body: some View {
+        let tracks = playlistData?.tracks ?? []
         ScrollView {
             if isLoading {
                 ProgressView()
                     .frame(maxWidth: .infinity, minHeight: 240)
             } else if let pl = playlistData {
-                let tracks = pl.tracks ?? []
                 let isOwner = pl.mine == true
                 let canRemove = isOwner && app.activeSource.can("removeFromPlaylist")
                 let canMove = isOwner && app.activeSource.can("movePlaylistTrack")
 
-                LazyVStack(spacing: 20) {
-                    VStack(spacing: 12) {
-                        ArtworkView(
-                            urlString: pl.imageUrl,
-                            pixelSize: 600,
-                            size: 190,
-                            cornerRadius: 16,
-                            systemIcon: "music.note.list"
+                LazyVStack(spacing: 18) {
+                    VStack(spacing: 16) {
+                        let descPart = (pl.description?.isEmpty == false) ? " · \(pl.description!)" : ""
+                        ParallaxDetailHeaderView(
+                            title: pl.name,
+                            subtitle: I18n.songs(tracks.count) + descPart,
+                            artworkURL: pl.imageUrl,
+                            artworkSize: 226,
+                            isCollapsed: $isHeaderCollapsed
                         )
-                        .background(
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .fill(MyGoTheme.placeholderFill)
-                                .shadow(color: .black.opacity(0.22), radius: 14, x: 0, y: 6)
-                        )
+                        .padding(.top, 10)
 
-                        Text(pl.name)
-                            .font(.system(size: 22, weight: .bold))
-                            .multilineTextAlignment(.center)
-
-                        Text(I18n.songs(tracks.count))
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-
-                        if let desc = pl.description, !desc.isEmpty {
-                            Text(desc)
-                                .font(.system(size: 13))
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 24)
-                        }
-
-                        HStack(spacing: 10) {
-                            if !tracks.isEmpty {
-                                Button {
-                                    app.player.playQueue(tracks, start: 0)
-                                } label: {
-                                    Label(I18n.t("Play"), systemImage: "play.fill")
-                                        .font(.system(size: 14, weight: .bold))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, 20)
-                                        .padding(.vertical, 10)
-                                        .background(MyGoTheme.accent, in: Capsule())
-                                }
-                                .buttonStyle(.plain)
-
-                                Button {
-                                    app.player.playShuffled(tracks)
-                                } label: {
-                                    Label(I18n.t("Shuffle"), systemImage: "shuffle")
-                                        .font(.system(size: 14, weight: .semibold))
-                                        .padding(.horizontal, 20)
-                                        .padding(.vertical, 10)
-                                        .mygoPillSurface()
-                                }
-                                .buttonStyle(.plain)
-                            }
-
-                            if !isOwner && app.activeSource.can("savePlaylist") {
-                                let srcID = app.activeSourceID
-                                Button {
-                                    Task {
-                                        isSaved = await app.toggleSavePlaylist(sourceID: srcID, playlistID: playlistID, currentlySaved: isSaved)
-                                    }
-                                } label: {
-                                    Image(systemName: isSaved ? "heart.fill" : "heart")
-                                        .font(.system(size: 15, weight: .semibold))
-                                        .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
-                                        .frame(width: 40, height: 40)
-                                        .mygoCircleSurface()
-                                }
-                                .buttonStyle(.plain)
-                            }
+                        if !tracks.isEmpty {
+                            AppleMusicPlayShuffleBar(
+                                hasTracks: !tracks.isEmpty,
+                                onPlay: { app.player.playQueue(tracks, start: 0) },
+                                onShuffle: { app.player.playShuffled(tracks) }
+                            )
                         }
                     }
-                    .padding(.top, 12)
 
-                    LazyVStack(spacing: 2) {
-                        let entries = LazyTrackRowsView.buildRowEntries(for: tracks)
-                        ForEach(entries) { entry in
-                            let idx = entry.index
-                            let tr = entry.track
-                            HStack(spacing: 4) {
-                                TrackRowView(track: tr, index: idx) {
-                                    app.player.playTrack(tracks, at: idx)
-                                }
+                    if isEditingOrder {
+                        LazyVStack(spacing: 2) {
+                            let entries = LazyTrackRowsView.buildRowEntries(for: tracks)
+                            ForEach(entries) { entry in
+                                let idx = entry.index
+                                let tr = entry.track
+                                HStack(spacing: 4) {
+                                    TrackRowView(track: tr, index: idx) {
+                                        app.player.playTrack(tracks, at: idx)
+                                    }
 
-                                if isEditingOrder {
                                     if canMove {
                                         Button {
                                             Task { await moveRow(from: idx, to: max(0, idx - 1)) }
@@ -1282,39 +1384,79 @@ public struct PlaylistDetailView: View {
                                         .buttonStyle(.plain)
                                     }
                                 }
+                                .padding(.horizontal, 8)
+                                .contextMenu {
+                                    if canMove && idx > 0 {
+                                        Button(I18n.t("Move Up"), systemImage: "arrow.up") {
+                                            Task { await moveRow(from: idx, to: idx - 1) }
+                                        }
+                                    }
+                                    if canMove && idx < tracks.count - 1 {
+                                        Button(I18n.t("Move Down"), systemImage: "arrow.down") {
+                                            Task { await moveRow(from: idx, to: idx + 1) }
+                                        }
+                                    }
+                                    if canRemove {
+                                        Button(I18n.t("Remove from Playlist"), systemImage: "trash", role: .destructive) {
+                                            Task { await removeRow(trackID: tr.id) }
+                                        }
+                                    }
+                                }
                             }
-                            .padding(.horizontal, 8)
-                            .contextMenu {
-                                if canMove && idx > 0 {
-                                    Button(I18n.t("Move Up"), systemImage: "arrow.up") {
-                                        Task { await moveRow(from: idx, to: idx - 1) }
-                                    }
-                                }
-                                if canMove && idx < tracks.count - 1 {
-                                    Button(I18n.t("Move Down"), systemImage: "arrow.down") {
-                                        Task { await moveRow(from: idx, to: idx + 1) }
-                                    }
-                                }
-                                if canRemove {
-                                    Button(I18n.t("Remove from Playlist"), systemImage: "trash", role: .destructive) {
-                                        Task { await removeRow(trackID: tr.id) }
-                                    }
-                                }
-                            }
+                        }
+                    } else {
+                        LazyTrackRowsView(tracks: tracks, isSelecting: $isSelecting) { list, idx in
+                            app.player.playTrack(list, at: idx)
                         }
                     }
                 }
             }
         }
+        .coordinateSpace(name: MyGoDetailScrollSpace.name)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
-        .navigationTitle(playlistData?.name ?? fallbackName)
+        .navigationTitle(isHeaderCollapsed ? (playlistData?.name ?? fallbackName) : "")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
         .toolbar {
-            if let pl = playlistData, pl.mine == true,
-               (app.activeSource.can("removeFromPlaylist") || app.activeSource.can("movePlaylistTrack")) {
-                ToolbarItem(placement: .automatic) {
+            ToolbarItemGroup(placement: .automatic) {
+                if isHeaderCollapsed && !tracks.isEmpty {
+                    CollapsedToolbarPlayButtons(tracks: tracks)
+                }
+                if let pl = playlistData, pl.mine != true, app.activeSource.can("savePlaylist") {
+                    let srcID = app.activeSourceID
+                    Button {
+                        MyGoHaptics.impact(isSaved ? .light : .medium)
+                        Task {
+                            isSaved = await app.toggleSavePlaylist(sourceID: srcID, playlistID: playlistID, currentlySaved: isSaved)
+                        }
+                    } label: {
+                        Image(systemName: isSaved ? "heart.fill" : "heart")
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(isSaved ? MyGoTheme.accent : .primary)
+                            .frame(width: 30, height: 30)
+                            .mygoCircleSurface()
+                    }
+                    .buttonStyle(.plain)
+                }
+                if !tracks.isEmpty {
+                    DetailDownloadAndSelectButtons(
+                        tracks: tracks,
+                        isSelecting: $isSelecting,
+                        compact: true,
+                        onBeforeEnableSelect: { isEditingOrder = false }
+                    )
+                }
+                if let pl = playlistData, pl.mine == true,
+                   (app.activeSource.can("removeFromPlaylist") || app.activeSource.can("movePlaylistTrack")) {
                     Button(isEditingOrder ? I18n.t("Done") : I18n.t("Edit")) {
-                        withAnimation { isEditingOrder.toggle() }
+                        withAnimation {
+                            isEditingOrder.toggle()
+                            if isEditingOrder {
+                                isSelecting = false
+                            }
+                        }
                     }
                 }
             }

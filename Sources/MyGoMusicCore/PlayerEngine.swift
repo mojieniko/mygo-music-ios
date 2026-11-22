@@ -14,6 +14,20 @@ import os
 import UIKit
 #endif
 
+/// 当前正在播放音轨的完整音频信号路径描述（供「音质/信号路径」浮层展示）
+public struct AudioSignalPathInfo: Equatable, Sendable {
+    public let sourceName: String
+    public let deliveryMode: String
+    public let codecFormat: String
+    public let qualityTier: String
+    public let isLossless: Bool
+    public let sampleRateHz: Int
+    public let bitDepth: Int
+    public let transitionMode: String
+    public let outputDeviceName: String
+    public let outputPortType: String
+}
+
 /// 全曲高精度硬件 FFT 频谱时间轴（对照桌面 internal/player/stream.go spectrum）
 /// 支持本地 MP3/M4A/WAV/FLAC 与已缓存云端音频的毫秒级全周期频谱查询、鼓点瞬态检测与渐进式分段发布
 final class AudioSpectrumTimeline: @unchecked Sendable {
@@ -243,6 +257,55 @@ final class AudioSpectrumTimeline: @unchecked Sendable {
             let finalSnapshot = Snapshot(sampleRate: detectedRate, chunks: chunks)
             self.lock.withLock { $0 = finalSnapshot }
         }.value
+    }
+
+    /// 将高密度频谱能量序列下采样聚合为指定数量的归一化全曲波形柱（[0.08 ... 1.0]）
+    func waveformBuckets(count: Int) -> [Float]? {
+        guard count > 0 else { return nil }
+        let snap = lock.withLock { $0 }
+        guard !snap.chunks.isEmpty else { return nil }
+
+        var buckets = [Float](repeating: 0.12, count: count)
+        let total = snap.chunks.count
+        var minVal: Float = .greatestFiniteMagnitude
+        var maxVal: Float = 0.0001
+
+        for i in 0..<count {
+            let startIdx = i * total / count
+            let endIdx = max(startIdx + 1, (i + 1) * total / count)
+            var sumEnergy: Double = 0
+            var localPeak: Double = 0
+            var sliceCount = 0
+            for idx in startIdx..<min(endIdx, total) {
+                let p = snap.chunks[idx]
+                let b0 = Double(p & 0xFF) / 255.0
+                let b1 = Double((p >> 8) & 0xFF) / 255.0
+                let b2 = Double((p >> 16) & 0xFF) / 255.0
+                let b3 = Double((p >> 24) & 0xFF) / 255.0
+                let b4 = Double((p >> 32) & 0xFF) / 255.0
+                let e = b0 * 0.25 + b1 * 0.22 + b2 * 0.28 + b3 * 0.15 + b4 * 0.10
+                sumEnergy += e
+                if e > localPeak { localPeak = e }
+                sliceCount += 1
+            }
+            let avg = sumEnergy / Double(max(1, sliceCount))
+            // 均值与局部峰值混合，保留瞬态鼓点冲击感
+            let combined = Float(avg * 0.55 + localPeak * 0.45)
+            buckets[i] = combined
+            if combined < minVal { minVal = combined }
+            if combined > maxVal { maxVal = combined }
+        }
+
+        let span = maxVal - minVal
+        // 若整轨能量方差极低（例如持续恒定测试正弦波或无声缓存），保留高对比音乐轮廓波形避免全线平齐
+        guard span >= 0.04 else { return nil }
+        for i in 0..<count {
+            let rel = Double(min(max((buckets[i] - minVal) / span, 0), 1))
+            // 非线性动态对比拉伸，避免响度均衡流行歌全部满格齐平
+            let shaped = pow(rel, 1.55)
+            buckets[i] = Float(min(1.0, max(0.10, 0.12 + shaped * 0.86)))
+        }
+        return buckets
     }
 }
 
@@ -727,6 +790,7 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         var cacheWrittenBytes: Int64 = 0
         var shouldWriteCache: Bool = false
         var finishedLoading = false
+        weak var dataTask: URLSessionDataTask?
 
         init(loadingRequest: AVAssetResourceLoadingRequest, canCache: Bool) {
             self.loadingRequest = loadingRequest
@@ -773,6 +837,9 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 12
         config.timeoutIntervalForResource = 120
+        if sessionConfiguration == nil {
+            config.waitsForConnectivity = true
+        }
         self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
@@ -882,12 +949,14 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         for ctx in contexts {
             var shouldFinish = false
             ctx.lock.lock()
+            let taskToCancel = ctx.dataTask
             cleanupCacheHandleLocked(ctx, removeTemp: true)
             if !ctx.finishedLoading && !ctx.loadingRequest.isFinished && !ctx.loadingRequest.isCancelled {
                 ctx.finishedLoading = true
                 shouldFinish = true
             }
             ctx.lock.unlock()
+            taskToCancel?.cancel()
             if shouldFinish {
                 ctx.loadingRequest.finishLoading(with: CancellationError())
             }
@@ -940,6 +1009,9 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         }
 
         let task = session.dataTask(with: request)
+        ctx.lock.lock()
+        ctx.dataTask = task
+        ctx.lock.unlock()
         lock.lock()
         if isInvalidated {
             lock.unlock()
@@ -960,19 +1032,15 @@ public final class AudioStreamProxy: NSObject, AVAssetResourceLoaderDelegate, UR
         lock.lock()
         let match = activeTasks.first { $0.value.loadingRequest === loadingRequest }
         let removedCtx = match.flatMap { activeTasks.removeValue(forKey: $0.key) }
-        let session = urlSession
         lock.unlock()
 
-        if let match {
-            session?.getAllTasks { tasks in
-                tasks.first { $0.taskIdentifier == match.key }?.cancel()
-            }
-        }
         if let removedCtx {
             removedCtx.lock.lock()
+            let taskToCancel = removedCtx.dataTask
             removedCtx.finishedLoading = true
             cleanupCacheHandleLocked(removedCtx, removeTemp: true)
             removedCtx.lock.unlock()
+            taskToCancel?.cancel()
         }
     }
 
@@ -1333,10 +1401,14 @@ public final class PlayerEngine: ObservableObject {
     @Published public private(set) var radioName: String? = nil
     @Published public private(set) var lyrics: [LyricLine] = []
     @Published public private(set) var lyricsLoaded: Bool = false
+    /// 歌词内容与所属曲目签名，用于在行数巧合一致时仍能准确重定位
+    @Published public private(set) var lyricsSignature: String = ""
     @Published public private(set) var errorMessage: String? = nil
     @Published public private(set) var audioBands: [Float] = [0.15, 0.15, 0.15, 0.15, 0.15]
     @Published public private(set) var isSeeking: Bool = false
     @Published public private(set) var seekRevision: Int = 0
+    /// 底层 AVPlayer.seek 真实落地完成后的递增版本号，供歌词对齐与时钟校偏使用
+    @Published public private(set) var seekSettledRevision: Int = 0
 
     public struct NowPlayingDisplayMetadata: Equatable, Sendable {
         public let title: String
@@ -1345,13 +1417,33 @@ public final class PlayerEngine: ObservableObject {
         public let lyricIndex: Int?
     }
 
+    public enum SleepTimerOption: Equatable, Sendable {
+        case off
+        case afterCurrentTrack
+        case minutes(Int)
+    }
+
+    @Published public private(set) var sleepTimerRemainingSeconds: Int? = nil
+    @Published public private(set) var sleepTimerStopsAfterCurrentTrack: Bool = false
+    /// 当前曲目的归一化全曲音频能量波形柱（默认 56 根，支持全曲分布波形进度条）
+    @Published public private(set) var currentTrackWaveform: [Float] = []
+    /// 当前曲目的实时音频容器标识（例如 FLAC / MP3 / WAV (PCM) / AAC / M4A，用于播放页底部徽章与信号路径面板）
+    @Published public private(set) var activeSignalCodec: String = "Audio"
+
     public var sourceResolver: ((String) -> MusicSource?)?
     public var qualityProvider: (() -> String)?
-    public var normalizeProvider: (() -> Bool)?
-    public var fadeEnabledProvider: (() -> Bool)?
     public var lockScreenLyricsProvider: (() -> Bool)?
+    public var isTrackLikedProvider: ((Track) -> Bool)?
+    public var onToggleLikeTrack: ((Track) -> Void)?
+    public var onSleepTimerTriggered: (() -> Void)?
+    public var localOfflineFileResolver: ((Track) -> URL?)?
+    public var episodePositionProvider: ((String) -> TimeInterval?)?
+    public var onEpisodePositionUpdated: ((String, TimeInterval?) -> Void)?
     public var onSourceFailure: ((String, SourceError) -> Void)?
     public var onSessionChanged: (() -> Void)?
+
+    /// 无缝切歌开关（提前预缓冲下一首 `AVPlayer`）
+    public var gaplessPlaybackEnabled: Bool = true
     /// 原生直连起播/卡顿后自动回退代理的等待秒数
     public var directBufferTimeoutSeconds: TimeInterval = 7.0
     /// 代理流或无退路流持续卡顿时的超时秒数（到期后退出缓冲态并报错）
@@ -1372,10 +1464,9 @@ public final class PlayerEngine: ObservableObject {
     private var timeControlObservation: NSKeyValueObservation?
     private var loadGeneration: Int = 0
     private var bufferWatchdogTask: Task<Void, Never>?
+    private var watchdogPhaseKey: String? = nil
+    private var watchdogBaselinePos: TimeInterval = 0
     private var lastObservedMediaPosition: TimeInterval = -1
-    private var currentGainLinear: Float = 1.0
-    private var currentFadeMultiplier: Float = 1.0
-    private var fadeTask: Task<Void, Never>?
     private var prefetchedStream: (trackKey: String, quality: String, stream: StreamInfo, fetchedAt: Date)?
     private var prefetchAttemptedKey: String?
     private var radioFeed: (() async -> [Track])? = nil
@@ -1391,6 +1482,22 @@ public final class PlayerEngine: ObservableObject {
     private var tapBassMovingMean: Double = 0.15
     private var lockScreenArtwork: MPMediaItemArtwork?
     private var lastPublishedNowPlayingMeta: NowPlayingDisplayMetadata?
+    private var systemObservers: [NSObjectProtocol] = []
+    private var wasPlayingBeforeInterruption: Bool = false
+    private var sleepTimerTask: Task<Void, Never>?
+    private var sleepTimerTargetDate: Date? = nil
+    // 音频信号路径实时信息
+    private var activeSignalDeliveryMode: String = "Direct Stream"
+    private var activeSignalSampleRateHz: Int = 44_100
+    private var activeSignalBitDepth: Int = 16
+    private var lastProgressSnapshotUptime: TimeInterval = 0
+    // 无缝切歌预热播放器
+    private var standbyPlayer: AVPlayer?
+    private var standbyTrackKey: String?
+    private var standbyOrderIndex: Int?
+    private var standbyStreamInfo: StreamInfo?
+    private var standbyResolvedLocalURL: URL?
+    private var standbyDeliveryMode: String?
 
     public init(cacheDir: URL? = nil, activateAudioSessionOnInit: Bool = false) {
         let dir = cacheDir ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -1405,7 +1512,16 @@ public final class PlayerEngine: ObservableObject {
             }
         }
         configureRemoteCommands()
+        registerSystemLifecycleObservers()
         startBandUpdateTimer()
+    }
+
+    deinit {
+        sleepTimerTask?.cancel()
+        bandTimer?.invalidate()
+        for observer in systemObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     // MARK: - 队列与播放控制（对应 PlayQueue / PlayTrack / PlayShuffled）
@@ -1494,31 +1610,25 @@ public final class PlayerEngine: ObservableObject {
     }
 
     public func pause() {
+        if !isSeeking {
+            let livePos = livePlaybackPosition()
+            if livePos.isFinite && livePos >= 0 {
+                position = livePos
+            }
+        }
         isPlaying = false
         isLoading = false
         bufferWatchdogTask?.cancel()
         bufferWatchdogTask = nil
-        fadeTask?.cancel()
-        if let player = avPlayer, fadeEnabledProvider?() == true, player.timeControlStatus == .playing {
-            let gen = loadGeneration
-            fadeTask = Task { [weak self] in
-                await self?.animateFade(from: self?.currentFadeMultiplier ?? 1.0, to: 0.0, durationMs: 160, gen: gen)
-                guard let self, !Task.isCancelled, self.loadGeneration == gen, !self.isPlaying else { return }
-                self.avPlayer?.pause()
-                self.currentFadeMultiplier = 1.0
-                self.applyPlayerVolume()
-            }
-        } else {
-            avPlayer?.pause()
-            currentFadeMultiplier = 1.0
-            applyPlayerVolume()
-        }
+        avPlayer?.pause()
+        applyPlayerVolume()
         if let tr = currentTrack,
            let src = sourceForTrack(tr),
            src.info().playback == .remote {
             Task { try? await src.remotePause() }
         }
-        updateNowPlayingCenter()
+        recordPlaybackProgressSnapshot(force: true)
+        updateNowPlayingCenter(useLiveClock: true)
         onSessionChanged?()
     }
 
@@ -1526,21 +1636,9 @@ public final class PlayerEngine: ObservableObject {
         guard currentTrack != nil else { return }
         ensureAudioSessionActive()
         isPlaying = true
-        fadeTask?.cancel()
         if let player = avPlayer {
-            if fadeEnabledProvider?() == true {
-                currentFadeMultiplier = 0.0
-                applyPlayerVolume()
-                player.play()
-                let gen = loadGeneration
-                fadeTask = Task { [weak self] in
-                    await self?.animateFade(from: 0.0, to: 1.0, durationMs: 200, gen: gen)
-                }
-            } else {
-                currentFadeMultiplier = 1.0
-                applyPlayerVolume()
-                player.play()
-            }
+            applyPlayerVolume()
+            player.play()
         } else if !isLoading {
             retryCurrentTrack()
         }
@@ -1605,6 +1703,35 @@ public final class PlayerEngine: ObservableObject {
         }
     }
 
+    /// 查询队列中的相邻可用曲目（供迷你播放栏等水平横滑预渲染，无播放副作用）
+    public func adjacentTrack(step: Int) -> Track? {
+        guard step != 0, currentOrderIndex >= 0, !order.isEmpty else { return nil }
+        guard let targetIdx = findPlayableOrderIndex(
+            startingAt: currentOrderIndex + step,
+            step: step,
+            wrapAround: true
+        ), targetIdx != currentOrderIndex else {
+            return nil
+        }
+        let queueIdx = order[targetIdx]
+        guard queueIdx >= 0, queueIdx < queue.count else { return nil }
+        return queue[queueIdx]
+    }
+
+    /// 立即切到队列上一首可用曲目（用于水平滑出上一首卡片松手后直接切换，不受 3 秒重头规则约束）
+    public func skipToPreviousTrack() {
+        guard !order.isEmpty else { return }
+        if let prevPlayable = findPlayableOrderIndex(
+            startingAt: currentOrderIndex - 1,
+            step: -1,
+            wrapAround: true
+        ), prevPlayable != currentOrderIndex {
+            loadTrack(atOrderIndex: prevPlayable, autoPlay: true)
+        } else {
+            seek(to: 0)
+        }
+    }
+
     /// 上一首（对应 Prev：超过 3 秒回到开头，否则切上一首并自动跳过灰显无权限曲目）
     public func previous() {
         guard !order.isEmpty else { return }
@@ -1625,6 +1752,7 @@ public final class PlayerEngine: ObservableObject {
     public func seek(to seconds: TimeInterval) {
         let clamped = max(0, min(seconds, duration > 0 ? duration : seconds))
         self.position = clamped
+        self.lastObservedMediaPosition = clamped
         self.isSeeking = true
         self.seekRevision &+= 1
 
@@ -1634,32 +1762,50 @@ public final class PlayerEngine: ObservableObject {
             avPlayer.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard let self, self.seekRevision == revision else { return }
-                    if finished {
+                    let actualSec = CMTimeGetSeconds(avPlayer.currentTime())
+                    if actualSec.isFinite && actualSec >= 0 {
+                        let resolved = self.duration > 0 ? min(actualSec, self.duration) : actualSec
+                        self.position = resolved
+                        self.lastObservedMediaPosition = resolved
+                        self.syncNowPlayingLyricsIfNeeded(at: resolved)
+                    } else if finished {
                         self.position = clamped
+                        self.lastObservedMediaPosition = clamped
                     }
                     self.isSeeking = false
-                    self.seekRevision &+= 1
-                    self.updateNowPlayingCenter()
+                    self.seekSettledRevision &+= 1
+                    self.rebuildLyricBoundaryObserver()
+                    self.recordPlaybackProgressSnapshot(force: true)
+                    self.updateNowPlayingCenter(useLiveClock: true)
                 }
             }
         } else {
             isSeeking = false
-            self.seekRevision &+= 1
+            self.seekSettledRevision &+= 1
         }
         if let tr = currentTrack,
            let src = sourceForTrack(tr),
            src.info().playback == .remote {
             Task { try? await src.remoteSeek(position: Int64(clamped * 1000)) }
         }
+        recordPlaybackProgressSnapshot(force: true)
         updateNowPlayingCenter()
         onSessionChanged?()
     }
 
     /// 切换随机模式（对应 ToggleShuffle）
     public func toggleShuffle() {
-        guard radioName == nil else { return }
-        shuffle.toggle()
-        guard !queue.isEmpty else { return }
+        setShuffle(!shuffle)
+    }
+
+    /// 显式设置随机播放状态（供界面与系统远程控制统一调用）
+    public func setShuffle(_ enabled: Bool) {
+        guard radioName == nil, shuffle != enabled else { return }
+        shuffle = enabled
+        guard !queue.isEmpty else {
+            syncRemoteCommandAvailability()
+            return
+        }
         let currentQueueIdx = (currentOrderIndex >= 0 && currentOrderIndex < order.count) ? order[currentOrderIndex] : 0
         if shuffle {
             shuffleOrder(keepingFirstQueueIndex: currentQueueIdx)
@@ -1668,13 +1814,139 @@ public final class PlayerEngine: ObservableObject {
             order = Array(0..<queue.count)
             currentOrderIndex = currentQueueIdx
         }
+        syncRemoteCommandAvailability()
         onSessionChanged?()
     }
 
     /// 切换循环模式（对应 CycleRepeat）
     public func cycleRepeat() {
-        repeatMode = repeatMode.next
+        setRepeatMode(repeatMode.next)
+    }
+
+    /// 显式设置循环模式（供界面与系统远程控制统一调用）
+    public func setRepeatMode(_ mode: RepeatMode) {
+        guard repeatMode != mode else { return }
+        repeatMode = mode
+        syncRemoteCommandAvailability()
         onSessionChanged?()
+    }
+
+    /// 下一首插播：将指定曲目插入当前播放位置的下一顺位（空队列时直接起播）
+    public func playNext(_ track: Track) {
+        guard currentTrack != nil, !order.isEmpty, currentOrderIndex >= 0 else {
+            playTrack([track], at: 0)
+            return
+        }
+        endRadio()
+        let newQueueIdx = queue.count
+        queue.append(track)
+        let insertOrderIdx = min(currentOrderIndex + 1, order.count)
+        order.insert(newQueueIdx, at: insertOrderIdx)
+        updateNowPlayingCenter()
+        onSessionChanged?()
+    }
+
+    /// 添加到播放队列末尾（空队列时直接起播）
+    public func enqueue(_ track: Track) {
+        guard currentTrack != nil, !order.isEmpty else {
+            playTrack([track], at: 0)
+            return
+        }
+        endRadio()
+        let newQueueIdx = queue.count
+        queue.append(track)
+        order.append(newQueueIdx)
+        updateNowPlayingCenter()
+        onSessionChanged?()
+    }
+
+    /// 调整播放顺序中的指定曲目位置，并精确同步维护当前正在播放项的顺位指针
+    public func moveInQueue(fromOrderIndex source: Int, toOrderIndex destination: Int) {
+        guard source >= 0, source < order.count,
+              destination >= 0, destination < order.count,
+              source != destination else {
+            return
+        }
+        let movedQueueIdx = order.remove(at: source)
+        order.insert(movedQueueIdx, at: destination)
+        if currentOrderIndex == source {
+            currentOrderIndex = destination
+        } else if source < currentOrderIndex && destination >= currentOrderIndex {
+            currentOrderIndex -= 1
+        } else if source > currentOrderIndex && destination <= currentOrderIndex {
+            currentOrderIndex += 1
+        }
+        cleanupStandbyPlayer()
+        updateNowPlayingCenter()
+        onSessionChanged?()
+    }
+
+    /// 保留当前正在播放的曲目并清空待播清单其余歌曲
+    public func clearQueueKeepingCurrent() {
+        cleanupStandbyPlayer()
+        guard let current = currentTrack else {
+            stopAndClear()
+            return
+        }
+        queue = [current]
+        order = [0]
+        currentOrderIndex = 0
+        updateNowPlayingCenter()
+        onSessionChanged?()
+    }
+
+    /// 更新无缝切歌配置
+    public func updateTransitionConfiguration(gapless: Bool) {
+        self.gaplessPlaybackEnabled = gapless
+        if !gapless {
+            cleanupStandbyPlayer()
+        }
+    }
+
+    /// 设置睡眠定时（到时自动淡出暂停播放）
+    public func setSleepTimer(_ option: SleepTimerOption) {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerTargetDate = nil
+        sleepTimerRemainingSeconds = nil
+        sleepTimerStopsAfterCurrentTrack = false
+
+        switch option {
+        case .off:
+            return
+        case .afterCurrentTrack:
+            sleepTimerStopsAfterCurrentTrack = true
+        case .minutes(let mins):
+            let clampedSeconds = max(1, mins) * 60
+            let target = Date().addingTimeInterval(TimeInterval(clampedSeconds))
+            sleepTimerTargetDate = target
+            sleepTimerRemainingSeconds = clampedSeconds
+            sleepTimerTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    guard let self, !Task.isCancelled else { return }
+                    guard let deadline = self.sleepTimerTargetDate else { return }
+                    let remaining = Int(ceil(deadline.timeIntervalSinceNow))
+                    if remaining <= 0 {
+                        self.completeSleepTimer()
+                        return
+                    }
+                    self.sleepTimerRemainingSeconds = remaining
+                }
+            }
+        }
+    }
+
+    private func completeSleepTimer() {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        sleepTimerTargetDate = nil
+        sleepTimerRemainingSeconds = nil
+        sleepTimerStopsAfterCurrentTrack = false
+        if isPlaying {
+            pause()
+        }
+        onSleepTimerTriggered?()
     }
 
     /// 获取按当前播放顺序排列的队列（对应 UpNext / Queue）
@@ -1715,19 +1987,26 @@ public final class PlayerEngine: ObservableObject {
 
     public func stopAndClear() {
         cleanupAVPlayer()
+        cleanupStandbyPlayer()
+        setSleepTimer(.off)
         queue = []
         order = []
         currentOrderIndex = -1
         currentTrack = nil
         currentStream = nil
+        activeSignalCodec = "Audio"
+        currentTrackWaveform = []
         isPlaying = false
         isLoading = false
         position = 0
         duration = 0
         lyrics = []
         lyricsLoaded = false
+        lyricsSignature = ""
         lastPublishedNowPlayingMeta = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+        syncRemoteCommandAvailability()
     }
 
     // MARK: - 会话恢复（Session Restore）
@@ -1736,10 +2015,12 @@ public final class PlayerEngine: ObservableObject {
         guard !queue.isEmpty, currentOrderIndex >= 0, currentOrderIndex < order.count else {
             return nil
         }
+        let livePos = isPlaying ? livePlaybackPosition() : position
+        let safePos = (livePos.isFinite && livePos >= 0) ? livePos : position
         return SavedPlaybackSession(
             queue: orderedQueue,
             currentIndex: currentOrderIndex,
-            positionSeconds: position,
+            positionSeconds: safePos,
             shuffle: shuffle,
             repeatMode: repeatMode
         )
@@ -1782,50 +2063,53 @@ public final class PlayerEngine: ObservableObject {
         loadGeneration += 1
         let gen = loadGeneration
 
+        let resolvedInitialSeek: TimeInterval
+        if initialSeek > 0 {
+            resolvedInitialSeek = initialSeek
+        } else if track.isEpisode, let savedEpisodePos = episodePositionProvider?(track.compositeKey), savedEpisodePos > 1.0 {
+            resolvedInitialSeek = savedEpisodePos
+        } else {
+            resolvedInitialSeek = 0
+        }
+
         cleanupAVPlayer()
         currentOrderIndex = orderIndex
         currentTrack = track
         lockScreenArtwork = nil
         currentStream = nil
-        position = initialSeek
+        activeSignalCodec = "Audio"
+        position = resolvedInitialSeek
         duration = track.durationSeconds
         isLoading = true
         isPlaying = autoPlay
         errorMessage = nil
         lyrics = []
         lyricsLoaded = false
+        lyricsSignature = Self.makeLyricsSignature(trackKey: track.compositeKey, lines: [])
         lastPublishedNowPlayingMeta = nil
-        currentGainLinear = 1.0
+        activeSignalSampleRateHz = 44_100
+        activeSignalBitDepth = 16
+        currentTrackWaveform = Self.syntheticWaveformBuckets(seed: Self.persistentMediaID(for: track), count: 56)
 
         updateNowPlayingCenter()
         onSessionChanged?()
 
+        let offlineAudioURL = localOfflineFileResolver?(track)
+
         guard let src = sourceForTrack(track) else {
+            if let offlineAudioURL {
+                loadLyricsWithOfflineFallback(src: nil, track: track, offlineAudioURL: offlineAudioURL, gen: gen)
+                playResolvedOfflineAudio(offlineAudioURL, track: track, autoPlay: autoPlay, initialSeek: resolvedInitialSeek, gen: gen)
+                return
+            }
             isLoading = false
             isPlaying = false
             errorMessage = I18n.t("The plugin of this song is gone")
             return
         }
 
-        // 异步加载歌词
-        if src.can("lyrics") && !track.isEpisode {
-            let trackID = track.id
-            Task {
-                if let rawLyrics = try? await src.lyrics(id: trackID) {
-                    let parsed = LyricsEngine.fromSource(rawLyrics)
-                    if self.loadGeneration == gen {
-                        self.lyrics = parsed
-                        self.lyricsLoaded = true
-                        self.rebuildLyricBoundaryObserver()
-                        self.updateNowPlayingCenter()
-                    }
-                } else if self.loadGeneration == gen {
-                    self.lyricsLoaded = true
-                }
-            }
-        } else {
-            lyricsLoaded = true
-        }
+        // 异步加载歌词（优先插件在线歌词，离线或无网时自动读取本地同名 .lrc）
+        loadLyricsWithOfflineFallback(src: src, track: track, offlineAudioURL: offlineAudioURL, gen: gen)
 
         // 记录播放历史
         let key = track.compositeKey
@@ -1836,10 +2120,16 @@ public final class PlayerEngine: ObservableObject {
             }
         }
 
+        // 若当前曲目已永久离线下载，优先直读本地音频文件零流量秒播
+        if let offlineAudioURL {
+            playResolvedOfflineAudio(offlineAudioURL, track: track, autoPlay: autoPlay, initialSeek: resolvedInitialSeek, gen: gen)
+            return
+        }
+
         // 远程播放源处理
         if src.info().playback == .remote {
             let ids = orderedQueue.map(\.id)
-            let posMs = Int64(initialSeek * 1000)
+            let posMs = Int64(resolvedInitialSeek * 1000)
             Task {
                 do {
                     try await src.remotePlay(ids: ids, start: orderIndex, position: posMs)
@@ -1862,6 +2152,37 @@ public final class PlayerEngine: ObservableObject {
             return
         }
 
+        // 若预热备用播放器恰匹配本曲，零网络延迟直接接管
+        if let warmPlayer = standbyPlayer,
+           standbyOrderIndex == orderIndex,
+           standbyTrackKey == key,
+           let warmStream = standbyStreamInfo {
+            let warmLocalURL = standbyResolvedLocalURL
+            let warmMode = standbyDeliveryMode ?? "Direct Stream"
+            clearStandbyPlayerReferenceOnly()
+            self.currentStream = warmStream
+            self.activeSignalCodec = Self.resolvedCodecLabel(streamType: warmStream.type, url: warmLocalURL ?? URL(string: warmStream.url))
+            Task {
+                guard self.loadGeneration == gen else {
+                    warmPlayer.pause()
+                    return
+                }
+                await self.startAVPlayer(
+                    with: warmStream,
+                    track: track,
+                    quality: qualityProvider?() ?? "high",
+                    autoPlay: autoPlay,
+                    initialSeek: resolvedInitialSeek,
+                    gen: gen,
+                    deliveryModeOverride: warmMode,
+                    prewarmedPlayer: warmPlayer,
+                    prewarmedLocalURL: warmLocalURL
+                )
+            }
+            return
+        }
+        cleanupStandbyPlayer()
+
         // 流媒体/本地文件播放处理（优先使用下一首流地址预取缓存）
         let quality = qualityProvider?() ?? "high"
         let trackID = track.id
@@ -1882,13 +2203,13 @@ public final class PlayerEngine: ObservableObject {
                 }
                 guard self.loadGeneration == gen else { return }
                 self.currentStream = streamInfo
-                self.computeLoudnessGain(streamInfo)
+                self.activeSignalCodec = Self.resolvedCodecLabel(streamType: streamInfo.type, url: URL(string: streamInfo.url))
                 await self.startAVPlayer(
                     with: streamInfo,
                     track: track,
                     quality: quality,
                     autoPlay: autoPlay,
-                    initialSeek: initialSeek,
+                    initialSeek: resolvedInitialSeek,
                     gen: gen
                 )
             } catch let err as SourceError {
@@ -1901,47 +2222,79 @@ public final class PlayerEngine: ObservableObject {
         }
     }
 
-    private func computeLoudnessGain(_ stream: StreamInfo) {
-        guard normalizeProvider?() == true else {
-            currentGainLinear = 1.0
+    private func loadLyricsWithOfflineFallback(
+        src: MusicSource?,
+        track: Track,
+        offlineAudioURL: URL?,
+        gen: Int
+    ) {
+        guard !track.isEpisode else {
+            lyricsLoaded = true
+            lyricsSignature = Self.makeLyricsSignature(trackKey: track.compositeKey, lines: [])
             return
         }
-        var gainLinear: Double = 1.0
-        if let gainDB = stream.gain, gainDB != 0 {
-            gainLinear = pow(10.0, gainDB / 20.0)
+        Task {
+            var parsed: [LyricLine] = []
+            if let src, src.can("lyrics"), let rawLyrics = try? await src.lyrics(id: track.id) {
+                parsed = LyricsEngine.fromSource(rawLyrics)
+            }
+            if parsed.isEmpty, let offlineAudioURL {
+                let lrcURL = offlineAudioURL.deletingPathExtension().appendingPathExtension("lrc")
+                if let data = try? Data(contentsOf: lrcURL),
+                   let text = LocalMusicSource.decodeTextWithFallback(data),
+                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    parsed = LyricsEngine.fromSource(RawLyrics(lrc: text))
+                }
+            }
+            guard self.loadGeneration == gen else { return }
+            self.lyrics = parsed
+            self.lyricsLoaded = true
+            self.lyricsSignature = Self.makeLyricsSignature(trackKey: track.compositeKey, lines: parsed)
+            if !parsed.isEmpty {
+                self.rebuildLyricBoundaryObserver()
+                self.updateNowPlayingCenter()
+            }
         }
-        if let peak = stream.peak, peak > 0, gainLinear * peak > 1.0 {
-            gainLinear = 1.0 / peak
+    }
+
+    private func playResolvedOfflineAudio(
+        _ offlineAudioURL: URL,
+        track: Track,
+        autoPlay: Bool,
+        initialSeek: TimeInterval,
+        gen: Int
+    ) {
+        cleanupStandbyPlayer()
+        let ext = offlineAudioURL.pathExtension.lowercased()
+        let streamInfo = StreamInfo(
+            url: offlineAudioURL.absoluteString,
+            type: ext.isEmpty ? "mp3" : ext,
+            quality: (ext == "flac" || ext == "wav") ? "lossless" : "high"
+        )
+        self.currentStream = streamInfo
+        self.activeSignalCodec = Self.resolvedCodecLabel(streamType: streamInfo.type, url: offlineAudioURL)
+        Task {
+            guard self.loadGeneration == gen else { return }
+            await self.startAVPlayer(
+                with: streamInfo,
+                track: track,
+                quality: streamInfo.quality ?? "high",
+                autoPlay: autoPlay,
+                initialSeek: initialSeek,
+                gen: gen,
+                deliveryModeOverride: "Offline File"
+            )
         }
-        currentGainLinear = Float(min(max(gainLinear, 0.1), 2.0))
     }
 
     private func applyPlayerVolume() {
         #if os(iOS)
-        // iOS 下输出音量由系统硬件与 MPVolumeView 统一接管，播放器仅保留响度均衡与淡入淡出系数，避免双重衰减
-        let baseScale: Float = 1.0
+        // iOS 下输出音量由系统硬件与 MPVolumeView 统一接管，播放器保持直出基准增益
+        let effective: Float = 1.0
         #else
-        let baseScale = Float(volume)
+        let effective = Float(min(max(volume, 0.0), 1.0))
         #endif
-        let effective = baseScale * min(currentGainLinear, 1.0) * min(max(currentFadeMultiplier, 0.0), 1.0)
-        avPlayer?.volume = min(max(effective, 0.0), 1.0)
-    }
-
-    private func animateFade(from start: Float, to end: Float, durationMs: Int, gen: Int) async {
-        let steps = max(4, durationMs / 16)
-        let sleepNs = UInt64(max(1, durationMs / steps)) * 1_000_000
-        for step in 1...steps {
-            guard !Task.isCancelled, loadGeneration == gen else { return }
-            let progress = Double(step) / Double(steps)
-            let eased = Float(0.5 - 0.5 * cos(.pi * progress))
-            currentFadeMultiplier = start + (end - start) * eased
-            applyPlayerVolume()
-            try? await Task.sleep(nanoseconds: sleepNs)
-        }
-        if !Task.isCancelled, loadGeneration == gen {
-            currentFadeMultiplier = end
-            applyPlayerVolume()
-        }
+        avPlayer?.volume = effective
     }
 
     /// 重新加载并播放当前曲目
@@ -2030,7 +2383,10 @@ public final class PlayerEngine: ObservableObject {
         autoPlay: Bool,
         initialSeek: TimeInterval,
         gen: Int,
-        forceProxy: Bool = false
+        forceProxy: Bool = false,
+        deliveryModeOverride: String? = nil,
+        prewarmedPlayer: AVPlayer? = nil,
+        prewarmedLocalURL: URL? = nil
     ) async {
         // 仅当真正开始播放时激活系统音频会话，冷启动恢复暂停会话时避免同步抢占音频路由
         if autoPlay {
@@ -2055,6 +2411,7 @@ public final class PlayerEngine: ObservableObject {
         }
 
         guard let url = assetURL else {
+            prewarmedPlayer?.pause()
             isLoading = false
             isPlaying = false
             errorMessage = I18n.t("Couldn't play this song")
@@ -2062,6 +2419,7 @@ public final class PlayerEngine: ObservableObject {
         }
 
         if let unsupported = Self.unsupportedAudioFormat(url: url, stream: stream) {
+            prewarmedPlayer?.pause()
             isLoading = false
             isPlaying = false
             errorMessage = String(format: I18n.t("Current audio format (%@) is not supported on iOS yet"), unsupported)
@@ -2077,57 +2435,73 @@ public final class PlayerEngine: ObservableObject {
             || (stream.type?.lowercased().contains("mpegurl") == true)
             || url.absoluteString.lowercased().contains(".m3u8")
 
+        let player: AVPlayer
+        let item: AVPlayerItem
         let asset: AVURLAsset
         var usedProxy = false
-        var resolvedLocalFileURL: URL? = url.isFileURL ? url : nil
-        if !url.isFileURL, let cacheKey, let cached = diskCache.cachedFileURL(forKey: cacheKey) {
-            // 优先从磁盘缓存秒开，零网络延迟并支持原生高精度 Seek 与全曲真频谱解码
-            asset = AVURLAsset(url: cached.fileURL)
-            resolvedLocalFileURL = cached.fileURL
-        } else if !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") && (forceProxy || Self.shouldUseStreamProxy(url: url, stream: stream)) {
-            // 对 .m4s、含 Cookie 等敏感头或直连回退流使用 AudioStreamProxy（保留跨域头与边播边缓）
-            usedProxy = true
-            var mergedHeaders = Self.directAssetHTTPHeaders(for: stream)
-            if !mergedHeaders.keys.contains(where: { $0.lowercased() == "user-agent" }) {
-                mergedHeaders["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) mygo-music/0.1"
-            }
-            let proxy = AudioStreamProxy(
-                remoteURL: url,
-                headers: mergedHeaders,
-                streamTypeHint: stream.type,
-                cacheKey: cacheKey,
-                diskCache: diskCache,
-                sessionConfiguration: proxySessionConfiguration
-            )
-            proxy.onCacheStored = { [weak self] storedFileURL in
-                Task { @MainActor [weak self] in
-                    guard let self, self.loadGeneration == gen else { return }
-                    self.startSpectrumTimelineAnalysis(forFile: storedFileURL, gen: gen)
+        var resolvedLocalFileURL: URL? = prewarmedLocalURL ?? (url.isFileURL ? url : nil)
+        var detectedDeliveryMode = deliveryModeOverride ?? (url.isFileURL ? "Offline File" : "Direct Stream")
+
+        if let prewarmedPlayer, let existingItem = prewarmedPlayer.currentItem {
+            player = prewarmedPlayer
+            item = existingItem
+            asset = (existingItem.asset as? AVURLAsset) ?? Self.makeAudioURLAsset(url: url)
+        } else {
+            if !url.isFileURL, let cacheKey, let cached = diskCache.cachedFileURL(forKey: cacheKey) {
+                // 优先从磁盘缓存秒开，开启精确帧索引支持高精度 Seek 与全曲真频谱解码
+                asset = Self.makeAudioURLAsset(url: cached.fileURL)
+                resolvedLocalFileURL = cached.fileURL
+                detectedDeliveryMode = deliveryModeOverride ?? "Disk Cache"
+            } else if !url.isFileURL && !isHLS && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https") && (forceProxy || Self.shouldUseStreamProxy(url: url, stream: stream)) {
+                // 对 .m4s、含 Cookie 等敏感头或直连回退流使用 AudioStreamProxy（保留跨域头与边播边缓）
+                usedProxy = true
+                detectedDeliveryMode = deliveryModeOverride ?? "Streaming Proxy"
+                var mergedHeaders = Self.directAssetHTTPHeaders(for: stream)
+                if !mergedHeaders.keys.contains(where: { $0.lowercased() == "user-agent" }) {
+                    mergedHeaders["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) mygo-music/0.1"
                 }
-            }
-            self.activeStreamProxy = proxy
-            let proxyAsset = AVURLAsset(url: proxy.makeProxyAssetURL())
-            proxyAsset.resourceLoader.setDelegate(proxy, queue: proxy.delegateQueue)
-            asset = proxyAsset
-        } else {
-            let directHeaders = Self.directAssetHTTPHeaders(for: stream)
-            if directHeaders.isEmpty {
-                asset = AVURLAsset(url: url)
+                let proxy = AudioStreamProxy(
+                    remoteURL: url,
+                    headers: mergedHeaders,
+                    streamTypeHint: stream.type,
+                    cacheKey: cacheKey,
+                    diskCache: diskCache,
+                    sessionConfiguration: proxySessionConfiguration
+                )
+                proxy.onCacheStored = { [weak self] storedFileURL in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.loadGeneration == gen else { return }
+                        self.startSpectrumTimelineAnalysis(forFile: storedFileURL, gen: gen)
+                    }
+                }
+                self.activeStreamProxy = proxy
+                let proxyAsset = Self.makeAudioURLAsset(url: proxy.makeProxyAssetURL(), preferPreciseTiming: false)
+                proxyAsset.resourceLoader.setDelegate(proxy, queue: proxy.delegateQueue)
+                asset = proxyAsset
             } else {
-                asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": directHeaders])
+                let directHeaders = Self.directAssetHTTPHeaders(for: stream)
+                asset = Self.makeAudioURLAsset(
+                    url: url,
+                    httpHeaders: directHeaders,
+                    preferPreciseTiming: url.isFileURL
+                )
             }
+
+            item = AVPlayerItem(asset: asset)
+            if !url.isFileURL && resolvedLocalFileURL == nil {
+                // 在线流仅保留适度前向缓冲门槛，避免高码率无损 FLAC 起播长时间滞留评估阶段
+                item.preferredForwardBufferDuration = 4.0
+            }
+            player = AVPlayer(playerItem: item)
         }
 
-        let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 10
-        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true
+        #if os(iOS)
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        #endif
         self.avPlayer = player
-
-        if autoPlay && fadeEnabledProvider?() == true {
-            currentFadeMultiplier = 0.0
-        } else {
-            currentFadeMultiplier = 1.0
-        }
+        self.activeSignalDeliveryMode = detectedDeliveryMode
+        self.activeSignalCodec = Self.resolvedCodecLabel(streamType: stream.type, url: resolvedLocalFileURL ?? url)
         applyPlayerVolume()
 
         // 任何本地音轨或已缓存本地文件（包含 MP3/M4A/WAV/FLAC），即刻启动非阻塞全曲硬件 FFT 频谱表构建
@@ -2135,17 +2509,28 @@ public final class PlayerEngine: ObservableObject {
             startSpectrumTimelineAnalysis(forFile: localAudioURL, gen: gen)
         }
 
-        // 同时为安全本地非 FLAC 文件保留实时 Tap 供第 0 秒瞬时起跳衔接（直到全曲表就绪）
+        // 同时解析真实采样率/位深并为安全本地非 FLAC 文件挂载实时 Tap（驱动实时频谱视觉律动）
         let isLocalSafeTapTarget = (resolvedLocalFileURL != nil) && (resolvedLocalFileURL!.pathExtension.lowercased() != "flac")
-        if isLocalSafeTapTarget {
-            let meter = AudioBandMeter()
-            Task { [weak self, weak item] in
-                guard let item, let tracks = try? await asset.load(.tracks),
-                      let audioTrack = tracks.first(where: { $0.mediaType == .audio }),
-                      let self, self.loadGeneration == gen,
-                      let tap = self.makeAudioTap(for: meter) else {
-                    return
+        let meter = isLocalSafeTapTarget ? AudioBandMeter() : nil
+        Task { [weak self, weak item] in
+            guard let item, let tracks = try? await asset.load(.tracks),
+                  let audioTrack = tracks.first(where: { $0.mediaType == .audio }),
+                  let self, self.loadGeneration == gen else {
+                return
+            }
+            if let fmts = try? await audioTrack.load(.formatDescriptions),
+               let firstDesc = fmts.first,
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(firstDesc)?.pointee {
+                if asbd.mSampleRate > 0 {
+                    self.activeSignalSampleRateHz = Int(asbd.mSampleRate.rounded())
                 }
+                if asbd.mBitsPerChannel > 0 {
+                    self.activeSignalBitDepth = Int(asbd.mBitsPerChannel)
+                } else if self.activeSignalCodec == "FLAC" || self.activeSignalCodec == "WAV" {
+                    self.activeSignalBitDepth = 16
+                }
+            }
+            if let meter, let tap = self.makeAudioTap(for: meter) {
                 let parameters = AVMutableAudioMixInputParameters(track: audioTrack)
                 parameters.audioTapProcessor = tap
                 let mix = AVMutableAudioMix()
@@ -2194,12 +2579,6 @@ public final class PlayerEngine: ObservableObject {
                         if self.isLoading {
                             armWatchdog()
                         }
-                        if self.fadeEnabledProvider?() == true && self.currentFadeMultiplier < 0.99 {
-                            self.fadeTask?.cancel()
-                            self.fadeTask = Task { [weak self] in
-                                await self?.animateFade(from: self?.currentFadeMultiplier ?? 0.0, to: 1.0, durationMs: 220, gen: gen)
-                            }
-                        }
                     }
                     self.updateNowPlayingCenter()
                 case .failed:
@@ -2242,6 +2621,7 @@ public final class PlayerEngine: ObservableObject {
                 case .playing:
                     self.isLoading = false
                     self.cancelBufferWatchdog()
+                    self.updateNowPlayingCenter(useLiveClock: true)
                     if !usedProxy && !url.isFileURL && !isHLS, let cacheKey,
                        self.activeSpectrumTimeline == nil && self.backgroundCacheTask == nil {
                         self.scheduleDirectStreamBackgroundCache(
@@ -2296,6 +2676,7 @@ public final class PlayerEngine: ObservableObject {
                 if self.duration > 0 && (self.duration - sec <= 35 || sec >= 5 && self.duration <= 25) {
                     self.maybePrefetchNextTrack()
                 }
+                self.recordPlaybackProgressSnapshot(force: false)
             }
         }
         rebuildLyricBoundaryObserver()
@@ -2359,8 +2740,24 @@ public final class PlayerEngine: ObservableObject {
         }
 
         if initialSeek > 0 {
+            self.isSeeking = true
             let cm = CMTime(seconds: initialSeek, preferredTimescale: 600)
-            player.seek(to: cm, toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
+            player.seek(to: cm, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.loadGeneration == gen else { return }
+                    let actualSec = CMTimeGetSeconds(player.currentTime())
+                    if actualSec.isFinite && actualSec >= 0 {
+                        let resolved = self.duration > 0 ? min(actualSec, self.duration) : actualSec
+                        self.position = resolved
+                        self.lastObservedMediaPosition = resolved
+                        self.syncNowPlayingLyricsIfNeeded(at: resolved)
+                    }
+                    self.isSeeking = false
+                    self.seekSettledRevision &+= 1
+                    self.rebuildLyricBoundaryObserver()
+                    self.updateNowPlayingCenter(useLiveClock: true)
+                }
+            }
         }
 
         if autoPlay || isPlaying {
@@ -2369,12 +2766,6 @@ public final class PlayerEngine: ObservableObject {
             isLoading = player.timeControlStatus != .playing
             if isLoading {
                 armWatchdog()
-            }
-            if fadeEnabledProvider?() == true && currentFadeMultiplier < 0.99 {
-                fadeTask?.cancel()
-                fadeTask = Task { [weak self] in
-                    await self?.animateFade(from: self?.currentFadeMultiplier ?? 0.0, to: 1.0, durationMs: 220, gen: gen)
-                }
             }
         } else {
             isLoading = false
@@ -2386,6 +2777,7 @@ public final class PlayerEngine: ObservableObject {
     private func cancelBufferWatchdog() {
         bufferWatchdogTask?.cancel()
         bufferWatchdogTask = nil
+        watchdogPhaseKey = nil
     }
 
     private func scheduleBufferWatchdog(
@@ -2399,15 +2791,24 @@ public final class PlayerEngine: ObservableObject {
         usedProxy: Bool,
         forceProxy: Bool
     ) {
-        bufferWatchdogTask?.cancel()
         guard isPlaying, isLoading, loadGeneration == gen else {
-            bufferWatchdogTask = nil
+            cancelBufferWatchdog()
             return
         }
+        let phaseKey = "\(gen):\(forceProxy ? 1 : 0):\(usedProxy ? 1 : 0)"
+        let currentPos = max(0, position)
+        // 若同阶段看门狗已在计时且尚未真正播进超过 0.25s，绝不因 readyToPlay 或重复 waiting 事件清零延后超时
+        if bufferWatchdogTask != nil && watchdogPhaseKey == phaseKey && abs(currentPos - watchdogBaselinePos) <= 0.25 {
+            return
+        }
+        bufferWatchdogTask?.cancel()
+        watchdogPhaseKey = phaseKey
+        watchdogBaselinePos = currentPos
+
         let canFallbackToProxy = !usedProxy && !forceProxy && !url.isFileURL && !isHLS
             && (url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https")
         let timeoutSec = canFallbackToProxy ? max(0.05, directBufferTimeoutSeconds) : max(0.05, proxyBufferTimeoutSeconds)
-        let baselinePos = max(0, position)
+        let baselinePos = currentPos
 
         bufferWatchdogTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(timeoutSec * 1_000_000_000))
@@ -2486,17 +2887,17 @@ public final class PlayerEngine: ObservableObject {
         updateNowPlayingCenter()
     }
 
-    /// 当当前曲目即将结束时提前解析下一首流地址，实现无缝切歌
+    /// 当当前曲目即将结束时提前解析下一首流地址，并在开启无缝/交叉淡入淡出时预先缓冲副播放器
     private func maybePrefetchNextTrack() {
         guard !order.isEmpty, currentOrderIndex >= 0 else { return }
-        let nextOrderIdx: Int
-        if currentOrderIndex + 1 < order.count {
-            nextOrderIdx = currentOrderIndex + 1
-        } else if repeatMode == .all, order.count > 1 {
-            nextOrderIdx = 0
-        } else {
+        guard let nextOrderIdx = findPlayableOrderIndex(
+            startingAt: currentOrderIndex + 1,
+            step: 1,
+            wrapAround: repeatMode == .all
+        ) else {
             return
         }
+        guard nextOrderIdx != currentOrderIndex || repeatMode == .all else { return }
 
         let queueIdx = order[nextOrderIdx]
         guard queueIdx >= 0 && queueIdx < queue.count else { return }
@@ -2505,19 +2906,128 @@ public final class PlayerEngine: ObservableObject {
         guard prefetchAttemptedKey != nextKey else { return }
         prefetchAttemptedKey = nextKey
 
-        guard let nextSrc = sourceForTrack(nextTrack), nextSrc.info().playback != .remote else { return }
         let quality = qualityProvider?() ?? "high"
+        let shouldPrewarmPlayer = gaplessPlaybackEnabled
+
+        // 1) 若下一首有永久本地离线文件，直接预热 standbyPlayer
+        if let offlineURL = localOfflineFileResolver?(nextTrack) {
+            let ext = offlineURL.pathExtension.lowercased()
+            let offlineStream = StreamInfo(
+                url: offlineURL.absoluteString,
+                type: ext.isEmpty ? "mp3" : ext,
+                quality: (ext == "flac" || ext == "wav") ? "lossless" : "high"
+            )
+            self.prefetchedStream = (nextKey, quality, offlineStream, Date())
+            if shouldPrewarmPlayer {
+                self.prepareStandbyPlayer(
+                    stream: offlineStream,
+                    track: nextTrack,
+                    orderIndex: nextOrderIdx,
+                    quality: quality
+                )
+            }
+            return
+        }
+
+        guard let nextSrc = sourceForTrack(nextTrack), nextSrc.info().playback != .remote else { return }
         let trackID = nextTrack.id
         Task { [weak self] in
             guard let nextStream = try? await nextSrc.stream(id: trackID, quality: quality) else { return }
             await MainActor.run {
                 guard let self, self.currentTrack?.compositeKey != nextKey else { return }
                 self.prefetchedStream = (nextKey, quality, nextStream, Date())
+                if self.gaplessPlaybackEnabled {
+                    self.prepareStandbyPlayer(
+                        stream: nextStream,
+                        track: nextTrack,
+                        orderIndex: nextOrderIdx,
+                        quality: quality
+                    )
+                }
             }
         }
     }
 
+    private func prepareStandbyPlayer(
+        stream: StreamInfo,
+        track: Track,
+        orderIndex: Int,
+        quality: String
+    ) {
+        let rawURL = stream.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: rawURL) ?? (rawURL.hasPrefix("/") ? URL(fileURLWithPath: rawURL) : nil) else {
+            return
+        }
+        guard Self.unsupportedAudioFormat(url: url, stream: stream) == nil else { return }
+        let isHLS = url.pathExtension.lowercased() == "m3u8" || rawURL.lowercased().contains(".m3u8")
+
+        let cacheKey = (!url.isFileURL) ? AudioDiskCache.cacheKey(sourceID: track.source ?? LocalMusicSource.sourceID, trackID: track.id, quality: quality) : nil
+        var resolvedLocal: URL? = url.isFileURL ? url : nil
+        var deliveryMode = url.isFileURL ? "Offline File" : "Direct Stream"
+        let asset: AVURLAsset
+
+        if !url.isFileURL, let cacheKey, let cached = diskCache.cachedFileURL(forKey: cacheKey) {
+            resolvedLocal = cached.fileURL
+            deliveryMode = "Disk Cache"
+            asset = Self.makeAudioURLAsset(url: cached.fileURL)
+        } else if !url.isFileURL && !isHLS && Self.shouldUseStreamProxy(url: url, stream: stream) {
+            // 代理流不并发提前抢占 Socket，继续由 prefetchedStream 秒开接管
+            return
+        } else {
+            // 当前曲目仍在起播/缓冲或已暂停时，绝不后台并发预拉下一首网络大流
+            if !url.isFileURL && (isLoading || !isPlaying) {
+                return
+            }
+            let directHeaders = Self.directAssetHTTPHeaders(for: stream)
+            asset = Self.makeAudioURLAsset(
+                url: url,
+                httpHeaders: directHeaders,
+                preferPreciseTiming: url.isFileURL
+            )
+        }
+
+        cleanupStandbyPlayer()
+        let item = AVPlayerItem(asset: asset)
+        if !url.isFileURL && resolvedLocal == nil {
+            item.preferredForwardBufferDuration = 3.0
+        }
+        let player = AVPlayer(playerItem: item)
+        player.volume = 0
+        player.allowsExternalPlayback = true
+        #if os(iOS)
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        #endif
+
+        self.standbyPlayer = player
+        self.standbyTrackKey = track.compositeKey
+        self.standbyOrderIndex = orderIndex
+        self.standbyStreamInfo = stream
+        self.standbyResolvedLocalURL = resolvedLocal
+        self.standbyDeliveryMode = deliveryMode
+    }
+
+    private func clearStandbyPlayerReferenceOnly() {
+        standbyPlayer = nil
+        standbyTrackKey = nil
+        standbyOrderIndex = nil
+        standbyStreamInfo = nil
+        standbyResolvedLocalURL = nil
+        standbyDeliveryMode = nil
+    }
+
+    private func cleanupStandbyPlayer() {
+        standbyPlayer?.pause()
+        clearStandbyPlayerReferenceOnly()
+    }
+
     private func handleTrackEnded() {
+        if let tr = currentTrack, tr.isEpisode {
+            onEpisodePositionUpdated?(tr.compositeKey, nil)
+        }
+        if sleepTimerStopsAfterCurrentTrack {
+            completeSleepTimer()
+            return
+        }
         if repeatMode == .one {
             seek(to: 0)
             resume()
@@ -2542,6 +3052,7 @@ public final class PlayerEngine: ObservableObject {
         isLoading = false
         isPlaying = false
         errorMessage = err.localizedDescription
+        updateNowPlayingCenter()
         switch err {
         case .signIn, .setup:
             onSourceFailure?(sourceID, err)
@@ -2585,13 +3096,10 @@ public final class PlayerEngine: ObservableObject {
         loadTrack(atOrderIndex: targetIdx, autoPlay: true)
     }
 
-    private func cleanupAVPlayer() {
+    private func detachObserversFromActivePlayer() {
         isSeeking = false
         lastObservedMediaPosition = -1
         cancelBufferWatchdog()
-        fadeTask?.cancel()
-        fadeTask = nil
-        currentFadeMultiplier = 1.0
         statusObservation?.invalidate()
         statusObservation = nil
         timeControlObservation?.invalidate()
@@ -2616,16 +3124,20 @@ public final class PlayerEngine: ObservableObject {
             NotificationCenter.default.removeObserver(failObs)
             failObserver = nil
         }
-        avPlayer?.pause()
-        avPlayer = nil
-        activeStreamProxy?.invalidate()
-        activeStreamProxy = nil
         audioBandMeter = nil
         spectrumAnalysisTask?.cancel()
         spectrumAnalysisTask = nil
         backgroundCacheTask?.cancel()
         backgroundCacheTask = nil
         activeSpectrumTimeline = nil
+    }
+
+    private func cleanupAVPlayer() {
+        detachObserversFromActivePlayer()
+        avPlayer?.pause()
+        avPlayer = nil
+        activeStreamProxy?.invalidate()
+        activeStreamProxy = nil
         rhythmSmoothedState = .idle
         lastRhythmSampleTimestamp = 0
         tapBassMovingMean = 0.15
@@ -2643,46 +3155,272 @@ public final class PlayerEngine: ObservableObject {
             unprepare: audioTapUnprepare,
             process: audioTapProcess
         )
-        var unmanagedTap: Unmanaged<MTAudioProcessingTap>?
-        let status = MTAudioProcessingTapCreate(
-            kCFAllocatorDefault,
-            &callbacks,
-            kMTAudioProcessingTapCreationFlag_PostEffects,
-            &unmanagedTap
-        )
-        guard status == noErr, let unmanagedTap else {
+        let (status, tap) = Self.createProcessingTapCompat(MTAudioProcessingTapCreate, callbacks: &callbacks)
+        guard status == noErr, let tap else {
             Unmanaged<AudioBandMeter>.fromOpaque(retainedMeter).release()
             return nil
         }
-        return unmanagedTap.takeRetainedValue()
+        return tap
     }
 
-    // MARK: - iOS 系统音频会话与锁屏控制中心
+    // 兼容新旧 Apple SDK：Xcode 27.2+ 将 tapOut 标注为 CM_RETURNS_RETAINED_PARAMETER，旧版为 Unmanaged<MTAudioProcessingTap>?
+    private nonisolated static func createProcessingTapCompat(
+        _ createFn: (
+            CFAllocator?,
+            UnsafePointer<MTAudioProcessingTapCallbacks>,
+            MTAudioProcessingTapCreationFlags,
+            UnsafeMutablePointer<MTAudioProcessingTap?>
+        ) -> OSStatus,
+        callbacks: UnsafePointer<MTAudioProcessingTapCallbacks>
+    ) -> (OSStatus, MTAudioProcessingTap?) {
+        var tap: MTAudioProcessingTap?
+        let status = createFn(kCFAllocatorDefault, callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &tap)
+        return (status, tap)
+    }
+
+    private nonisolated static func createProcessingTapCompat(
+        _ createFn: (
+            CFAllocator?,
+            UnsafePointer<MTAudioProcessingTapCallbacks>,
+            MTAudioProcessingTapCreationFlags,
+            UnsafeMutablePointer<Unmanaged<MTAudioProcessingTap>?>
+        ) -> OSStatus,
+        callbacks: UnsafePointer<MTAudioProcessingTapCallbacks>
+    ) -> (OSStatus, MTAudioProcessingTap?) {
+        var unmanagedTap: Unmanaged<MTAudioProcessingTap>?
+        let status = createFn(kCFAllocatorDefault, callbacks, kMTAudioProcessingTapCreationFlag_PostEffects, &unmanagedTap)
+        return (status, unmanagedTap?.takeRetainedValue())
+    }
+
+    // MARK: - iOS 系统音频会话与锁屏/灵动岛控制中心
+
+    /// 统一配置长音频后台播放类别（声明 `.longFormAudio` 路由策略以激活灵动岛与 AirPlay 独立音轨）
+    nonisolated public static func configurePlaybackAudioSessionCategory() {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        if session.category == .playback && session.routeSharingPolicy == .longFormAudio {
+            return
+        }
+        do {
+            try session.setCategory(.playback, mode: .default, policy: .longFormAudio, options: [])
+        } catch {
+            do {
+                try session.setCategory(.playback, mode: .default, options: [])
+            } catch {
+                print("AVAudioSession category setup failed: \(error)")
+            }
+        }
+        #endif
+    }
 
     private func configureAudioSession() {
         ensureAudioSessionActive()
     }
 
     nonisolated private static func preparePlaybackAudioCategory() {
-        #if os(iOS)
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
-        } catch {
-            print("AVAudioSession category setup failed: \(error)")
-        }
-        #endif
+        configurePlaybackAudioSessionCategory()
     }
 
     private func ensureAudioSessionActive() {
         #if os(iOS)
+        Self.configurePlaybackAudioSessionCategory()
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true)
+            try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             print("AVAudioSession configuration failed: \(error)")
         }
+        #if canImport(UIKit)
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        #endif
+        #endif
+    }
+
+    /// 监听系统音频打断（来电/Siri）、耳机拔出路由变化、媒体服务重置以及前后台切出瞬时校准
+    private func registerSystemLifecycleObservers() {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        let interruptionToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+            Task { @MainActor [weak self] in
+                self?.handleAudioSessionInterruption(typeRaw: typeRaw, optionsRaw: optionsRaw)
+            }
+        }
+        systemObservers.append(interruptionToken)
+
+        let routeToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] note in
+            let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            let prevDesc = note.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+            let prevPorts = prevDesc?.outputs.map { $0.portType.rawValue } ?? []
+            Task { @MainActor [weak self] in
+                self?.handleAudioRouteChange(reasonRaw: reasonRaw, previousOutputPortTypes: prevPorts)
+            }
+        }
+        systemObservers.append(routeToken)
+
+        let resetToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleMediaServicesWereReset()
+            }
+        }
+        systemObservers.append(resetToken)
+        #endif
+
+        #if canImport(UIKit)
+        let resignToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.syncSystemNowPlayingForTransition()
+            }
+        }
+        systemObservers.append(resignToken)
+
+        let bgToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.syncSystemNowPlayingForTransition()
+            }
+        }
+        systemObservers.append(bgToken)
+
+        let fgToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.currentTrack != nil else { return }
+                if !self.isSeeking {
+                    self.position = self.livePlaybackPosition()
+                }
+                self.updateNowPlayingCenter(useLiveClock: true)
+            }
+        }
+        systemObservers.append(fgToken)
+        #endif
+    }
+
+    private func syncSystemNowPlayingForTransition() {
+        guard currentTrack != nil else { return }
+        if !isSeeking {
+            let livePos = livePlaybackPosition()
+            if livePos.isFinite && livePos >= 0 {
+                position = livePos
+            }
+        }
+        recordPlaybackProgressSnapshot(force: true)
+        if isPlaying {
+            ensureAudioSessionActive()
+        }
+        updateNowPlayingCenter(useLiveClock: true)
+    }
+
+    private func recordPlaybackProgressSnapshot(force: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || (now - lastProgressSnapshotUptime) >= 10.0 else { return }
+        lastProgressSnapshotUptime = now
+
+        if let tr = currentTrack, tr.isEpisode {
+            let livePos = isPlaying ? livePlaybackPosition() : position
+            if duration > 5 && livePos >= duration - 3 {
+                onEpisodePositionUpdated?(tr.compositeKey, nil)
+            } else if livePos >= 1.0 {
+                onEpisodePositionUpdated?(tr.compositeKey, livePos)
+            }
+        }
+        if !force {
+            onSessionChanged?()
+        }
+    }
+
+    #if os(iOS)
+    private func handleAudioSessionInterruption(typeRaw: UInt?, optionsRaw: UInt?) {
+        guard let typeRaw, let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+        switch type {
+        case .began:
+            wasPlayingBeforeInterruption = isPlaying
+            if isPlaying {
+                isPlaying = false
+                avPlayer?.pause()
+                updateNowPlayingCenter(useLiveClock: true)
+            }
+        case .ended:
+            let shouldResume = optionsRaw
+                .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
+            let resumeWanted = wasPlayingBeforeInterruption
+            wasPlayingBeforeInterruption = false
+            if shouldResume && resumeWanted && currentTrack != nil {
+                ensureAudioSessionActive()
+                resume()
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleAudioRouteChange(reasonRaw: UInt?, previousOutputPortTypes: [String]) {
+        guard let reasonRaw else { return }
+        if Self.shouldPauseForAudioRouteChange(reasonRawValue: reasonRaw, previousOutputPortTypes: previousOutputPortTypes),
+           isPlaying {
+            pause()
+        }
+    }
+
+    private func handleMediaServicesWereReset() {
+        Self.configurePlaybackAudioSessionCategory()
+        if isPlaying {
+            ensureAudioSessionActive()
+        } else {
+            #if canImport(UIKit)
+            UIApplication.shared.beginReceivingRemoteControlEvents()
+            #endif
+        }
+        updateNowPlayingCenter(useLiveClock: true)
+    }
+    #endif
+
+    /// 判断音频路由变更是否因耳机/蓝牙等外设断开而需要自动暂停播放（防止外放干扰）
+    nonisolated public static func shouldPauseForAudioRouteChange(
+        reasonRawValue: UInt,
+        previousOutputPortTypes: [String]
+    ) -> Bool {
+        #if os(iOS)
+        guard reasonRawValue == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue else {
+            return false
+        }
+        if previousOutputPortTypes.isEmpty {
+            return true
+        }
+        let externalPorts: Set<String> = [
+            AVAudioSession.Port.headphones.rawValue,
+            AVAudioSession.Port.bluetoothA2DP.rawValue,
+            AVAudioSession.Port.bluetoothHFP.rawValue,
+            AVAudioSession.Port.bluetoothLE.rawValue,
+            AVAudioSession.Port.usbAudio.rawValue,
+            AVAudioSession.Port.carAudio.rawValue,
+            AVAudioSession.Port.airPlay.rawValue
+        ]
+        return previousOutputPortTypes.contains { externalPorts.contains($0) }
+        #else
+        return reasonRawValue == 2 && !previousOutputPortTypes.isEmpty
         #endif
     }
 
@@ -2713,11 +3451,100 @@ public final class PlayerEngine: ObservableObject {
             Task { @MainActor in self?.seek(to: posEvent.positionTime) }
             return .success
         }
+        center.skipForwardCommand.preferredIntervals = [15]
+        center.skipForwardCommand.addTarget { [weak self] event in
+            let interval = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.seek(to: self.livePlaybackPosition() + interval)
+            }
+            return .success
+        }
+        center.skipBackwardCommand.preferredIntervals = [15]
+        center.skipBackwardCommand.addTarget { [weak self] event in
+            let interval = (event as? MPSkipIntervalCommandEvent)?.interval ?? 15
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.seek(to: max(0, self.livePlaybackPosition() - interval))
+            }
+            return .success
+        }
+        center.likeCommand.localizedTitle = I18n.t("Like")
+        center.likeCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let tr = self.currentTrack else { return }
+                self.onToggleLikeTrack?(tr)
+            }
+            return .success
+        }
+        center.changeRepeatModeCommand.addTarget { [weak self] event in
+            guard let ev = event as? MPChangeRepeatModeCommandEvent else { return .commandFailed }
+            let target: RepeatMode
+            switch ev.repeatType {
+            case .off: target = .off
+            case .one: target = .one
+            case .all: target = .all
+            @unknown default: target = .off
+            }
+            Task { @MainActor [weak self] in
+                self?.setRepeatMode(target)
+            }
+            return .success
+        }
+        center.changeShuffleModeCommand.addTarget { [weak self] event in
+            guard let ev = event as? MPChangeShuffleModeCommandEvent else { return .commandFailed }
+            let enableShuffle = ev.shuffleType != .off
+            Task { @MainActor [weak self] in
+                self?.setShuffle(enableShuffle)
+            }
+            return .success
+        }
+        syncRemoteCommandAvailability()
+    }
+
+    /// 根据当前曲目与播客/队列状态动态同步灵动岛与锁屏控件按钮可用状态
+    private func syncRemoteCommandAvailability() {
+        let center = MPRemoteCommandCenter.shared()
+        let hasTrack = (currentTrack != nil)
+        let isEpisode = (currentTrack?.isEpisode == true)
+        center.playCommand.isEnabled = hasTrack
+        center.pauseCommand.isEnabled = hasTrack
+        center.togglePlayPauseCommand.isEnabled = hasTrack
+        center.changePlaybackPositionCommand.isEnabled = hasTrack && duration > 0
+        // 音乐模式优先呈现上下首，播客单集自动切换为 ±15 秒快进退（符合 Apple 灵动岛与锁屏控件规范）
+        center.nextTrackCommand.isEnabled = hasTrack && !isEpisode && !order.isEmpty
+        center.previousTrackCommand.isEnabled = hasTrack && !isEpisode && !order.isEmpty
+        center.skipForwardCommand.isEnabled = hasTrack && isEpisode
+        center.skipBackwardCommand.isEnabled = hasTrack && isEpisode
+        center.changeRepeatModeCommand.isEnabled = hasTrack && !isEpisode
+        center.changeShuffleModeCommand.isEnabled = hasTrack && !isEpisode && radioName == nil
+
+        switch repeatMode {
+        case .off: center.changeRepeatModeCommand.currentRepeatType = .off
+        case .all: center.changeRepeatModeCommand.currentRepeatType = .all
+        case .one: center.changeRepeatModeCommand.currentRepeatType = .one
+        }
+        center.changeShuffleModeCommand.currentShuffleType = shuffle ? .items : .off
+        refreshRemoteLikeState()
+    }
+
+    /// 供外部收藏状态变化后即时同步灵动岛/锁屏控制卡片上的红心高亮状态
+    public func refreshRemoteLikeState() {
+        let center = MPRemoteCommandCenter.shared()
+        guard let tr = currentTrack else {
+            center.likeCommand.isEnabled = false
+            center.likeCommand.isActive = false
+            return
+        }
+        center.likeCommand.isEnabled = (onToggleLikeTrack != nil)
+        let liked = isTrackLikedProvider?(tr) ?? false
+        center.likeCommand.isActive = liked
+        center.likeCommand.localizedTitle = I18n.t(liked ? "Unlike" : "Like")
     }
 
     /// 供设置切换后外部主动刷新锁屏媒体栏信息
     public func refreshNowPlayingInfo() {
-        updateNowPlayingCenter()
+        updateNowPlayingCenter(useLiveClock: true)
     }
 
     /// 生成锁屏 / 控制中心展示元数据：开启锁屏歌词且命中非空歌词行时，将主标题替换为当前歌词（含翻译）并保持副标题展示歌名与歌手
@@ -2820,48 +3647,157 @@ public final class PlayerEngine: ObservableObject {
         }
     }
 
-    private func updateNowPlayingCenter() {
+    /// 基于曲目联合键生成确定性 64 位媒体标识，确保开启锁屏歌词改写标题时灵动岛与系统卡片稳定识别同一首歌
+    nonisolated public static func persistentMediaID(for track: Track) -> UInt64 {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in track.compositeKey.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return hash == 0 ? 1 : hash
+    }
+
+    /// 计算同步给 MPNowPlayingInfoCenter.playbackState 的标准状态
+    nonisolated public static func resolveNowPlayingPlaybackState(
+        hasTrack: Bool,
+        isPlaying: Bool
+    ) -> MPNowPlayingPlaybackState {
+        guard hasTrack else { return .stopped }
+        return isPlaying ? .playing : .paused
+    }
+
+    private func updateNowPlayingCenter(useLiveClock: Bool = false) {
+        let center = MPNowPlayingInfoCenter.default()
         guard let tr = currentTrack else {
             lockScreenArtwork = nil
             lastPublishedNowPlayingMeta = nil
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            center.nowPlayingInfo = nil
+            center.playbackState = .stopped
+            syncRemoteCommandAvailability()
             return
         }
         let enabled = lockScreenLyricsProvider?() ?? true
+        let elapsed = useLiveClock ? livePlaybackPosition() : position
         let meta = Self.buildNowPlayingDisplayMetadata(
             track: tr,
             lyrics: lyrics,
-            position: position,
+            position: elapsed,
             lockScreenLyricsEnabled: enabled
         )
         lastPublishedNowPlayingMeta = meta
 
+        let mediaType: MPMediaType = tr.isEpisode ? .podcast : .music
+        let playbackRate: Double = (isPlaying && !isLoading) ? 1.0 : 0.0
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: meta.title,
             MPMediaItemPropertyArtist: meta.artist,
             MPMediaItemPropertyAlbumTitle: meta.albumTitle,
-            MPMediaItemPropertyMediaType: MPMediaType.music.rawValue,
+            MPMediaItemPropertyMediaType: mediaType.rawValue,
+            MPMediaItemPropertyPersistentID: NSNumber(value: Self.persistentMediaID(for: tr)),
             MPMediaItemPropertyPlaybackDuration: duration > 0 ? duration : tr.durationSeconds,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyPlaybackRate: playbackRate,
             MPNowPlayingInfoPropertyIsLiveStream: false
         ]
+        if !order.isEmpty, currentOrderIndex >= 0 {
+            info[MPNowPlayingInfoPropertyPlaybackQueueIndex] = currentOrderIndex
+            info[MPNowPlayingInfoPropertyPlaybackQueueCount] = order.count
+        }
         if let lockScreenArtwork {
             info[MPMediaItemPropertyArtwork] = lockScreenArtwork
         }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        center.nowPlayingInfo = info
+        center.playbackState = Self.resolveNowPlayingPlaybackState(hasTrack: true, isPlaying: isPlaying)
+        syncRemoteCommandAvailability()
     }
 
     #if canImport(UIKit)
     public func setNowPlayingArtwork(data: Data?) {
         if let data, let image = UIImage(data: data) {
-            lockScreenArtwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            setNowPlayingArtwork(image: image)
         } else {
             lockScreenArtwork = nil
+            updateNowPlayingCenter()
         }
+    }
+
+    /// 直接写入已解码封面图（超大图自动收敛至 600px 避免 MediaRemote IPC 传输超时导致灵动岛丢封面）
+    public func setNowPlayingArtwork(image: UIImage?) {
+        guard let image else {
+            lockScreenArtwork = nil
+            updateNowPlayingCenter()
+            return
+        }
+        let preparedImage = Self.downsampledNowPlayingArtworkImage(image, maxDimension: 600)
+        lockScreenArtwork = MPMediaItemArtwork(boundsSize: preparedImage.size) { _ in preparedImage }
         updateNowPlayingCenter()
     }
+
+    private static func downsampledNowPlayingArtworkImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+        let maxSide = max(image.size.width, image.size.height)
+        guard maxSide > maxDimension, maxSide > 0 else { return image }
+        let ratio = maxDimension / maxSide
+        let targetSize = CGSize(
+            width: max(1, (image.size.width * ratio).rounded()),
+            height: max(1, (image.size.height * ratio).rounded())
+        )
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
     #endif
+
+    /// 统一构建 AVURLAsset：仅对本地文件默认开启精确帧索引表，在线流完全省略该 Key 以极速起播并兼容自定义 ResourceLoader 协议（避免显式传 false 触发 CoreMedia -17770）
+    nonisolated public static func makeAudioURLAsset(
+        url: URL,
+        httpHeaders: [String: String] = [:],
+        preferPreciseTiming: Bool? = nil
+    ) -> AVURLAsset {
+        let usePrecise = preferPreciseTiming ?? url.isFileURL
+        var options: [String: Any] = [:]
+        if usePrecise {
+            options[AVURLAssetPreferPreciseDurationAndTimingKey] = true
+        }
+        if !httpHeaders.isEmpty {
+            options["AVURLAssetHTTPHeaderFieldsKey"] = httpHeaders
+        }
+        return AVURLAsset(url: url, options: options.isEmpty ? nil : options)
+    }
+
+    /// 生成曲目与歌词内容复合签名（包含首尾时间戳与文本摘要，杜绝行数恰好相同时不触发对齐）
+    private static func makeLyricsSignature(trackKey: String, lines: [LyricLine]) -> String {
+        guard !lines.isEmpty else { return "\(trackKey)#0" }
+        let first = lines.first.map { String(format: "%.3f:%@", $0.at, $0.text) } ?? ""
+        let last = lines.last.map { String(format: "%.3f:%@", $0.at, $0.text) } ?? ""
+        return "\(trackKey)#\(lines.count)#\(first)#\(last)"
+    }
+
+    /// 返回当前音频输出通道的实时硬件输出延迟（已钳位至 0.0...0.35s，兼容蓝牙耳机与外放）
+    public func currentAudioOutputLatency() -> TimeInterval {
+        #if os(iOS)
+        let raw = AVAudioSession.sharedInstance().outputLatency
+        guard raw.isFinite else { return 0.0 }
+        return min(0.35, max(0.0, raw))
+        #else
+        return 0.0
+        #endif
+    }
+
+    /// 歌词专用声学同步时钟：播放态扣除系统/蓝牙音频通道输出延迟，暂停与 Seek 态直接按当前时钟
+    public func acousticLyricPosition(manualOffset: TimeInterval = 0) -> TimeInterval {
+        if !isSeeking,
+           isPlaying,
+           !isLoading,
+           avPlayer?.timeControlStatus == .playing {
+            let synced = livePlaybackPosition() - currentAudioOutputLatency() + manualOffset
+            return max(0, synced)
+        }
+        return max(0, position + manualOffset)
+    }
 
     /// 返回当前最高精度的媒体播放时间点（播放态直接采样 AVPlayer 硬件音频时钟，消除 30fps 定时器的阶梯延迟）
     public func livePlaybackPosition() -> TimeInterval {
@@ -2942,63 +3878,335 @@ public final class PlayerEngine: ObservableObject {
                 Task.isCancelled
             }
             guard !Task.isCancelled else { return }
-            _ = self?.loadGeneration == gen
+            await MainActor.run { [weak self] in
+                guard let self, self.loadGeneration == gen else { return }
+                if let realWaveform = timeline.waveformBuckets(count: 56), !realWaveform.isEmpty {
+                    self.currentTrackWaveform = realWaveform
+                }
+            }
         }
     }
 
-    /// 对直连首播的在线曲目，后台轻量预存磁盘缓存以热解锁全曲真实 FFT 频谱与离线二次秒开（限 38MB 内单曲，零阻塞播放器）
+    // MARK: - 音频容器识别、信号路径与波形生成纯函数
+
+    /// 生成确定性音乐包络波形（模拟前奏-主歌-副歌-尾奏分段能量层次，全曲真 FFT 就绪后自动平滑替换）
+    nonisolated public static func syntheticWaveformBuckets(seed: UInt64, count: Int) -> [Float] {
+        guard count > 0 else { return [] }
+        var state = seed == 0 ? 0x9E3779B97F4A7C15 : seed
+        var out: [Float] = []
+        out.reserveCapacity(count)
+        for i in 0..<count {
+            state ^= state >> 12
+            state ^= state << 25
+            state ^= state >> 27
+            let randUnit = Double((state &* 0x2545F4914F6CDD1D) & 0xFFFF) / 65535.0
+            let progress = Double(i) / Double(max(1, count - 1))
+            // 塑造高对比结构包络（低缓前/尾奏 + 高能双副歌峰值 + 律动起伏脉冲）
+            let sectionEnvelope = max(0.0, sin(progress * .pi)) * 0.42
+                + max(0.0, sin((progress - 0.15) * .pi * 2.4)) * 0.30
+            let beatAccent = (i % 4 == 0 ? 0.16 : (i % 2 == 0 ? 0.06 : -0.06))
+            let val = min(0.98, max(0.12, 0.14 + sectionEnvelope * 0.55 + pow(randUnit, 1.35) * 0.46 + beatAccent))
+            out.append(Float(val))
+        }
+        return out
+    }
+
+    nonisolated public static func resolvedCodecLabel(streamType: String?, url: URL?) -> String {
+        let rawType = streamType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let rawPathExt = url?.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if rawType.contains("m4s") || rawPathExt == "m4s" {
+            return "DASH Audio"
+        }
+        let fallbackURL = URL(string: "https://codec.local")!
+        let targetURL = url ?? fallbackURL
+        let ext = AudioStreamProxy.knownFileExtension(streamType: streamType, url: targetURL) ?? rawPathExt
+        switch ext.lowercased() {
+        case "flac": return "FLAC"
+        case "wav": return "WAV (PCM)"
+        case "m4a", "aac", "mp4": return "AAC / M4A"
+        case "mp3": return "MP3"
+        default:
+            return ext.isEmpty ? "Audio" : ext.uppercased()
+        }
+    }
+
+    /// 汇总当前在播音轨完整音频信号路径快照（音源解码、输出路由）
+    public func currentAudioSignalPath(sourceDisplayName: String) -> AudioSignalPathInfo {
+        let st = currentStream
+        let isLossless = (st?.quality == "lossless")
+            || (activeSignalCodec == "FLAC")
+            || (activeSignalCodec.contains("WAV"))
+        let tierKey: String
+        switch st?.quality?.lowercased() {
+        case "lossless": tierKey = "Lossless"
+        case "standard": tierKey = "Standard"
+        default: tierKey = isLossless ? "Lossless" : "High"
+        }
+
+        let transitionMode = gaplessPlaybackEnabled ? I18n.t("Gapless Playback") : I18n.t("Off")
+
+        #if os(iOS)
+        let output = AVAudioSession.sharedInstance().currentRoute.outputs.first
+        let deviceName = output?.portName ?? "iPhone Speaker"
+        let portType = output?.portType.rawValue ?? "BuiltInSpeaker"
+        #else
+        let deviceName = "System Audio Output"
+        let portType = "CoreAudio"
+        #endif
+
+        return AudioSignalPathInfo(
+            sourceName: sourceDisplayName,
+            deliveryMode: I18n.t(activeSignalDeliveryMode),
+            codecFormat: activeSignalCodec,
+            qualityTier: I18n.t(tierKey),
+            isLossless: isLossless,
+            sampleRateHz: activeSignalSampleRateHz,
+            bitDepth: activeSignalBitDepth,
+            transitionMode: transitionMode,
+            outputDeviceName: deviceName,
+            outputPortType: portType
+        )
+    }
+
+    /// 判断后台缓存是否应放行下载（提前拦截已知超过体积上限的超大流，防止耗尽首播带宽后白白丢弃）
+    nonisolated public static func shouldProceedWithBackgroundCache(
+        declaredSizeBytes: Int64?,
+        expectedContentLength: Int64? = nil,
+        maxBytes: Int64 = 52 * 1024 * 1024
+    ) -> Bool {
+        if let declaredSizeBytes, declaredSizeBytes > 0, declaredSizeBytes > maxBytes {
+            return false
+        }
+        if let expectedContentLength, expectedContentLength > 0, expectedContentLength > maxBytes {
+            return false
+        }
+        return true
+    }
+
+    /// 对直连首播的在线曲目，待播放稳定后后台轻量预存磁盘缓存以热解锁全曲真实 FFT 频谱与离线二次秒开（限 52MB 内单曲）
     private func scheduleDirectStreamBackgroundCache(
         url: URL,
         stream: StreamInfo,
         cacheKey: String,
         gen: Int
     ) {
-        guard diskCache.limitMB > 0, backgroundCacheTask == nil else { return }
+        let maxBytes: Int64 = 52 * 1024 * 1024
+        guard diskCache.limitMB > 0,
+              backgroundCacheTask == nil,
+              Self.shouldProceedWithBackgroundCache(declaredSizeBytes: stream.size, maxBytes: maxBytes) else {
+            return
+        }
         let headers = Self.directAssetHTTPHeaders(for: stream)
         let ext = AudioStreamProxy.knownFileExtension(streamType: stream.type, url: url) ?? "mp3"
         let hintType = stream.type
-        let maxBytes: Int64 = 38 * 1024 * 1024
         let cfg = proxySessionConfiguration
 
-        backgroundCacheTask = Task.detached(priority: .background) { [weak self] in
-            // 稍让出首播 0.8s 的网络带宽给 AVPlayer 缓冲首块内容
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            guard !Task.isCancelled else { return }
+        backgroundCacheTask = Task.detached(priority: .utility) { [weak self] in
+            // 充分让出首播缓冲黄金期（6 秒），防止并发下载与正在起播的 AVPlayer 抢占带宽
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+
+            let canStartNow = await MainActor.run { [weak self] () -> Bool in
+                guard let self else { return false }
+                return self.loadGeneration == gen && self.isPlaying && !self.isLoading && self.position >= 3.0
+            }
+            guard canStartNow, !Task.isCancelled else { return }
 
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 45)
             for (k, v) in headers {
                 request.setValue(v, forHTTPHeaderField: k)
             }
             let sessionCfg = cfg ?? URLSessionConfiguration.ephemeral
-            let session = URLSession(configuration: sessionCfg)
-            defer { session.invalidateAndCancel() }
+            if cfg == nil {
+                sessionCfg.waitsForConnectivity = true
+            }
+
+            let downloader = BoundedBackgroundDownloader(maxBytes: maxBytes, fileExtension: ext)
+            defer { downloader.cancel() }
 
             do {
-                let (tmpLocalURL, response) = try await session.download(for: request)
-                defer { try? FileManager.default.removeItem(at: tmpLocalURL) }
-                guard !Task.isCancelled,
-                      let http = response as? HTTPURLResponse,
-                      (200..<300).contains(http.statusCode) else {
-                    return
+                let outcome = try await withTaskCancellationHandler {
+                    try await downloader.download(request: request, configuration: sessionCfg)
+                } onCancel: {
+                    downloader.cancel()
                 }
-                let attrs = try FileManager.default.attributesOfItem(atPath: tmpLocalURL.path)
-                let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-                guard size > 8192, size <= maxBytes else { return }
+                guard let outcome, !Task.isCancelled else { return }
+                defer { try? FileManager.default.removeItem(at: outcome.tempFileURL) }
 
-                guard let self else { return }
                 let storedURL = try self.diskCache.store(
-                    tempFileURL: tmpLocalURL,
+                    tempFileURL: outcome.tempFileURL,
                     key: cacheKey,
                     fileExtension: ext,
-                    contentType: hintType ?? http.mimeType
+                    contentType: hintType ?? outcome.mimeType
                 )
-                guard storedURL != tmpLocalURL, !Task.isCancelled else { return }
+                guard storedURL != outcome.tempFileURL, !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
                     guard let self, self.loadGeneration == gen else { return }
                     self.startSpectrumTimelineAnalysis(forFile: storedURL, gen: gen)
                 }
             } catch {
                 // 静默忽略后台增强缓存失败，不影响正常播放
+            }
+        }
+    }
+
+    /// 按块流式落盘并在响应头或累计字节超出上限时立即断开连接，零内存滞留且不浪费超大文件流量
+    private final class BoundedBackgroundDownloader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        struct Outcome: Sendable {
+            let tempFileURL: URL
+            let mimeType: String?
+        }
+
+        private let maxBytes: Int64
+        private let fileExtension: String
+        private let lock = NSLock()
+        private var session: URLSession?
+        private var task: URLSessionDataTask?
+        private var continuation: CheckedContinuation<Outcome?, Never>?
+        private var tempURL: URL?
+        private var fileHandle: FileHandle?
+        private var writtenBytes: Int64 = 0
+        private var mimeType: String?
+        private var finished = false
+
+        init(maxBytes: Int64, fileExtension: String) {
+            self.maxBytes = maxBytes
+            self.fileExtension = fileExtension
+        }
+
+        func download(request: URLRequest, configuration: URLSessionConfiguration) async throws -> Outcome? {
+            await withCheckedContinuation { cont in
+                lock.lock()
+                if finished {
+                    lock.unlock()
+                    cont.resume(returning: nil)
+                    return
+                }
+                self.continuation = cont
+                let ses = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+                let t = ses.dataTask(with: request)
+                self.session = ses
+                self.task = t
+                lock.unlock()
+                t.resume()
+            }
+        }
+
+        func cancel() {
+            finish(outcome: nil, removeTemp: true)
+        }
+
+        private func finish(outcome: Outcome?, removeTemp: Bool) {
+            lock.lock()
+            if finished {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let cont = continuation
+            continuation = nil
+            let t = task
+            task = nil
+            let ses = session
+            session = nil
+            let handle = fileHandle
+            fileHandle = nil
+            let tmp = tempURL
+            if removeTemp {
+                tempURL = nil
+            }
+            lock.unlock()
+
+            try? handle?.close()
+            if removeTemp, let tmp {
+                try? FileManager.default.removeItem(at: tmp)
+            }
+            t?.cancel()
+            ses?.invalidateAndCancel()
+            cont?.resume(returning: outcome)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                completionHandler(.cancel)
+                finish(outcome: nil, removeTemp: true)
+                return
+            }
+            let expectedLen = http.expectedContentLength > 0
+                ? http.expectedContentLength
+                : (http.value(forHTTPHeaderField: "Content-Length").flatMap { Int64($0) } ?? -1)
+            if expectedLen > maxBytes {
+                completionHandler(.cancel)
+                finish(outcome: nil, removeTemp: true)
+                return
+            }
+
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mygo-bg-cache-\(UUID().uuidString).\(fileExtension)")
+            FileManager.default.createFile(atPath: tmp.path, contents: nil)
+            guard let handle = try? FileHandle(forWritingTo: tmp) else {
+                completionHandler(.cancel)
+                finish(outcome: nil, removeTemp: true)
+                return
+            }
+
+            lock.lock()
+            if finished {
+                lock.unlock()
+                try? handle.close()
+                try? FileManager.default.removeItem(at: tmp)
+                completionHandler(.cancel)
+                return
+            }
+            tempURL = tmp
+            fileHandle = handle
+            mimeType = http.mimeType
+            lock.unlock()
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            lock.lock()
+            guard !finished, let handle = fileHandle else {
+                lock.unlock()
+                dataTask.cancel()
+                return
+            }
+            let nextTotal = writtenBytes + Int64(data.count)
+            if nextTotal > maxBytes {
+                lock.unlock()
+                finish(outcome: nil, removeTemp: true)
+                return
+            }
+            writtenBytes = nextTotal
+            do {
+                try handle.write(contentsOf: data)
+                lock.unlock()
+            } catch {
+                lock.unlock()
+                finish(outcome: nil, removeTemp: true)
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if error != nil {
+                finish(outcome: nil, removeTemp: true)
+                return
+            }
+            lock.lock()
+            let ok = !finished && writtenBytes > 8192 && writtenBytes <= maxBytes
+            let tmp = tempURL
+            let mime = mimeType
+            lock.unlock()
+            if ok, let tmp {
+                finish(outcome: Outcome(tempFileURL: tmp, mimeType: mime), removeTemp: false)
+            } else {
+                finish(outcome: nil, removeTemp: true)
             }
         }
     }
