@@ -1242,11 +1242,11 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
 
     private var tintOverlay: Color {
         if colorScheme == .dark {
-            // 沉稳黑曜石烟熏玻璃：迷你条模式提高遮蔽抑制底层列表高对比白字穿透
+            // 对标 Telegram / iOS 26 深黑曜石高遮蔽质感（#151518 中性深炭黑，彻底隔绝背后列表文字穿透）
             if highOcclusion {
-                return Color(red: 0.095, green: 0.095, blue: 0.115).opacity(0.82)
+                return Color(red: 0.068, green: 0.068, blue: 0.072).opacity(0.96)
             }
-            return Color(red: 0.085, green: 0.085, blue: 0.105).opacity(isHighlighted ? 0.64 : 0.54)
+            return Color(red: 0.068, green: 0.068, blue: 0.072).opacity(isHighlighted ? 0.945 : 0.93)
         }
         if highOcclusion {
             return Color(white: 0.96).opacity(0.78)
@@ -1259,10 +1259,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         if colorScheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.white.opacity(0.15),
-                    Color.white.opacity(0.035),
+                    Color.white.opacity(0.042),
+                    Color.white.opacity(0.012),
                     Color.clear,
-                    Color.white.opacity(0.07)
+                    Color.white.opacity(0.025)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -1284,10 +1284,10 @@ private struct LiquidGlassSurfaceModifier<S: InsettableShape>: ViewModifier {
         if colorScheme == .dark {
             return LinearGradient(
                 colors: [
-                    Color.white.opacity(0.28),
-                    Color.white.opacity(0.085),
-                    Color.white.opacity(0.055),
-                    Color.white.opacity(0.15)
+                    Color.white.opacity(0.125),
+                    Color.white.opacity(0.045),
+                    Color.white.opacity(0.030),
+                    Color.white.opacity(0.075)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -1338,7 +1338,7 @@ private struct LiquidGlassSelectionBubble<S: InsettableShape>: View {
 
     private func fillColor(isDark: Bool) -> Color {
         if isDark {
-            return Color.white.opacity(isEmphasized ? 0.26 : 0.19)
+            return Color.white.opacity(isEmphasized ? 0.155 : 0.12)
         }
         return Color.white.opacity(isEmphasized ? 0.95 : 0.86)
     }
@@ -1346,7 +1346,7 @@ private struct LiquidGlassSelectionBubble<S: InsettableShape>: View {
     private func borderGradient(isDark: Bool) -> LinearGradient {
         LinearGradient(
             colors: isDark
-                ? [Color.white.opacity(0.32), Color.white.opacity(0.08)]
+                ? [Color.white.opacity(0.15), Color.white.opacity(0.04)]
                 : [Color.white.opacity(1.0), Color.black.opacity(0.055)],
             startPoint: .top,
             endPoint: .bottom
@@ -1376,6 +1376,7 @@ public struct MiniPlayerBarView: View {
     @State private var dragAxisLock: DragAxisLock? = nil
     @State private var didTriggerDragHaptic = false
     @State private var transitionVisibilityAlpha: Double = 1.0
+    @State private var hideArtworkForHeroFlight: Bool = false
     @State private var landingBounceScale: CGFloat = 1.0
     @State private var landingBounceY: CGFloat = 0.0
 
@@ -1498,7 +1499,7 @@ public struct MiniPlayerBarView: View {
                     .allowsHitTesting(!isCompact)
                     .clipped()
                 }
-                .padding(.trailing, isCompact ? 8 : 10)
+                .padding(.trailing, isCompact ? 10 : FloatingTabBarMetrics.miniTrailingPadding)
                 .geometryGroup()
             }
             .frame(height: barHeight)
@@ -1531,6 +1532,8 @@ public struct MiniPlayerBarView: View {
                 if let pair = note.object as? [Double], pair.count >= 2 {
                     let targetAlpha = pair[0]
                     let duration = pair[1]
+                    let shouldHideArtwork = pair.count >= 3 ? (pair[2] > 0.5) : false
+                    hideArtworkForHeroFlight = shouldHideArtwork
                     if duration <= 0.001 {
                         transitionVisibilityAlpha = targetAlpha
                     } else {
@@ -1542,6 +1545,7 @@ public struct MiniPlayerBarView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .mygoNowPlayingDidCollapseToMiniBar)) { _ in
                 transitionVisibilityAlpha = 1.0
+                hideArtworkForHeroFlight = false
             }
             .onTapGesture {
                 app.presentNowPlaying()
@@ -1637,15 +1641,15 @@ public struct MiniPlayerBarView: View {
         }
     }
 
-    /// 渲染单个横向滑轨曲目条目（左槽 38x38 封面 + 双行歌名/歌手）
+    /// 渲染单个横向滑轨曲目条目（按 iOS 26/27 胶囊同心留白规范：左边距 16pt + 34×34 封面 + 8.5pt 圆角）
     @ViewBuilder
     private func miniTrackSlotContent(
         for displayTrack: Track,
         isCurrentSlot: Bool,
         slotWidth: CGFloat
     ) -> some View {
-        let artworkSlotSize: CGFloat = 38
-        let artworkRadius: CGFloat = 9.5
+        let artworkSlotSize: CGFloat = FloatingTabBarMetrics.miniArtworkSize
+        let artworkRadius: CGFloat = FloatingTabBarMetrics.miniArtworkCornerRadius
 
         HStack(spacing: 10) {
             ArtworkView(
@@ -1670,6 +1674,7 @@ public struct MiniPlayerBarView: View {
                     .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 1.5)
             )
             .scaleEffect(isCompact ? 0.94 : 1.0)
+            .opacity(isCurrentSlot && hideArtworkForHeroFlight ? 0.0 : 1.0)
             .geometryGroup()
 
             VStack(alignment: .leading, spacing: 1.5) {
@@ -1706,7 +1711,7 @@ public struct MiniPlayerBarView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .geometryGroup()
         }
-        .padding(.leading, 9)
+        .padding(.leading, FloatingTabBarMetrics.miniArtworkLeading)
         .frame(width: slotWidth, alignment: .leading)
         .geometryGroup()
     }
@@ -2094,6 +2099,10 @@ public enum FloatingTabBarMetrics {
     public static let overlaySpacing: CGFloat = 10
     public static let miniExpandedHeight: CGFloat = 56
     public static let compactBarHeight: CGFloat = 56
+    public static let miniArtworkSize: CGFloat = 34
+    public static let miniArtworkCornerRadius: CGFloat = 8.5
+    public static let miniArtworkLeading: CGFloat = 16
+    public static let miniTrailingPadding: CGFloat = 14
     public static let searchCircleSize: CGFloat = barHeight
     public static let splitSpacing: CGFloat = 12
     public static let compactSplitSpacing: CGFloat = 10
@@ -3522,7 +3531,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
         let cardSolidBackdropView = SolidBackdropGradientView()
         /// 退场后半段承接层：将专辑主色平滑过渡至与迷你条一致的高遮蔽实体胶囊底色
         let cardSolidCapsuleTintView = UIView()
-        let cardGlassView = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+        let cardGlassView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
         let morphingMiniHeaderView = UIView()
         let morphingMiniArtworkView = UIImageView()
         let morphingMiniPlaceholderIcon = UIImageView()
@@ -3583,19 +3592,19 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             cardSolidCapsuleTintView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             cardSolidCapsuleTintView.backgroundColor = UIColor { traits in
                 traits.userInterfaceStyle == .dark
-                    ? UIColor(red: 0.095, green: 0.095, blue: 0.115, alpha: 0.96)
+                    ? UIColor(red: 0.068, green: 0.068, blue: 0.072, alpha: 0.97)
                     : UIColor(white: 0.96, alpha: 0.94)
             }
             cardSolidCapsuleTintView.alpha = 0
             cardSolidCapsuleTintView.isUserInteractionEnabled = false
             cardClipView.addSubview(cardSolidCapsuleTintView)
 
-            // 自适应深浅外观的液态磨砂玻璃底板：颜色对齐 MiniPlayerBarView 的 LiquidGlassSurfaceModifier 消除交棒色差
+            // 自适应深浅外观的液态磨砂玻璃底板：颜色及高遮蔽率与 MiniPlayerBarView 完全同源对齐，杜绝透字与交棒色差
             cardGlassView.frame = cardClipView.bounds
             cardGlassView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             cardGlassView.contentView.backgroundColor = UIColor { traits in
                 traits.userInterfaceStyle == .dark
-                    ? UIColor(red: 0.085, green: 0.085, blue: 0.105, alpha: 0.56)
+                    ? UIColor(red: 0.068, green: 0.068, blue: 0.072, alpha: 0.96)
                     : UIColor(white: 0.955, alpha: 0.48)
             }
             cardGlassView.alpha = 0
@@ -3620,7 +3629,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             morphingMiniArtworkView.translatesAutoresizingMaskIntoConstraints = false
             morphingMiniArtworkView.contentMode = .scaleAspectFill
             morphingMiniArtworkView.clipsToBounds = true
-            morphingMiniArtworkView.layer.cornerRadius = 9.5
+            morphingMiniArtworkView.layer.cornerRadius = FloatingTabBarMetrics.miniArtworkCornerRadius
             morphingMiniArtworkView.layer.cornerCurve = .continuous
             morphingMiniArtworkView.backgroundColor = UIColor.secondarySystemFill
             morphingMiniHeaderView.addSubview(morphingMiniArtworkView)
@@ -3660,15 +3669,15 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             morphingMiniHeaderView.addSubview(morphingMiniNextIcon)
 
             NSLayoutConstraint.activate([
-                morphingMiniArtworkView.leadingAnchor.constraint(equalTo: morphingMiniHeaderView.leadingAnchor, constant: 9),
+                morphingMiniArtworkView.leadingAnchor.constraint(equalTo: morphingMiniHeaderView.leadingAnchor, constant: FloatingTabBarMetrics.miniArtworkLeading),
                 morphingMiniArtworkView.centerYAnchor.constraint(equalTo: morphingMiniHeaderView.centerYAnchor),
-                morphingMiniArtworkView.widthAnchor.constraint(equalToConstant: 38),
-                morphingMiniArtworkView.heightAnchor.constraint(equalToConstant: 38),
+                morphingMiniArtworkView.widthAnchor.constraint(equalToConstant: FloatingTabBarMetrics.miniArtworkSize),
+                morphingMiniArtworkView.heightAnchor.constraint(equalToConstant: FloatingTabBarMetrics.miniArtworkSize),
 
                 morphingMiniPlaceholderIcon.centerXAnchor.constraint(equalTo: morphingMiniArtworkView.centerXAnchor),
                 morphingMiniPlaceholderIcon.centerYAnchor.constraint(equalTo: morphingMiniArtworkView.centerYAnchor),
-                morphingMiniPlaceholderIcon.widthAnchor.constraint(equalToConstant: 16),
-                morphingMiniPlaceholderIcon.heightAnchor.constraint(equalToConstant: 16),
+                morphingMiniPlaceholderIcon.widthAnchor.constraint(equalToConstant: 15),
+                morphingMiniPlaceholderIcon.heightAnchor.constraint(equalToConstant: 15),
 
                 textStack.leadingAnchor.constraint(equalTo: morphingMiniArtworkView.trailingAnchor, constant: 10),
                 textStack.centerYAnchor.constraint(equalTo: morphingMiniHeaderView.centerYAnchor),
@@ -3682,7 +3691,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                 morphingMiniNextIcon.centerYAnchor.constraint(equalTo: morphingMiniHeaderView.centerYAnchor),
                 morphingMiniNextIcon.widthAnchor.constraint(equalToConstant: 34),
                 morphingMiniNextIcon.heightAnchor.constraint(equalToConstant: 34),
-                morphingMiniNextIcon.trailingAnchor.constraint(equalTo: morphingMiniHeaderView.trailingAnchor, constant: -10)
+                morphingMiniNextIcon.trailingAnchor.constraint(equalTo: morphingMiniHeaderView.trailingAnchor, constant: -FloatingTabBarMetrics.miniTrailingPadding)
             ])
 
             if let coordinator {
@@ -3946,14 +3955,15 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             return CGRect(x: (b.width - w) / 2, y: b.height - 140, width: w, height: 56)
         }
 
-        /// 计算 cardClipView 本地坐标系左端 38×38 迷你封面的精确矩形（与 MiniPlayerBarView 零像素对齐）
+        /// 计算 cardClipView 本地坐标系左端迷你封面的精确矩形（与 MiniPlayerBarView 共用同心标准常量，零像素对齐）
         private func localMiniArtworkSlotRect(barHeight: CGFloat) -> CGRect {
             let effectiveH = max(48, barHeight)
+            let side = FloatingTabBarMetrics.miniArtworkSize
             return CGRect(
-                x: 9.0,
-                y: (effectiveH - 38.0) * 0.5,
-                width: 38.0,
-                height: 38.0
+                x: FloatingTabBarMetrics.miniArtworkLeading,
+                y: (effectiveH - side) * 0.5,
+                width: side,
+                height: side
             )
         }
 
@@ -4265,7 +4275,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                     self.applyFloatingHeroTransform(
                         baseSide: heroBaseSide,
                         toRect: slotStartGlobal,
-                        cornerRadius: 9.5,
+                        cornerRadius: FloatingTabBarMetrics.miniArtworkCornerRadius,
                         shadowOpacity: 0.16,
                         shadowRadius: 4.0,
                         shadowY: 1.5,
@@ -4437,41 +4447,63 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                     host.floatingHeroShadowView.alpha = 0
                     host.floatingHeroShadowView.isHidden = true
                 }
-                NotificationCenter.default.post(name: .mygoMiniPlayerSetTransitionAlpha, object: [0.0, 0.0])
+                NotificationCenter.default.post(
+                    name: .mygoMiniPlayerSetTransitionAlpha,
+                    object: [0.0, 0.0, useHeroFlight ? 1.0 : 0.0]
+                )
             }
 
             isTransitioning = true
             host.view.isUserInteractionEnabled = false
 
+            let finishCollapseHandoff: () -> Void = { [weak self] in
+                guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
+                // 外壳已于中途就位稳住；封面精确归槽后仅同帧交还左槽封面图并撤除独立浮层，导航条零变色零顿挫
+                NotificationCenter.default.post(name: .mygoMiniPlayerSetTransitionAlpha, object: [1.0, 0.0, 0.0])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                    guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
+                    self.isTransitioning = false
+                    NotificationCenter.default.post(name: .mygoNowPlayingDidCollapseToMiniBar, object: nil)
+                    self.unmountHostingIfHidden()
+                }
+            }
+
             let runCapsuleShrinkAndHeroBounceBack: () -> Void = { [weak self] in
                 guard let self, let host = self.hostController,
                       self.transitionEpoch == epoch, !self.currentlyPresented else { return }
 
+                // 缩框全程由高遮蔽深炭黑实体层接棒封住底层列表文字，绝不出现半透明过渡窗
                 UIView.animate(
-                    withDuration: 0.24,
+                    withDuration: 0.16,
                     delay: 0.0,
                     options: [.curveEaseInOut, .beginFromCurrentState]
                 ) {
-                    host.cardSolidBackdropView.alpha = 0.0
-                    host.cardSolidCapsuleTintView.alpha = 0.35
+                    host.cardSolidCapsuleTintView.alpha = 1.0
                     host.cardGlassView.alpha = 1.0
                 }
                 UIView.animate(
-                    withDuration: 0.28,
-                    delay: 0.06,
-                    usingSpringWithDamping: 0.88,
-                    initialSpringVelocity: 0.2,
+                    withDuration: 0.22,
+                    delay: 0.02,
+                    options: [.curveEaseInOut, .beginFromCurrentState]
+                ) {
+                    host.cardSolidBackdropView.alpha = 0.0
+                }
+                UIView.animate(
+                    withDuration: 0.22,
+                    delay: 0.03,
+                    usingSpringWithDamping: 0.92,
+                    initialSpringVelocity: 0.15,
                     options: [.beginFromCurrentState]
                 ) {
                     host.morphingMiniHeaderView.alpha = 1.0
                     host.morphingMiniHeaderView.transform = .identity
                 }
 
-                // 外框胶囊舒展收缩成顶部悬停磨砂胶囊并落位 barEnd，留出下方封面从容抬升空间
+                // 外框胶囊顺滑收缩成底部悬停深黑磨砂胶囊并落位 barEnd
                 UIView.animate(
-                    withDuration: 0.44,
+                    withDuration: 0.36,
                     delay: 0,
-                    usingSpringWithDamping: 0.90,
+                    usingSpringWithDamping: 0.94,
                     initialSpringVelocity: cardVel,
                     options: [.beginFromCurrentState]
                 ) {
@@ -4480,10 +4512,10 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                     host.cardClipView.bounds = CGRect(origin: .zero, size: barEnd.size)
                     host.cardClipView.center = CGPoint(x: barEnd.midX, y: barEnd.midY)
                     host.cardClipView.layer.cornerRadius = barEnd.height * 0.5
-                    host.cardClipView.layer.borderWidth = 0.65
+                    host.cardClipView.layer.borderWidth = 0.70
                     let dynamicBorder = UIColor { traits in
-                        let baseAlpha: CGFloat = traits.userInterfaceStyle == .dark ? 0.16 * 1.4 : 0.16 * 4.5
-                        return UIColor.white.withAlphaComponent(min(0.85, baseAlpha))
+                        let baseAlpha: CGFloat = traits.userInterfaceStyle == .dark ? 0.11 : 0.72
+                        return UIColor.white.withAlphaComponent(baseAlpha)
                     }
                     host.cardClipView.layer.borderColor = dynamicBorder.resolvedColor(with: host.traitCollection).cgColor
 
@@ -4495,57 +4527,64 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                     if let hostingView = self.hostingController?.view {
                         hostingView.alpha = 0.0
                     }
+                } completion: { _ in
+                    if !useHeroFlight {
+                        finishCollapseHandoff()
+                    }
                 }
 
-                // 独立专辑封面：微滞后 30ms 启动，从胶囊下方低位带着柔和弹性由下向上从容回弹缩进 38×38 左槽
+                // 卡片收束至 barEnd 后（t=0.28s）：先将底层真实 MiniPlayerBarView 外壳瞬间以 1.0 满遮蔽就位
+                // （保持左槽封面图隐形），隔 1~2 帧再单向轻退上层替身，彻底杜绝交叉渐隐透明空窗漏出背后文字与结尾变色
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
+                    guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
+                    NotificationCenter.default.post(
+                        name: .mygoMiniPlayerSetTransitionAlpha,
+                        object: [1.0, 0.0, useHeroFlight ? 1.0 : 0.0]
+                    )
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in
+                        guard let self, let host = self.hostController,
+                              self.transitionEpoch == epoch, !self.currentlyPresented else { return }
+                        UIView.animate(
+                            withDuration: 0.08,
+                            delay: 0,
+                            options: [.curveEaseOut, .beginFromCurrentState]
+                        ) {
+                            host.cardClipView.alpha = 0.0
+                            host.cardShadowView.layer.shadowOpacity = 0.0
+                        }
+                    }
+                }
+
+                // 独立专辑封面：从胶囊下方低位一气呵成优美弧线抬升滑入 34×34 同心左槽并自然停稳
                 if useHeroFlight {
                     UIView.animate(
-                        withDuration: 0.56,
-                        delay: 0.03,
-                        usingSpringWithDamping: 0.80,
+                        withDuration: 0.48,
+                        delay: 0.015,
+                        usingSpringWithDamping: 0.87,
                         initialSpringVelocity: heroVel,
                         options: [.beginFromCurrentState]
                     ) {
                         self.applyFloatingHeroTransform(
                             baseSide: heroBaseSide,
                             toRect: slotEndGlobal,
-                            cornerRadius: 9.5,
+                            cornerRadius: FloatingTabBarMetrics.miniArtworkCornerRadius,
                             shadowOpacity: 0.16,
                             shadowRadius: 4.0,
                             shadowY: 1.5,
                             in: host
                         )
-                    }
-                }
-
-                // 待封面后段优雅回弹稳住后再无感交棒 + 接球轻柔缓冲
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.52) { [weak self] in
-                    guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
-                    NotificationCenter.default.post(name: .mygoMiniPlayerSetTransitionAlpha, object: [1.0, 0.0])
-                    NotificationCenter.default.post(name: .mygoMiniPlayerLandingPulse, object: nil)
-                    UIView.animate(
-                        withDuration: 0.10,
-                        delay: 0.01,
-                        options: [.curveEaseIn, .beginFromCurrentState]
-                    ) {
-                        host.cardClipView.alpha = 0.0
-                        host.cardShadowView.layer.shadowOpacity = 0.0
-                        host.floatingHeroShadowView.alpha = 0.0
                     } completion: { _ in
-                        guard self.transitionEpoch == epoch, !self.currentlyPresented else { return }
-                        self.isTransitioning = false
-                        NotificationCenter.default.post(name: .mygoNowPlayingDidCollapseToMiniBar, object: nil)
-                        self.unmountHostingIfHidden()
+                        finishCollapseHandoff()
                     }
                 }
             }
 
             if needsPlungePhase {
-                // Stage 1（高位轻扫/点收起按钮触发）：先整卡全宽从容优雅下沉到底，把大封面带到下方区域再回弹归槽
+                // Stage 1（高位轻扫/点收起按钮触发）：先整卡全宽顺滑下沉到底，在速度未停前无缝接入 Stage 2
                 UIView.animate(
-                    withDuration: 0.22,
+                    withDuration: 0.18,
                     delay: 0,
-                    options: [.curveEaseInOut, .beginFromCurrentState]
+                    options: [.curveEaseOut, .beginFromCurrentState]
                 ) {
                     host.backdropView.alpha = 0.0
                     self.hostingController?.view.alpha = 0.0
@@ -4569,13 +4608,13 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                         )
                     }
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.17) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) {
                     runCapsuleShrinkAndHeroBounceBack()
                 }
             } else {
                 // 慢速手势已直接将整卡全宽拖到底部下方：内页柔顺淡出，同步收拢外框并让下沉封面由下往上回弹归槽
                 UIView.animate(
-                    withDuration: 0.16,
+                    withDuration: 0.14,
                     delay: 0,
                     options: [.curveEaseOut, .beginFromCurrentState]
                 ) {

@@ -894,6 +894,14 @@ final class MyGoMusicTests: XCTestCase {
             accuracy: 0.01
         )
         XCTAssertGreaterThanOrEqual(FloatingTabBarMetrics.iconSize, 21.0)
+        // 验证迷你播放栏遵循 iOS 26/27 胶囊同心安全距规范：左内边距 16pt、封面 34×34（上下各留 11pt），与左端弧壁净空 >= 9pt
+        XCTAssertEqual(FloatingTabBarMetrics.miniArtworkLeading, 16.0, accuracy: 0.01)
+        XCTAssertEqual(FloatingTabBarMetrics.miniArtworkSize, 34.0, accuracy: 0.01)
+        XCTAssertEqual(FloatingTabBarMetrics.miniArtworkCornerRadius, 8.5, accuracy: 0.01)
+        let capRadius = FloatingTabBarMetrics.miniExpandedHeight * 0.5
+        let verticalInset = (FloatingTabBarMetrics.miniExpandedHeight - FloatingTabBarMetrics.miniArtworkSize) * 0.5
+        let arcXAtVerticalInset = capRadius - sqrt(max(0, capRadius * capRadius - pow(capRadius - verticalInset, 2)))
+        XCTAssertGreaterThanOrEqual(FloatingTabBarMetrics.miniArtworkLeading - arcXAtVerticalInset, 9.5)
         XCTAssertGreaterThan(FloatingTabBarMetrics.bottomInsetEmptyPlayer, FloatingTabBarMetrics.barHeight)
         XCTAssertGreaterThan(FloatingTabBarMetrics.bottomInsetWithMiniPlayer, FloatingTabBarMetrics.bottomInsetEmptyPlayer)
 
