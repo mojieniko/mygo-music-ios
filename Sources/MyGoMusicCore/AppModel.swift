@@ -131,10 +131,33 @@ public enum AppIconPreset: String, CaseIterable, Identifiable, Codable, Sendable
     }
 
     public var alternateIconName: String? {
-        switch self {
-        case .primary: return nil
-        case .appleMusic: return "AppIconAppleMusic"
+        resolvedAlternateIconName(bundlePrimaryIconName: Bundle.main.infoDictionary?["CFBundleIconName"] as? String)
+    }
+
+    public func resolvedAlternateIconName(bundlePrimaryIconName: String? = Bundle.main.infoDictionary?["CFBundleIconName"] as? String) -> String? {
+        let primaryName = bundlePrimaryIconName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "AppIcon"
+        switch (self, primaryName) {
+        case (.primary, "AppIconAppleMusic"):
+            return "AppIcon"
+        case (.primary, _):
+            return nil
+        case (.appleMusic, "AppIconAppleMusic"):
+            return nil
+        case (.appleMusic, _):
+            return "AppIconAppleMusic"
         }
+    }
+
+    public static func currentPreset(
+        forAlternateIconName activeAlternateName: String?,
+        bundlePrimaryIconName: String? = Bundle.main.infoDictionary?["CFBundleIconName"] as? String
+    ) -> AppIconPreset {
+        let trimmed = activeAlternateName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            return trimmed == "AppIconAppleMusic" ? .appleMusic : .primary
+        }
+        let primaryName = bundlePrimaryIconName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "AppIcon"
+        return primaryName == "AppIconAppleMusic" ? .appleMusic : .primary
     }
 
     public var previewAssetName: String {
@@ -373,6 +396,11 @@ public final class AppModel: ObservableObject {
 
     private var webSignInContinuation: CheckedContinuation<String, Error>? = nil
     private let pathMonitor = NWPathMonitor()
+    private var foregroundObserver: NSObjectProtocol? = nil
+    #if os(iOS) && canImport(UIKit)
+    private var offlineDownloadBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private var activeOfflineDownloadCount: Int = 0
+    #endif
     private var playerCancellable: AnyCancellable?
     private var trackChangeCancellable: AnyCancellable?
     private var captionTask: Task<Void, Never>?
@@ -409,9 +437,21 @@ public final class AppModel: ObservableObject {
         self.settings = initialSettings
         I18n.setLanguage(initialSettings.language)
 
-        // 初始化本地音乐源（App 冷启动时延后扫描以免阻塞首帧渲染）
+        // 初始化本地音乐源（App 冷启动时延后扫描以免阻塞首帧渲染；iOS 沙盒下同步扫描共享 Documents 目录）
         let localDir = rootDir.appendingPathComponent("local", isDirectory: true)
-        let createdLocalSource = LocalMusicSource(dataDir: localDir, eagerSyncScan: !deferHeavyStartup)
+        let sharedDocsDir: URL?
+        #if os(iOS)
+        sharedDocsDir = (baseDataDir == nil)
+            ? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            : nil
+        #else
+        sharedDocsDir = nil
+        #endif
+        let createdLocalSource = LocalMusicSource(
+            dataDir: localDir,
+            sharedDocumentsFolder: sharedDocsDir,
+            eagerSyncScan: !deferHeavyStartup
+        )
         self.localSource = createdLocalSource
 
         // 初始化播放器（冷启动不提前同步激活系统音频会话）
@@ -474,9 +514,27 @@ public final class AppModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.isOnCellularNetwork != cellular else { return }
                 self.isOnCellularNetwork = cellular
+                self.settings.quality = Self.resolveEffectiveStreamingQuality(
+                    isCellular: cellular,
+                    wifiQuality: self.settings.wifiQuality,
+                    cellularQuality: self.settings.cellularQuality
+                )
+                self.player.invalidatePrefetchedMediaForQualityChange()
             }
         }
         self.pathMonitor.start(queue: DispatchQueue.global(qos: .utility))
+        #if os(iOS) && canImport(UIKit)
+        self.foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isStartupReady else { return }
+                self.localSource.rescan()
+            }
+        }
+        #endif
         self.player.lockScreenLyricsProvider = { [weak self] in
             self?.settings.lockScreenLyrics ?? true
         }
@@ -1212,7 +1270,11 @@ public final class AppModel: ObservableObject {
         }
 
         downloadingTrackKeys.insert(compKey)
-        defer { downloadingTrackKeys.remove(compKey) }
+        beginOfflineDownloadBackgroundTask()
+        defer {
+            downloadingTrackKeys.remove(compKey)
+            endOfflineDownloadBackgroundTask()
+        }
 
         do {
             let targetQuality = settings.wifiQuality.rawValue
@@ -2652,6 +2714,10 @@ public final class AppModel: ObservableObject {
     }
 
     public func handleDeepLink(_ url: URL) {
+        if url.isFileURL {
+            handleExternalFileURL(url)
+            return
+        }
         guard let scheme = url.scheme?.lowercased(),
               (scheme == "mygo-music" || scheme == "mygo-music-dev") else { return }
         let host = url.host ?? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -2665,6 +2731,110 @@ public final class AppModel: ObservableObject {
             await waitUntilStartupReady()
             await installPluginFromGitHub(repoInput: repo)
         }
+    }
+
+    /// 响应系统 Spotlight 点击播放索引恢复曲目或跳转搜索
+    public func handleSpotlightUserActivity(
+        _ userActivity: NSUserActivity,
+        onSearchFallback: (@MainActor () -> Void)? = nil
+    ) {
+        guard userActivity.activityType == "com.egoist.mygomusic.playing" else { return }
+        let info = userActivity.userInfo ?? [:]
+        let trackID = (info["trackID"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trackName = (info["trackName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sourceID = (info["source"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        Task {
+            await waitUntilStartupReady()
+            if !trackID.isEmpty {
+                if let orderIdx = player.order.firstIndex(where: { idx in
+                    guard idx >= 0 && idx < player.queue.count else { return false }
+                    let tr = player.queue[idx]
+                    return tr.id == trackID && (sourceID == nil || tr.source == sourceID)
+                }) {
+                    player.playTrack(player.queue, at: player.order[orderIdx])
+                    presentNowPlaying()
+                    return
+                }
+                if let matched = recentTracks.first(where: { $0.id == trackID && (sourceID == nil || $0.source == sourceID) }) {
+                    player.playTrack([matched], at: 0)
+                    presentNowPlaying()
+                    return
+                }
+                if sourceID == nil || sourceID == LocalMusicSource.sourceID,
+                   let localTrack = localSource.track(forFileURL: URL(fileURLWithPath: trackID)) {
+                    player.playTrack([localTrack], at: 0)
+                    presentNowPlaying()
+                    return
+                }
+            }
+            if !trackName.isEmpty {
+                onSearchFallback?()
+                searchQuery = trackName
+                await performSearch()
+            }
+        }
+    }
+
+    private func handleExternalFileURL(_ url: URL) {
+        Task {
+            await waitUntilStartupReady()
+            let secured = url.startAccessingSecurityScopedResource()
+            defer {
+                if secured { url.stopAccessingSecurityScopedResource() }
+            }
+            let ext = url.pathExtension.lowercased()
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            let existsAsDir = fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+            let isPluginFolder = existsAsDir && fm.fileExists(atPath: url.appendingPathComponent("plugin.json").path)
+
+            if ext == "zip" || isPluginFolder {
+                await importLocalPlugin(from: url)
+                return
+            }
+
+            let imported = localSource.importAudioFilesReturningURLs([url])
+            if let firstURL = imported.first {
+                switchSource(to: LocalMusicSource.sourceID)
+                if let track = localSource.track(forFileURL: firstURL) {
+                    player.playTrack([track], at: 0)
+                    presentNowPlaying()
+                }
+                showToast(I18n.tf("Imported %d track(s)", imported.count))
+            } else {
+                showToast(I18n.t("No audio files imported"))
+            }
+        }
+    }
+
+    private func beginOfflineDownloadBackgroundTask() {
+        #if os(iOS) && canImport(UIKit)
+        activeOfflineDownloadCount += 1
+        if offlineDownloadBackgroundTaskID == .invalid {
+            offlineDownloadBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "MyGoMusic.OfflineDownload") { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let taskID = self.offlineDownloadBackgroundTaskID
+                    self.offlineDownloadBackgroundTaskID = .invalid
+                    if taskID != .invalid {
+                        UIApplication.shared.endBackgroundTask(taskID)
+                    }
+                }
+            }
+        }
+        #endif
+    }
+
+    private func endOfflineDownloadBackgroundTask() {
+        #if os(iOS) && canImport(UIKit)
+        activeOfflineDownloadCount = max(0, activeOfflineDownloadCount - 1)
+        if activeOfflineDownloadCount == 0 && offlineDownloadBackgroundTaskID != .invalid {
+            let taskID = offlineDownloadBackgroundTaskID
+            offlineDownloadBackgroundTaskID = .invalid
+            UIApplication.shared.endBackgroundTask(taskID)
+        }
+        #endif
     }
 
     public func showToast(_ text: String) {
@@ -2705,5 +2875,8 @@ public final class AppModel: ObservableObject {
 
     deinit {
         pathMonitor.cancel()
+        if let foregroundObserver {
+            NotificationCenter.default.removeObserver(foregroundObserver)
+        }
     }
 }

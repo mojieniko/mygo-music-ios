@@ -1323,7 +1323,7 @@ private struct DailyFeatureBackdropView: View {
                 }
             }
         }
-        .onChange(of: isAnimating) { _, active in
+        .mygoOnChange(of: isAnimating) { _, active in
             if active {
                 phaseAnchor = Date()
             }
@@ -1533,7 +1533,7 @@ private struct DailyMiniVinylRecordView: View {
             }
             .frame(width: size, height: size)
         }
-        .onChange(of: isAnimating) { _, active in
+        .mygoOnChange(of: isAnimating) { _, active in
             if active {
                 spinStart = Date()
             }
@@ -1699,7 +1699,7 @@ public struct TrackRowView: View {
                 .offset(x: isSelectionMode ? 0 : swipeOffset)
         }
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .onChange(of: isSelectionMode) { _, active in
+        .mygoOnChange(of: isSelectionMode) { _, active in
             if active && swipeOffset != 0 {
                 swipeOffset = 0
                 didTriggerSwipeHaptic = false
@@ -2080,12 +2080,12 @@ public struct LazyTrackRowsView: View {
                 }
             }
         }
-        .onChange(of: isSelectionActive) { _, active in
+        .mygoOnChange(of: isSelectionActive) { _, active in
             if !active {
                 selectedKeys.removeAll()
             }
         }
-        .onChange(of: tracks.count) { _, _ in
+        .mygoOnChange(of: tracks.count) { _, _ in
             let valid = Set(tracks.map(\.compositeKey))
             selectedKeys = selectedKeys.intersection(valid)
         }
@@ -3624,10 +3624,10 @@ public struct MyGoMarqueeText: View {
                     cycleStartDate = .now
                 }
             }
-            .onChange(of: text) { _, _ in
+            .mygoOnChange(of: text) { _, _ in
                 cycleStartDate = .now
             }
-            .onChange(of: isActive) { _, active in
+            .mygoOnChange(of: isActive) { _, active in
                 if active {
                     cycleStartDate = .now
                 }
@@ -3649,5 +3649,65 @@ public struct MyGoMarqueeText: View {
             startPoint: .leading,
             endPoint: .trailing
         )
+    }
+}
+
+// MARK: - iOS 16+ 向下兼容视图修饰符
+
+extension View {
+    /// 统一双参数 `onChange` 兼容封装（iOS 17+ 走新 API，iOS 16 自动退化为单参数形式）
+    @ViewBuilder
+    func mygoOnChange<V: Equatable>(of value: V, perform action: @escaping (V, V) -> Void) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            self.onChange(of: value) { oldValue, newValue in
+                action(oldValue, newValue)
+            }
+        } else {
+            self.modifier(LegacyOnChangeModifier(value: value, action: action))
+        }
+    }
+
+    /// 统一 `geometryGroup()` 兼容封装（iOS 17+ 启用原生群组变换，iOS 16 透传自身）
+    @ViewBuilder
+    func mygoGeometryGroup() -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            self.geometryGroup()
+        } else {
+            self
+        }
+    }
+
+    /// 统一底部安全内边距兼容封装（iOS 17+ 走 `safeAreaPadding`，iOS 16 走非拦截 `safeAreaInset`）
+    @ViewBuilder
+    func mygoSafeAreaPaddingBottom(_ inset: CGFloat) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            self.safeAreaPadding(.bottom, inset)
+        } else {
+            self.safeAreaInset(edge: .bottom, spacing: 0) {
+                Color.clear
+                    .frame(height: max(0, inset))
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+private struct LegacyOnChangeModifier<V: Equatable>: ViewModifier {
+    let value: V
+    let action: (V, V) -> Void
+    @State private var previousValue: V
+
+    init(value: V, action: @escaping (V, V) -> Void) {
+        self.value = value
+        self.action = action
+        _previousValue = State(initialValue: value)
+    }
+
+    func body(content: Content) -> some View {
+        content.onChange(of: value) { newValue in
+            let oldValue = previousValue
+            previousValue = newValue
+            action(oldValue, newValue)
+        }
     }
 }

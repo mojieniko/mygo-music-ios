@@ -3392,6 +3392,152 @@ final class MyGoMusicTests: XCTestCase {
         XCTAssertEqual(obj?["token"] as? String, "abc-123")
         _ = reloaded
     }
+
+    func testAppIconPresetDualPackageMappingAndVersionAlignment() {
+        XCTAssertNil(AppIconPreset.primary.resolvedAlternateIconName(bundlePrimaryIconName: "AppIcon"))
+        XCTAssertEqual(
+            AppIconPreset.appleMusic.resolvedAlternateIconName(bundlePrimaryIconName: "AppIcon"),
+            "AppIconAppleMusic"
+        )
+        XCTAssertEqual(
+            AppIconPreset.primary.resolvedAlternateIconName(bundlePrimaryIconName: "AppIconAppleMusic"),
+            "AppIcon"
+        )
+        XCTAssertNil(AppIconPreset.appleMusic.resolvedAlternateIconName(bundlePrimaryIconName: "AppIconAppleMusic"))
+
+        XCTAssertEqual(
+            AppIconPreset.currentPreset(forAlternateIconName: nil, bundlePrimaryIconName: "AppIcon"),
+            .primary
+        )
+        XCTAssertEqual(
+            AppIconPreset.currentPreset(forAlternateIconName: "AppIconAppleMusic", bundlePrimaryIconName: "AppIcon"),
+            .appleMusic
+        )
+        XCTAssertEqual(
+            AppIconPreset.currentPreset(forAlternateIconName: nil, bundlePrimaryIconName: "AppIconAppleMusic"),
+            .appleMusic
+        )
+        XCTAssertEqual(
+            AppIconPreset.currentPreset(forAlternateIconName: "AppIcon", bundlePrimaryIconName: "AppIconAppleMusic"),
+            .primary
+        )
+        XCTAssertEqual(JSPluginSource.appVersion, "0.1.24.8")
+    }
+
+    func testLocalSourceSharedDocumentsScanAndInboxExclusion() async throws {
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-shared-docs-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let localDir = tmpRoot.appendingPathComponent("local", isDirectory: true)
+        let docsDir = tmpRoot.appendingPathComponent("Documents", isDirectory: true)
+        let inboxDir = docsDir.appendingPathComponent("Inbox", isDirectory: true)
+        try FileManager.default.createDirectory(at: inboxDir, withIntermediateDirectories: true)
+
+        let wavData = Self.makeTinyTestWAVData()
+        try wavData.write(to: docsDir.appendingPathComponent("Shared - Song.wav"))
+        try wavData.write(to: inboxDir.appendingPathComponent("InboxOnly - Duplicate.wav"))
+
+        let src = LocalMusicSource(dataDir: localDir, sharedDocumentsFolder: docsDir, eagerSyncScan: true)
+        let tracks = try await src.search(query: "", kind: .tracks, offset: 0).tracks ?? []
+        XCTAssertEqual(tracks.count, 1, "应只扫描共享 Documents 目录并跳过 Documents/Inbox 避免重样")
+        XCTAssertEqual(tracks.first?.name, "Song")
+        XCTAssertEqual(tracks.first?.artistNames, "Shared")
+    }
+
+    @MainActor
+    func testExternalFileDeepLinkImportAndSpotlightActivityAndPrefetchInvalidation() async throws {
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-ext-open-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let app = AppModel(baseDataDir: tmpRoot)
+        await app.waitUntilStartupReady()
+
+        let externalAudio = tmpRoot.appendingPathComponent("Aimer - Brave Shine.wav")
+        try Self.makeTinyTestWAVData().write(to: externalAudio)
+
+        app.handleDeepLink(externalAudio)
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        XCTAssertEqual(app.activeSourceID, LocalMusicSource.sourceID)
+        XCTAssertEqual(app.localSource.trackCount(), 1)
+        XCTAssertEqual(app.player.currentTrack?.name, "Brave Shine")
+        XCTAssertTrue(app.isNowPlayingPresented)
+
+        app.player.invalidatePrefetchedMediaForQualityChange()
+
+        let track = try XCTUnwrap(app.player.currentTrack)
+        app.isNowPlayingPresented = false
+        let activity = NSUserActivity(activityType: "com.egoist.mygomusic.playing")
+        activity.userInfo = [
+            "trackID": track.id,
+            "trackName": track.name,
+            "source": LocalMusicSource.sourceID
+        ]
+        app.handleSpotlightUserActivity(activity)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(app.isNowPlayingPresented)
+    }
+
+    private static func makeTinyTestWAVData() -> Data {
+        let sampleRate: UInt32 = 8000
+        let sampleCount: UInt32 = 800
+        let dataSize = sampleCount * 2
+        var d = Data()
+        d.append(contentsOf: "RIFF".utf8)
+        var riffSize = UInt32(36 + dataSize).littleEndian
+        d.append(Data(bytes: &riffSize, count: 4))
+        d.append(contentsOf: "WAVEfmt ".utf8)
+        var fmtSize = UInt32(16).littleEndian
+        d.append(Data(bytes: &fmtSize, count: 4))
+        var audioFormat = UInt16(1).littleEndian
+        var channels = UInt16(1).littleEndian
+        var sr = sampleRate.littleEndian
+        var byteRate = (sampleRate * 2).littleEndian
+        var blockAlign = UInt16(2).littleEndian
+        var bits = UInt16(16).littleEndian
+        d.append(Data(bytes: &audioFormat, count: 2))
+        d.append(Data(bytes: &channels, count: 2))
+        d.append(Data(bytes: &sr, count: 4))
+        d.append(Data(bytes: &byteRate, count: 4))
+        d.append(Data(bytes: &blockAlign, count: 2))
+        d.append(Data(bytes: &bits, count: 2))
+        d.append(contentsOf: "data".utf8)
+        var ds = dataSize.littleEndian
+        d.append(Data(bytes: &ds, count: 4))
+        d.append(Data(count: Int(dataSize)))
+        return d
+    }
+
+    @MainActor
+    func testNowPlayingSeekRateAnchorAndSceneManifestAndSleepTimer() throws {
+        XCTAssertEqual(PlayerEngine.resolvedNowPlayingPlaybackRate(isPlaying: true, isLoading: false, isSeeking: false), 1.0)
+        XCTAssertEqual(PlayerEngine.resolvedNowPlayingPlaybackRate(isPlaying: true, isLoading: false, isSeeking: true), 0.0)
+        XCTAssertEqual(PlayerEngine.resolvedNowPlayingPlaybackRate(isPlaying: true, isLoading: true, isSeeking: false), 0.0)
+        XCTAssertEqual(PlayerEngine.resolvedNowPlayingPlaybackRate(isPlaying: false, isLoading: false, isSeeking: false), 0.0)
+
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let plistData = try Data(contentsOf: projectRoot.appendingPathComponent("App/Info.plist"))
+        let plist = try XCTUnwrap(PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any])
+        let manifest = try XCTUnwrap(plist["UIApplicationSceneManifest"] as? [String: Any])
+        XCTAssertEqual(manifest["UIApplicationSupportsMultipleScenes"] as? Bool, false)
+        let orientations = try XCTUnwrap(plist["UISupportedInterfaceOrientations"] as? [String])
+        XCTAssertEqual(orientations, ["UIInterfaceOrientationPortrait"])
+        let docTypes = try XCTUnwrap(plist["CFBundleDocumentTypes"] as? [[String: Any]])
+        XCTAssertGreaterThanOrEqual(docTypes.count, 2)
+
+        let cacheDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mygo-sleep-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: cacheDir) }
+        let engine = PlayerEngine(cacheDir: cacheDir, activateAudioSessionOnInit: false)
+        engine.setSleepTimer(.minutes(5))
+        XCTAssertEqual(engine.sleepTimerRemainingSeconds, 300)
+        engine.setSleepTimer(.off)
+        XCTAssertNil(engine.sleepTimerRemainingSeconds)
+        XCTAssertFalse(engine.sleepTimerStopsAfterCurrentTrack)
+    }
 }
 
 private final class LockedRequestRecorder: @unchecked Sendable {

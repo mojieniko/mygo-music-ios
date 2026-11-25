@@ -1790,7 +1790,16 @@ private final class PluginTimerCenter: @unchecked Sendable {
 // MARK: - JavaScript 插件音乐源实现（对应 plugin.Plugin）
 
 public final class JSPluginSource: MusicSource, @unchecked Sendable {
-    public static let appVersion = "0.1.24"
+    public static let appVersion: String = {
+        if Bundle.main.bundleIdentifier == "com.egoist.mygomusic.ios",
+           let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+            let trimmed = ver.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, PluginInstaller.parseVersionNumbers(trimmed) != nil {
+                return trimmed
+            }
+        }
+        return "0.1.24.8"
+    }()
     private static let defaultCallTimeout: TimeInterval = 30
     private static let signInCallTimeout: TimeInterval = 300
 

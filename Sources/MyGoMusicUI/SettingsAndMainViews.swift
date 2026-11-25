@@ -65,6 +65,10 @@ public struct SettingsView: View {
                     }
 
                     AccentColorPickerRow()
+
+                    #if os(iOS) && !targetEnvironment(macCatalyst)
+                    AppIconPickerRow()
+                    #endif
                 }
 
                 // 2. 播放与音质
@@ -83,7 +87,7 @@ public struct SettingsView: View {
                             Text(I18n.t(q.labelKey)).tag(q)
                         }
                     }
-                    .onChange(of: app.settings.wifiQuality) { _, newValue in
+                    .mygoOnChange(of: app.settings.wifiQuality) { _, newValue in
                         if !app.isOnCellularNetwork {
                             app.settings.quality = newValue
                         }
@@ -132,7 +136,7 @@ public struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .onChange(of: app.settings.coverPlayerMode) { _, enabled in
+                    .mygoOnChange(of: app.settings.coverPlayerMode) { _, enabled in
                         if enabled {
                             app.settings.lyricsStage = false
                             app.activeNowPlayingPane = .cover
@@ -351,6 +355,14 @@ public struct SettingsView: View {
                             cacheUsedBytes = app.player.diskCache.usedBytes()
                         }
                     }
+                    HStack {
+                        Spacer()
+                        Text(I18n.tf("Current Version %s", JSPluginSource.appVersion))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .listRowBackground(Color.clear)
                     .id("settingsBottom")
                 }
             }
@@ -368,7 +380,7 @@ public struct SettingsView: View {
                 #endif
             }
             #if DEBUG
-            .onChange(of: app.isStartupReady) { _, ready in
+            .mygoOnChange(of: app.isStartupReady) { _, ready in
                 guard ready else { return }
                 scrollToDebugSectionIfNeeded(using: scrollProxy, delay: 0.35)
             }
@@ -1019,7 +1031,7 @@ private struct PluginSettingFieldRow: View {
         .onAppear {
             loadInitialValue()
         }
-        .onChange(of: source.info().id) { _, _ in
+        .mygoOnChange(of: source.info().id) { _, _ in
             loadInitialValue()
         }
     }
@@ -1458,7 +1470,7 @@ public struct MiniPlayerBarView: View {
                     .onAppear {
                         pagerSlotWidth = slotW
                     }
-                    .onChange(of: slotW) { _, newW in
+                    .mygoOnChange(of: slotW) { _, newW in
                         pagerSlotWidth = newW
                     }
                 }
@@ -1500,7 +1512,7 @@ public struct MiniPlayerBarView: View {
                     .clipped()
                 }
                 .padding(.trailing, isCompact ? 10 : FloatingTabBarMetrics.miniTrailingPadding)
-                .geometryGroup()
+                .mygoGeometryGroup()
             }
             .frame(height: barHeight)
             .mygoLiquidGlass(in: capsuleShape, highOcclusion: true)
@@ -1512,7 +1524,7 @@ public struct MiniPlayerBarView: View {
                     )
                 }
             )
-            .geometryGroup()
+            .mygoGeometryGroup()
             .contentShape(capsuleShape)
             .offset(x: shellTensionX, y: min(0, swipePullUpY * 0.28) + landingBounceY)
             .scaleEffect(
@@ -1675,7 +1687,7 @@ public struct MiniPlayerBarView: View {
             )
             .scaleEffect(isCompact ? 0.94 : 1.0)
             .opacity(isCurrentSlot && hideArtworkForHeroFlight ? 0.0 : 1.0)
-            .geometryGroup()
+            .mygoGeometryGroup()
 
             VStack(alignment: .leading, spacing: 1.5) {
                 HStack(spacing: 4) {
@@ -1709,11 +1721,11 @@ public struct MiniPlayerBarView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .geometryGroup()
+            .mygoGeometryGroup()
         }
         .padding(.leading, FloatingTabBarMetrics.miniArtworkLeading)
         .frame(width: slotWidth, alignment: .leading)
-        .geometryGroup()
+        .mygoGeometryGroup()
     }
 
     private func animateButtonNextSwitchIfPossible(hasNextTrack: Bool) {
@@ -2620,7 +2632,7 @@ private struct VerticalScrollTrackingModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .safeAreaPadding(.bottom, bottomOverlayInset)
+            .mygoSafeAreaPaddingBottom(bottomOverlayInset)
             #if canImport(UIKit)
             .background(
                 VerticalScrollProbeRepresentable { metrics in
@@ -2846,7 +2858,7 @@ private struct PrimaryTabsCapsuleBar: View {
                 .frame(width: pillWidth, height: fullBarHeight, alignment: .center)
                 .foregroundStyle(foregroundColor(isSelected: isHighlight))
                 .opacity(isPressingInactive ? 0.72 : 1.0)
-                .geometryGroup()
+                .mygoGeometryGroup()
                 .opacity(isSlotVisible ? 1 : 0)
                 .animation(
                     isCollapsedToCircle
@@ -2871,7 +2883,7 @@ private struct PrimaryTabsCapsuleBar: View {
         }
         .frame(width: targetWidth, height: targetHeight)
         .mygoLiquidGlass(in: Capsule(style: .continuous), isHighlighted: isCollapsedToCircle && selectedSlot != nil)
-        .geometryGroup()
+        .mygoGeometryGroup()
         .contentShape(Capsule(style: .continuous))
         .onTapGesture {
             guard isCollapsedToCircle else { return }
@@ -2892,15 +2904,17 @@ private struct PrimaryTabsCapsuleBar: View {
                     handleDragEnded(value, selectedSlot: selectedSlot, activeBarWidth: activeBarWidth)
                 }
         )
-        .onChange(of: isCollapsedToCircle) { _, collapsed in
+        .mygoOnChange(of: isCollapsedToCircle) { _, collapsed in
             if collapsed {
                 resetDragTransientState()
             }
         }
-        .onChange(of: selectedTab) { _, newTab in
+        .mygoOnChange(of: selectedTab) { _, newTab in
             triggerTabIconAnimation(for: newTab)
         }
-        .sensoryFeedback(.selection, trigger: hapticCount)
+        .mygoOnChange(of: hapticCount) { _, _ in
+            MyGoHaptics.selection()
+        }
     }
 
     @ViewBuilder
@@ -3192,10 +3206,10 @@ private struct SearchCircleButton: View {
             }
             .frame(width: size, height: size)
             .mygoLiquidGlass(in: Circle(), isHighlighted: isSelected)
-            .geometryGroup()
+            .mygoGeometryGroup()
         }
         .buttonStyle(ScalePressButtonStyle())
-        .onChange(of: isSelected) { _, selected in
+        .mygoOnChange(of: isSelected) { _, selected in
             if selected {
                 triggerTiltAnimation()
             }
@@ -3306,7 +3320,7 @@ private struct AdaptiveFloatingBottomChrome: View {
                         isScrollPaused: false
                     )
                     .frame(width: miniWidth, height: miniHeight)
-                    .geometryGroup()
+                    .mygoGeometryGroup()
                     .offset(y: miniBottomOffset)
                 }
             }
@@ -3321,7 +3335,7 @@ private struct AdaptiveFloatingBottomChrome: View {
                     .onAppear {
                         measuredWidth = innerW
                     }
-                    .onChange(of: innerW) { _, newW in
+                    .mygoOnChange(of: innerW) { _, newW in
                         measuredWidth = newW
                     }
             }
@@ -3547,6 +3561,10 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
         private var morphingMiniHeightConstraint: NSLayoutConstraint?
         private var lastLaidOutBounds: CGRect = .zero
 
+        override var preferredStatusBarStyle: UIStatusBarStyle {
+            (coordinator?.isInteractiveForHitTesting == true) ? .lightContent : .default
+        }
+
         override func loadView() {
             let passthrough = NowPlayingPassthroughView()
             passthrough.hostController = self
@@ -3761,6 +3779,9 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
         private var transitionEpoch: Int = 0
         private var lockedHeroSnapshot: NowPlayingHeroArtworkSnapshot? = nil
         private var cachedCoverHeroRect: CGRect? = nil
+        private var cachedDragBarRect: CGRect? = nil
+        private var didSchedulePrewarm: Bool = false
+        private var activeAnimator: UIViewPropertyAnimator? = nil
         private weak var trackingScrollView: UIScrollView?
         private var demoDismissObserver: NSObjectProtocol?
         private var demoLyricsObserver: NSObjectProtocol?
@@ -3867,16 +3888,23 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             if hostController == nil {
                 attachToWindow(anchorView?.window)
             }
+            if !presented && hostingController == nil && !didSchedulePrewarm && parent.app.player.currentTrack != nil {
+                didSchedulePrewarm = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    guard let self, !self.currentlyPresented, self.hostingController == nil else { return }
+                    self.ensureHostingMounted(startHidden: true)
+                }
+            }
             guard presented != currentlyPresented else { return }
             currentlyPresented = presented
             if presented {
                 animateExpandFromMiniBar()
             } else {
-                animateCollapseToMiniBar(initialVelocity: 0.6)
+                animateCollapseToMiniBar(initialVelocity: 0.45)
             }
         }
 
-        private func ensureHostingMounted() {
+        private func ensureHostingMounted(startHidden: Bool = false) {
             guard let host = hostController else { return }
             let boundsSize = host.view.bounds.size
             guard boundsSize.width > 0, boundsSize.height > 0 else { return }
@@ -3889,6 +3917,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                     self?.canInteractiveDismiss = allowed
                 }
                 modalBridge.onRequestDismiss = dismissAction
+                modalBridge.isHostHidden = startHidden
                 let root = AnyView(
                     NowPlayingView()
                         .environmentObject(parent.app)
@@ -3898,6 +3927,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                         .environment(\.mygoOnNowPlayingCanDismissChanged, canDismissCallback)
                 )
                 let hc = UIHostingController(rootView: root)
+                hc.overrideUserInterfaceStyle = .dark
                 hc.view.backgroundColor = .clear
                 host.addChild(hc)
                 hc.view.transform = .identity
@@ -3910,7 +3940,12 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                 hc.view.setNeedsLayout()
                 hc.view.layoutIfNeeded()
                 hostingController = hc
+                if startHidden {
+                    host.view.isHidden = true
+                    host.view.isUserInteractionEnabled = false
+                }
             } else if let hc = hostingController {
+                modalBridge.isHostHidden = startHidden
                 hc.view.transform = .identity
                 hc.view.bounds = CGRect(origin: .zero, size: boundsSize)
                 hc.view.layoutIfNeeded()
@@ -3919,16 +3954,12 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             }
         }
 
-        private func unmountHostingIfHidden() {
+        private func hideHostingPreservingInstance() {
             guard !currentlyPresented, !isTransitioning else { return }
-            // 先保持冻结并完整拆除 hostingController，绝不在缩微期提前解冻触发 SwiftUI 写入 y<0 脏快照
+            // 常驻保留 hostingController 避免下次点击冷启动卡顿，同时彻底冻结后台渲染与动态特效
             modalBridge.freezeHeroSnapshotUpdates = true
-            if let hc = hostingController {
-                hc.willMove(toParent: nil)
-                hc.view.removeFromSuperview()
-                hc.removeFromParent()
-                hostingController = nil
-            }
+            modalBridge.isTransitioning = false
+            modalBridge.isHostHidden = true
             modalBridge.hideInnerHeroArtwork = false
             lockedHeroSnapshot = nil
             hostController?.cardShadowView.layer.shadowOpacity = 0
@@ -3943,6 +3974,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             hostController?.floatingHeroShadowView.isHidden = true
             hostController?.view.isHidden = true
             hostController?.view.isUserInteractionEnabled = false
+            hostController?.setNeedsStatusBarAppearanceUpdate()
         }
 
         private func resolvedTargetBarRect(in container: UIView) -> CGRect {
@@ -4096,11 +4128,16 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             let adjustedRadius = cornerRadius / avgScale
 
             if abs(host.floatingHeroShadowView.bounds.width - safeBase) > 0.5 ||
-                abs(host.floatingHeroShadowView.bounds.height - safeBase) > 0.5 {
+                abs(host.floatingHeroShadowView.bounds.height - safeBase) > 0.5 ||
+                host.floatingHeroShadowView.layer.shadowPath == nil {
                 UIView.performWithoutAnimation {
                     let fixedBounds = CGRect(x: 0, y: 0, width: safeBase, height: safeBase)
                     host.floatingHeroShadowView.transform = .identity
                     host.floatingHeroShadowView.bounds = fixedBounds
+                    host.floatingHeroShadowView.layer.shadowPath = UIBezierPath(
+                        roundedRect: fixedBounds,
+                        cornerRadius: cornerRadius / avgScale
+                    ).cgPath
                     host.floatingHeroClipView.frame = fixedBounds
                     host.floatingHeroArtworkView.frame = fixedBounds
                     let iconSide = max(24, min(48, safeBase * 0.22))
@@ -4119,20 +4156,28 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
         }
 
         private func applyCardFrameAndRadius(_ rectSize: CGSize, center: CGPoint, cornerRadius: CGFloat, shadowOpacity: Float, borderAlpha: CGFloat, in host: NowPlayingHostController) {
-            host.cardClipView.bounds = CGRect(origin: .zero, size: rectSize)
+            let targetBounds = CGRect(origin: .zero, size: rectSize)
+            if host.cardClipView.bounds.size != rectSize {
+                host.cardClipView.bounds = targetBounds
+                host.cardShadowView.bounds = targetBounds
+            }
             host.cardClipView.center = center
             host.cardClipView.layer.cornerRadius = cornerRadius
             host.cardClipView.layer.borderWidth = borderAlpha > 0.01 ? 0.65 : 0.0
-            let dynamicBorder = UIColor { traits in
-                let baseAlpha = traits.userInterfaceStyle == .dark ? borderAlpha * 1.4 : borderAlpha * 4.5
-                return UIColor.white.withAlphaComponent(min(0.85, baseAlpha))
+            if borderAlpha > 0.01 {
+                let isDark = host.traitCollection.userInterfaceStyle == .dark
+                let baseAlpha = isDark ? borderAlpha * 1.4 : borderAlpha * 4.5
+                host.cardClipView.layer.borderColor = UIColor.white.withAlphaComponent(min(0.85, baseAlpha)).cgColor
+            } else {
+                host.cardClipView.layer.borderColor = nil
             }
-            host.cardClipView.layer.borderColor = dynamicBorder.resolvedColor(with: host.traitCollection).cgColor
 
-            host.cardShadowView.bounds = CGRect(origin: .zero, size: rectSize)
             host.cardShadowView.center = center
             host.cardShadowView.layer.cornerRadius = cornerRadius
             host.cardShadowView.layer.shadowOpacity = shadowOpacity
+            host.cardShadowView.layer.shadowPath = shadowOpacity > 0.005
+                ? UIBezierPath(roundedRect: targetBounds, cornerRadius: cornerRadius).cgPath
+                : nil
         }
 
         private func applyDragGeometry(progress p: CGFloat, dragOffsetX: CGFloat) {
@@ -4156,8 +4201,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                 modalBridge.freezeHeroSnapshotUpdates = false
             }
 
-            // 对齐 Apple Music 原生逻辑：全宽抽屉垂直跟手一直拉到底部胶囊位置，仅顶边呈现 40pt 连续圆角，背后列表明亮透出
-            let barEnd = resolvedTargetBarRect(in: host.view)
+            let barEnd = cachedDragBarRect ?? resolvedTargetBarRect(in: host.view)
             let maxDropY = max(420.0, barEnd.minY + 12.0)
             let curW = fullBounds.width
             let curH = fullBounds.height
@@ -4184,7 +4228,9 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             host.floatingHeroShadowView.isHidden = true
 
             if let hostingView = hostingController?.view {
-                hostingView.bounds = CGRect(origin: .zero, size: fullBounds.size)
+                if hostingView.bounds.size != fullBounds.size {
+                    hostingView.bounds = CGRect(origin: .zero, size: fullBounds.size)
+                }
                 hostingView.transform = .identity
                 hostingView.center = CGPoint(x: curW * 0.5, y: curH * 0.5)
                 hostingView.alpha = 1.0
@@ -4194,7 +4240,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             host.cardSolidCapsuleTintView.alpha = 0.0
             host.cardGlassView.alpha = 0.0
             host.morphingMiniHeaderView.alpha = 0.0
-            host.backdropView.alpha = max(0, min(0.08, 0.08 * (1.0 - norm)))
+            host.backdropView.alpha = max(0, min(0.18, 0.18 * (1.0 - norm)))
         }
 
         func dismissFromButtonOrSwipe() {
@@ -4206,6 +4252,13 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             animateCollapseToMiniBar(initialVelocity: 0.0)
         }
 
+        private func stopActiveAnimator() {
+            if let anim = activeAnimator {
+                anim.stopAnimation(true)
+                activeAnimator = nil
+            }
+        }
+
         private func animateExpandFromMiniBar() {
             attachToWindow(anchorView?.window)
             guard let host = hostController else { return }
@@ -4213,18 +4266,22 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                 host.view.frame = superview.bounds
                 superview.bringSubviewToFront(host.view)
             }
+            stopActiveAnimator()
             transitionEpoch += 1
             let epoch = transitionEpoch
 
             // 展开前即刻冻结快照回调，确保从迷你条缩微态挂起 SwiftUI 期间零脏数据写入
             modalBridge.freezeHeroSnapshotUpdates = true
+            modalBridge.isHostHidden = false
+            modalBridge.isTransitioning = true
             canInteractiveDismiss = true
             trackingScrollView = nil
             lockedHeroSnapshot = nil
             host.view.isHidden = false
             host.view.isUserInteractionEnabled = true
+            host.setNeedsStatusBarAppearanceUpdate()
             host.view.layoutIfNeeded()
-            ensureHostingMounted()
+            ensureHostingMounted(startHidden: false)
 
             let fullBounds = host.view.bounds
             let barStart = resolvedTargetBarRect(in: host.view)
@@ -4260,11 +4317,10 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                 host.morphingMiniHeaderView.alpha = 1.0
 
                 if let hostingView = self.hostingController?.view {
-                    let s = max(0.84, barStart.width / max(1, fullBounds.width))
+                    // 保持自然全屏比例并轻度下沉微缩，避免文字按钮贴在 56pt 胶囊顶边硬拉猛冲
                     hostingView.bounds = CGRect(origin: .zero, size: fullBounds.size)
-                    hostingView.transform = CGAffineTransform(scaleX: s, y: s)
-                    // 顶边对齐 cardClipView 顶部，杜绝负向偏移
-                    hostingView.center = CGPoint(x: barStart.width * 0.5, y: (fullBounds.height * s) * 0.5)
+                    hostingView.center = CGPoint(x: fullBounds.midX, y: fullBounds.midY)
+                    hostingView.transform = CGAffineTransform(translationX: 0, y: 36).scaledBy(x: 0.95, y: 0.95)
                     hostingView.alpha = 0.0
                 }
 
@@ -4294,38 +4350,39 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                 let expandedHero = self.resolvedExpandedHeroSnapshot(in: host, allowLiveSnapshot: false)
 
                 UIView.animate(
-                    withDuration: 0.06,
+                    withDuration: 0.08,
                     delay: 0,
                     options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
                 ) {
                     host.morphingMiniHeaderView.alpha = 0.0
                 }
                 UIView.animate(
-                    withDuration: 0.26,
-                    delay: 0.03,
+                    withDuration: 0.14,
+                    delay: 0.02,
                     options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
                 ) {
                     host.cardSolidCapsuleTintView.alpha = 0.0
                 }
                 UIView.animate(
-                    withDuration: 0.28,
-                    delay: 0.18,
+                    withDuration: 0.16,
+                    delay: 0.04,
                     options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]
                 ) {
                     self.hostingController?.view.alpha = 1.0
                 }
 
-                // 灵动分频物理弹性：容器壳体从容展平全屏，独立专辑封面温润舒展飞越回正
-                UIView.animate(
-                    withDuration: 0.56,
-                    delay: 0,
-                    usingSpringWithDamping: 0.91,
-                    initialSpringVelocity: 0.0,
-                    options: [.allowUserInteraction, .beginFromCurrentState]
-                ) {
+                // 单一高刚度临界弹簧同步驱动外壳、大页与专辑封面，实现 Apple Music 一体化干脆生长
+                let timing = UISpringTimingParameters(
+                    mass: 1.0,
+                    stiffness: 340,
+                    damping: 34,
+                    initialVelocity: CGVector(dx: 0, dy: 0.5)
+                )
+                let animator = UIViewPropertyAnimator(duration: 0, timingParameters: timing)
+                animator.addAnimations {
                     self.activeProgress = 0.0
                     self.activeDragOffsetX = 0
-                    host.backdropView.alpha = 0.08
+                    host.backdropView.alpha = 0.18
                     self.applyCardFrameAndRadius(
                         fullBounds.size,
                         center: CGPoint(x: fullBounds.midX, y: fullBounds.midY),
@@ -4334,30 +4391,12 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                         borderAlpha: 0.0,
                         in: host
                     )
-
                     if let hostingView = self.hostingController?.view {
                         hostingView.bounds = CGRect(origin: .zero, size: fullBounds.size)
                         hostingView.transform = .identity
                         hostingView.center = CGPoint(x: fullBounds.midX, y: fullBounds.midY)
                     }
-                } completion: { _ in
-                    guard self.transitionEpoch == epoch else { return }
-                    self.isTransitioning = false
-                    self.modalBridge.freezeHeroSnapshotUpdates = false
-                    self.modalBridge.hideInnerHeroArtwork = false
-                    self.modalBridge.snapshotRefreshTick &+= 1
-                    host.floatingHeroShadowView.alpha = 0
-                    host.floatingHeroShadowView.isHidden = true
-                }
-
-                if showHeroOnExpand {
-                    UIView.animate(
-                        withDuration: 0.54,
-                        delay: 0,
-                        usingSpringWithDamping: 0.86,
-                        initialSpringVelocity: 0.25,
-                        options: [.allowUserInteraction, .beginFromCurrentState]
-                    ) {
+                    if showHeroOnExpand {
                         self.applyFloatingHeroTransform(
                             baseSide: heroBaseSide,
                             toRect: expandedHero.globalRect,
@@ -4369,65 +4408,54 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                         )
                     }
                 }
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-                    guard let self, self.transitionEpoch == epoch, self.currentlyPresented else { return }
+                animator.addCompletion { [weak self] position in
+                    guard let self, self.transitionEpoch == epoch, position == .end else { return }
+                    self.activeAnimator = nil
+                    self.isTransitioning = false
+                    self.modalBridge.isTransitioning = false
                     self.modalBridge.freezeHeroSnapshotUpdates = false
                     self.modalBridge.hideInnerHeroArtwork = false
                     self.modalBridge.snapshotRefreshTick &+= 1
-                    UIView.animate(withDuration: 0.06, delay: 0, options: [.curveEaseOut]) {
-                        host.floatingHeroShadowView.alpha = 0.0
-                    } completion: { _ in
-                        guard self.transitionEpoch == epoch else { return }
-                        host.floatingHeroShadowView.isHidden = true
-                    }
+                    host.floatingHeroShadowView.alpha = 0
+                    host.floatingHeroShadowView.isHidden = true
                 }
+                self.activeAnimator = animator
+                animator.startAnimation()
             }
         }
 
         private func animateCollapseToMiniBar(initialVelocity: CGFloat) {
             guard let host = hostController else { return }
+            stopActiveAnimator()
             transitionEpoch += 1
             let epoch = transitionEpoch
 
             modalBridge.freezeHeroSnapshotUpdates = true
-            let fullBounds = host.view.bounds
+            modalBridge.isTransitioning = true
+            host.setNeedsStatusBarAppearanceUpdate()
+
             let barEnd = resolvedTargetBarRect(in: host.view)
             let slotEndGlobal = globalMiniArtworkSlotRect(forBarRect: barEnd)
             let baseSnapshot = lockedHeroSnapshot ?? resolvedExpandedHeroSnapshot(in: host, allowLiveSnapshot: true)
             let useHeroFlight = baseSnapshot.isVisibleInCurrentPane && baseSnapshot.globalRect.width > 12
 
-            // 计算当前全宽卡片实时顶边位置，以及独立封面在 host.view 全局坐标系下的起始位置
             let currentCardFrame = host.cardClipView.frame
-            let currentTopY = max(0, currentCardFrame.minY)
-            let plungeTopY = barEnd.minY + 12.0
-            let needsPlungePhase = currentTopY < (barEnd.minY * 0.62)
-
             let startHeroGlobal = CGRect(
                 x: currentCardFrame.minX + baseSnapshot.globalRect.minX,
                 y: currentCardFrame.minY + baseSnapshot.globalRect.minY,
                 width: baseSnapshot.globalRect.width,
                 height: baseSnapshot.globalRect.height
             )
-            // 下沉终态封面位置：沉在底部胶囊下沿下方区域（保持饱满尺度，准备从容地由下往上回弹吸进左槽）
-            let plungeHeroSide = min(baseSnapshot.globalRect.width * 0.72, 164.0)
-            let plungeHeroGlobal = CGRect(
-                x: max(16.0, slotEndGlobal.minX + 14.0),
-                y: min(fullBounds.height - plungeHeroSide * 0.52, barEnd.maxY - 2.0),
-                width: plungeHeroSide,
-                height: plungeHeroSide
-            )
 
             let heroBaseSide = max(24, baseSnapshot.globalRect.width)
-            let cardVel = min(max(initialVelocity * 0.35, 0.0), 0.65)
-            let heroVel = min(max(initialVelocity * 0.45, 0.15), 0.75)
+            let clampedVel = min(max(initialVelocity, 0.2), 1.8)
             refreshMorphingMiniBarContent(in: host, barHeight: barEnd.height, hideMiniArtwork: useHeroFlight)
             syncSolidBackdropColors(in: host)
 
             UIView.performWithoutAnimation {
                 host.cardSolidBackdropView.alpha = 1.0
                 host.cardGlassView.alpha = 0.0
-                host.morphingMiniHeaderView.transform = CGAffineTransform(translationX: 10, y: 1.0).scaledBy(x: 0.96, y: 0.96)
+                host.morphingMiniHeaderView.transform = CGAffineTransform(translationX: 8, y: 0).scaledBy(x: 0.96, y: 0.96)
                 host.morphingMiniHeaderView.alpha = 0.0
                 self.modalBridge.hideInnerHeroArtwork = useHeroFlight
                 if useHeroFlight {
@@ -4456,191 +4484,100 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             isTransitioning = true
             host.view.isUserInteractionEnabled = false
 
-            let finishCollapseHandoff: () -> Void = { [weak self] in
-                guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
-                // 外壳已于中途就位稳住；封面精确归槽后仅同帧交还左槽封面图并撤除独立浮层，导航条零变色零顿挫
+            UIView.animate(
+                withDuration: 0.11,
+                delay: 0.0,
+                options: [.curveEaseOut, .beginFromCurrentState]
+            ) {
+                self.hostingController?.view.alpha = 0.0
+            }
+            UIView.animate(
+                withDuration: 0.18,
+                delay: 0.02,
+                options: [.curveEaseInOut, .beginFromCurrentState]
+            ) {
+                host.cardSolidCapsuleTintView.alpha = 1.0
+                host.cardSolidBackdropView.alpha = 0.0
+            }
+            UIView.animate(
+                withDuration: 0.18,
+                delay: 0.05,
+                options: [.curveEaseOut, .beginFromCurrentState]
+            ) {
+                host.morphingMiniHeaderView.alpha = 1.0
+                host.morphingMiniHeaderView.transform = .identity
+            }
+
+            // 单一高刚度弹簧同时驱动替身胶囊与封面严丝合缝同时归槽，抵达终点同帧再无缝交棒给真实底栏，消灭左槽空洞
+            let timing = UISpringTimingParameters(
+                mass: 1.0,
+                stiffness: 360,
+                damping: 35,
+                initialVelocity: CGVector(dx: 0, dy: clampedVel)
+            )
+            let animator = UIViewPropertyAnimator(duration: 0, timingParameters: timing)
+            animator.addAnimations {
+                self.activeProgress = 1.0
+                host.backdropView.alpha = 0.0
+                let isDark = host.traitCollection.userInterfaceStyle == .dark
+                self.applyCardFrameAndRadius(
+                    barEnd.size,
+                    center: CGPoint(x: barEnd.midX, y: barEnd.midY),
+                    cornerRadius: barEnd.height * 0.5,
+                    shadowOpacity: 0.20,
+                    borderAlpha: isDark ? 0.08 : 0.16,
+                    in: host
+                )
+                if useHeroFlight {
+                    self.applyFloatingHeroTransform(
+                        baseSide: heroBaseSide,
+                        toRect: slotEndGlobal,
+                        cornerRadius: FloatingTabBarMetrics.miniArtworkCornerRadius,
+                        shadowOpacity: 0.16,
+                        shadowRadius: 4.0,
+                        shadowY: 1.5,
+                        in: host
+                    )
+                }
+            }
+            animator.addCompletion { [weak self] position in
+                guard let self, self.transitionEpoch == epoch, !self.currentlyPresented, position == .end else { return }
+                self.activeAnimator = nil
                 NotificationCenter.default.post(name: .mygoMiniPlayerSetTransitionAlpha, object: [1.0, 0.0, 0.0])
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
                     guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
                     self.isTransitioning = false
                     NotificationCenter.default.post(name: .mygoNowPlayingDidCollapseToMiniBar, object: nil)
-                    self.unmountHostingIfHidden()
+                    self.hideHostingPreservingInstance()
                 }
             }
-
-            let runCapsuleShrinkAndHeroBounceBack: () -> Void = { [weak self] in
-                guard let self, let host = self.hostController,
-                      self.transitionEpoch == epoch, !self.currentlyPresented else { return }
-
-                // 缩框全程由高遮蔽深炭黑实体层接棒封住底层列表文字，绝不出现半透明过渡窗
-                UIView.animate(
-                    withDuration: 0.16,
-                    delay: 0.0,
-                    options: [.curveEaseInOut, .beginFromCurrentState]
-                ) {
-                    host.cardSolidCapsuleTintView.alpha = 1.0
-                    host.cardGlassView.alpha = 1.0
-                }
-                UIView.animate(
-                    withDuration: 0.22,
-                    delay: 0.02,
-                    options: [.curveEaseInOut, .beginFromCurrentState]
-                ) {
-                    host.cardSolidBackdropView.alpha = 0.0
-                }
-                UIView.animate(
-                    withDuration: 0.22,
-                    delay: 0.03,
-                    usingSpringWithDamping: 0.92,
-                    initialSpringVelocity: 0.15,
-                    options: [.beginFromCurrentState]
-                ) {
-                    host.morphingMiniHeaderView.alpha = 1.0
-                    host.morphingMiniHeaderView.transform = .identity
-                }
-
-                // 外框胶囊顺滑收缩成底部悬停深黑磨砂胶囊并落位 barEnd
-                UIView.animate(
-                    withDuration: 0.36,
-                    delay: 0,
-                    usingSpringWithDamping: 0.94,
-                    initialSpringVelocity: cardVel,
-                    options: [.beginFromCurrentState]
-                ) {
-                    self.activeProgress = 1.0
-                    host.backdropView.alpha = 0.0
-                    host.cardClipView.bounds = CGRect(origin: .zero, size: barEnd.size)
-                    host.cardClipView.center = CGPoint(x: barEnd.midX, y: barEnd.midY)
-                    host.cardClipView.layer.cornerRadius = barEnd.height * 0.5
-                    host.cardClipView.layer.borderWidth = 0.70
-                    let dynamicBorder = UIColor { traits in
-                        let baseAlpha: CGFloat = traits.userInterfaceStyle == .dark ? 0.11 : 0.72
-                        return UIColor.white.withAlphaComponent(baseAlpha)
-                    }
-                    host.cardClipView.layer.borderColor = dynamicBorder.resolvedColor(with: host.traitCollection).cgColor
-
-                    host.cardShadowView.bounds = CGRect(origin: .zero, size: barEnd.size)
-                    host.cardShadowView.center = CGPoint(x: barEnd.midX, y: barEnd.midY)
-                    host.cardShadowView.layer.cornerRadius = barEnd.height * 0.5
-                    host.cardShadowView.layer.shadowOpacity = 0.20
-
-                    if let hostingView = self.hostingController?.view {
-                        hostingView.alpha = 0.0
-                    }
-                } completion: { _ in
-                    if !useHeroFlight {
-                        finishCollapseHandoff()
-                    }
-                }
-
-                // 卡片收束至 barEnd 后（t=0.28s）：先将底层真实 MiniPlayerBarView 外壳瞬间以 1.0 满遮蔽就位
-                // （保持左槽封面图隐形），隔 1~2 帧再单向轻退上层替身，彻底杜绝交叉渐隐透明空窗漏出背后文字与结尾变色
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
-                    guard let self, self.transitionEpoch == epoch, !self.currentlyPresented else { return }
-                    NotificationCenter.default.post(
-                        name: .mygoMiniPlayerSetTransitionAlpha,
-                        object: [1.0, 0.0, useHeroFlight ? 1.0 : 0.0]
-                    )
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in
-                        guard let self, let host = self.hostController,
-                              self.transitionEpoch == epoch, !self.currentlyPresented else { return }
-                        UIView.animate(
-                            withDuration: 0.08,
-                            delay: 0,
-                            options: [.curveEaseOut, .beginFromCurrentState]
-                        ) {
-                            host.cardClipView.alpha = 0.0
-                            host.cardShadowView.layer.shadowOpacity = 0.0
-                        }
-                    }
-                }
-
-                // 独立专辑封面：从胶囊下方低位一气呵成优美弧线抬升滑入 34×34 同心左槽并自然停稳
-                if useHeroFlight {
-                    UIView.animate(
-                        withDuration: 0.48,
-                        delay: 0.015,
-                        usingSpringWithDamping: 0.87,
-                        initialSpringVelocity: heroVel,
-                        options: [.beginFromCurrentState]
-                    ) {
-                        self.applyFloatingHeroTransform(
-                            baseSide: heroBaseSide,
-                            toRect: slotEndGlobal,
-                            cornerRadius: FloatingTabBarMetrics.miniArtworkCornerRadius,
-                            shadowOpacity: 0.16,
-                            shadowRadius: 4.0,
-                            shadowY: 1.5,
-                            in: host
-                        )
-                    } completion: { _ in
-                        finishCollapseHandoff()
-                    }
-                }
-            }
-
-            if needsPlungePhase {
-                // Stage 1（高位轻扫/点收起按钮触发）：先整卡全宽顺滑下沉到底，在速度未停前无缝接入 Stage 2
-                UIView.animate(
-                    withDuration: 0.18,
-                    delay: 0,
-                    options: [.curveEaseOut, .beginFromCurrentState]
-                ) {
-                    host.backdropView.alpha = 0.0
-                    self.hostingController?.view.alpha = 0.0
-                    self.applyCardFrameAndRadius(
-                        fullBounds.size,
-                        center: CGPoint(x: fullBounds.midX, y: plungeTopY + fullBounds.height * 0.5),
-                        cornerRadius: 38.0,
-                        shadowOpacity: 0.18,
-                        borderAlpha: 0.12,
-                        in: host
-                    )
-                    if useHeroFlight {
-                        self.applyFloatingHeroTransform(
-                            baseSide: heroBaseSide,
-                            toRect: plungeHeroGlobal,
-                            cornerRadius: 16.0,
-                            shadowOpacity: 0.24,
-                            shadowRadius: 12.0,
-                            shadowY: 6.0,
-                            in: host
-                        )
-                    }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) {
-                    runCapsuleShrinkAndHeroBounceBack()
-                }
-            } else {
-                // 慢速手势已直接将整卡全宽拖到底部下方：内页柔顺淡出，同步收拢外框并让下沉封面由下往上回弹归槽
-                UIView.animate(
-                    withDuration: 0.14,
-                    delay: 0,
-                    options: [.curveEaseOut, .beginFromCurrentState]
-                ) {
-                    self.hostingController?.view.alpha = 0.0
-                }
-                runCapsuleShrinkAndHeroBounceBack()
-            }
+            self.activeAnimator = animator
+            animator.startAnimation()
         }
 
         private func animateBounceBackToFullscreen(initialVelocity: CGFloat) {
+            stopActiveAnimator()
             transitionEpoch += 1
             let epoch = transitionEpoch
             isTransitioning = true
+            modalBridge.isTransitioning = true
             guard let host = hostController else { return }
 
-            UIView.animate(
-                withDuration: 0.42,
-                delay: 0,
-                usingSpringWithDamping: 0.90,
-                initialSpringVelocity: min(max(initialVelocity * 0.35, 0), 0.6),
-                options: [.allowUserInteraction, .beginFromCurrentState]
-            ) {
+            let timing = UISpringTimingParameters(
+                mass: 1.0,
+                stiffness: 350,
+                damping: 34,
+                initialVelocity: CGVector(dx: 0, dy: min(max(initialVelocity * 0.4, 0), 0.8))
+            )
+            let animator = UIViewPropertyAnimator(duration: 0, timingParameters: timing)
+            animator.addAnimations {
                 self.applyDragGeometry(progress: 0.0, dragOffsetX: 0)
-            } completion: { _ in
-                guard self.transitionEpoch == epoch else { return }
+            }
+            animator.addCompletion { [weak self] position in
+                guard let self, self.transitionEpoch == epoch, position == .end else { return }
+                self.activeAnimator = nil
                 self.isTransitioning = false
+                self.modalBridge.isTransitioning = false
                 self.lockedHeroSnapshot = nil
                 self.modalBridge.freezeHeroSnapshotUpdates = false
                 self.modalBridge.hideInnerHeroArtwork = false
@@ -4651,6 +4588,8 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
                     self.applyDragGeometry(progress: 0.0, dragOffsetX: 0)
                 }
             }
+            self.activeAnimator = animator
+            animator.startAnimation()
         }
 
         // MARK: UIPanGestureRecognizer & UIGestureRecognizerDelegate
@@ -4710,13 +4649,16 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
             guard let host = hostController, currentlyPresented else { return }
             let t = pan.translation(in: host.view)
             let v = pan.velocity(in: host.view)
-            let barEnd = resolvedTargetBarRect(in: host.view)
+            let barEnd = cachedDragBarRect ?? resolvedTargetBarRect(in: host.view)
             let dragScale = max(420.0, barEnd.minY + 12.0)
 
             switch pan.state {
             case .began:
+                stopActiveAnimator()
                 transitionEpoch += 1
                 isTransitioning = true
+                modalBridge.isTransitioning = true
+                cachedDragBarRect = barEnd
                 lockedHeroSnapshot = nil
                 modalBridge.freezeHeroSnapshotUpdates = true
                 modalBridge.hideInnerHeroArtwork = false
@@ -4755,6 +4697,7 @@ private struct NowPlayingModalContainer: UIViewRepresentable {
 
             case .ended, .cancelled, .failed:
                 trackingScrollView = nil
+                cachedDragBarRect = nil
                 let shouldDismiss = (activeProgress > 0.24) || (v.y > 520 && t.y > 24)
                 if shouldDismiss {
                     MyGoHaptics.impact(.soft)
@@ -4975,7 +4918,7 @@ public struct MainView: View {
                     .environment(\.mygoBottomOverlayInset, bottomOverlayInset)
                     .environment(\.mygoReportVerticalScroll, onReportScroll)
                     .environment(\.mygoResetScrollTracker, onResetScroll)
-                    .environment(\.mygoIsViewVisible, isActive && !isNowPlayingPresented)
+                    .environment(\.mygoIsViewVisible, isActive)
                     .tint(MyGoTheme.color(for: accentPreset))
                     .preferredColorScheme(preferredScheme)
             )
@@ -4984,7 +4927,6 @@ public struct MainView: View {
         private struct TabRootConfig: Equatable {
             let isActive: Bool
             let bottomOverlayInset: CGFloat
-            let isNowPlayingPresented: Bool
             let accentPreset: AccentColorPreset
             let preferredScheme: ColorScheme?
         }
@@ -5023,7 +4965,6 @@ public struct MainView: View {
                     let targetConfig = TabRootConfig(
                         isActive: isActive,
                         bottomOverlayInset: rep.bottomOverlayInset,
-                        isNowPlayingPresented: rep.isNowPlayingPresented,
                         accentPreset: rep.accentPreset,
                         preferredScheme: rep.preferredScheme
                     )
@@ -5179,7 +5120,7 @@ public struct MainView: View {
                             bottomSafeAreaInset = safeBottom
                         }
                     }
-                    .onChange(of: safeBottom) { _, newValue in
+                    .mygoOnChange(of: safeBottom) { _, newValue in
                         if abs(bottomSafeAreaInset - newValue) > 0.5 {
                             bottomSafeAreaInset = newValue
                         }
@@ -5193,7 +5134,7 @@ public struct MainView: View {
         .onAppear {
             MyGoTheme.setAccentPreset(app.settings.accentPreset)
         }
-        .onChange(of: app.settings.accentPreset) { _, newPreset in
+        .mygoOnChange(of: app.settings.accentPreset) { _, newPreset in
             MyGoTheme.setAccentPreset(newPreset)
         }
         #if canImport(UIKit)
@@ -5203,10 +5144,10 @@ public struct MainView: View {
                 MyGoSystemAppearanceConfigurator.apply(for: app.settings.appearance)
             }
         }
-        .onChange(of: app.settings.appearance) { _, newAppearance in
+        .mygoOnChange(of: app.settings.appearance) { _, newAppearance in
             MyGoSystemAppearanceConfigurator.apply(for: newAppearance)
         }
-        .onChange(of: colorScheme) { _, _ in
+        .mygoOnChange(of: colorScheme) { _, _ in
             MyGoSystemAppearanceConfigurator.apply(for: app.settings.appearance)
         }
         #endif
@@ -5222,14 +5163,14 @@ public struct MainView: View {
             }
         }
         #endif
-        .onChange(of: tabStore.selectedTab) { _, newTab in
+        .mygoOnChange(of: tabStore.selectedTab) { _, newTab in
             MyGoKeyboard.dismiss()
             if MainTabMapping.slotIndex(for: newTab) != nil {
                 tabStore.lastPrimaryTab = newTab
             }
             scrollCoordinator.resetAccumulatorAndExpand()
         }
-        .onChange(of: app.isNowPlayingPresented) { _, presented in
+        .mygoOnChange(of: app.isNowPlayingPresented) { _, presented in
             if presented {
                 MyGoKeyboard.dismiss()
             }
@@ -5266,7 +5207,7 @@ public struct MainView: View {
             }
         }
         #endif
-        .onChange(of: app.pendingQuickAction) { _, pending in
+        .mygoOnChange(of: app.pendingQuickAction) { _, pending in
             guard let pending else { return }
             app.pendingQuickAction = nil
             executeQuickAction(pending)
@@ -5278,11 +5219,20 @@ public struct MainView: View {
             activity.title = MyGoShareHelper.shareText(for: track)
             activity.isEligibleForSearch = true
             activity.isEligibleForHandoff = false
-            activity.userInfo = [
+            var info: [AnyHashable: Any] = [
                 "trackID": track.id,
                 "trackName": track.name,
                 "artist": track.artistNames
             ]
+            if let source = track.source, !source.isEmpty {
+                info["source"] = source
+            }
+            activity.userInfo = info
+        }
+        .onContinueUserActivity("com.egoist.mygomusic.playing") { activity in
+            app.handleSpotlightUserActivity(activity) {
+                switchToTab(MainTabMapping.searchTabID)
+            }
         }
         .sheet(isPresented: $app.isSignInSheetPresented) {
             SignInDialogSheetView()
@@ -5306,6 +5256,37 @@ public struct MainView: View {
             }
             #endif
             app.handleDeepLink(url)
+        }
+        .background {
+            // 全局外接键盘 / iPad 媒体快捷键（使用 Cmd 组合键避免与输入框打字冲突）
+            Group {
+                Button("") {
+                    MyGoHaptics.impact(.light)
+                    app.player.togglePlay()
+                }
+                .keyboardShortcut("p", modifiers: .command)
+
+                Button("") {
+                    MyGoHaptics.impact(.light)
+                    app.player.previous()
+                }
+                .keyboardShortcut(.leftArrow, modifiers: .command)
+
+                Button("") {
+                    MyGoHaptics.impact(.light)
+                    app.player.next()
+                }
+                .keyboardShortcut(.rightArrow, modifiers: .command)
+
+                Button("") {
+                    app.isNowPlayingPresented = false
+                    handleSearchCircleTap()
+                }
+                .keyboardShortcut("f", modifiers: .command)
+            }
+            .frame(width: 0, height: 0)
+            .opacity(0.001)
+            .accessibilityHidden(true)
         }
     }
 
@@ -5532,22 +5513,8 @@ public struct MainView: View {
         }
         #if os(iOS) && !targetEnvironment(macCatalyst)
         if let iconArg = query["icon"]?.lowercased() {
-            let targetName: String? = (iconArg == "applemusic" || iconArg == "apple")
-                ? AppIconPreset.appleMusic.alternateIconName
-                : nil
-            print("[MyGoIconDebug] supportsAlternateIcons=\(UIApplication.shared.supportsAlternateIcons) current=\(String(describing: UIApplication.shared.alternateIconName)) target=\(String(describing: targetName))")
-            UIApplication.shared.setAlternateIconName(targetName) { error in
-                Task { @MainActor in
-                    if let error {
-                        print("[MyGoIconDebug] setAlternateIconName error=\(error)")
-                        app.showToast("\(I18n.t("Failed to change app icon")): \(error.localizedDescription)")
-                    } else {
-                        print("[MyGoIconDebug] setAlternateIconName succeeded current=\(String(describing: UIApplication.shared.alternateIconName))")
-                        app.settings.appIconPreset = (targetName == nil) ? .primary : .appleMusic
-                        app.showToast(I18n.t("Alternate icon updated"))
-                    }
-                }
-            }
+            let targetPreset: AppIconPreset = (iconArg == "applemusic" || iconArg == "apple") ? .appleMusic : .primary
+            MyGoAppIconSwitcher.apply(preset: targetPreset, app: app)
         }
         #endif
     }
@@ -5689,6 +5656,8 @@ public final class MyGoApplicationDelegate: NSObject, UIApplicationDelegate {
 }
 
 public final class MyGoSceneDelegate: NSObject, UIWindowSceneDelegate {
+    public var window: UIWindow?
+
     public func scene(
         _ scene: UIScene,
         willConnectTo session: UISceneSession,
@@ -5773,3 +5742,130 @@ private struct AccentColorPickerRow: View {
         .padding(.vertical, 4)
     }
 }
+
+#if os(iOS) && !targetEnvironment(macCatalyst)
+/// 统一封装桌面应用图标切换与真实状态同步（供设置页选择器与 URL Scheme 共用）
+@MainActor
+private enum MyGoAppIconSwitcher {
+    static func syncCurrentPreset(into app: AppModel) {
+        let resolved = AppIconPreset.currentPreset(forAlternateIconName: UIApplication.shared.alternateIconName)
+        if app.settings.appIconPreset != resolved {
+            app.settings.appIconPreset = resolved
+        }
+    }
+
+    static func apply(preset: AppIconPreset, app: AppModel, completion: ((Bool) -> Void)? = nil) {
+        let current = AppIconPreset.currentPreset(forAlternateIconName: UIApplication.shared.alternateIconName)
+        if current == preset {
+            app.settings.appIconPreset = preset
+            completion?(true)
+            return
+        }
+        guard UIApplication.shared.supportsAlternateIcons else {
+            app.showToast("\(I18n.t("Failed to change app icon")): supportsAlternateIcons=false")
+            completion?(false)
+            return
+        }
+        let targetName = preset.alternateIconName
+        UIApplication.shared.setAlternateIconName(targetName) { error in
+            Task { @MainActor in
+                if let error {
+                    let nsErr = error as NSError
+                    print("[MyGoIconDebug] setAlternateIconName(\(String(describing: targetName))) failed: \(nsErr.domain) (\(nsErr.code)) \(nsErr.localizedDescription)")
+                    syncCurrentPreset(into: app)
+                    app.showToast("\(I18n.t("Failed to change app icon")): \(nsErr.localizedDescription) (\(nsErr.code))")
+                    completion?(false)
+                } else {
+                    app.settings.appIconPreset = preset
+                    app.showToast(I18n.t("Alternate icon updated"))
+                    completion?(true)
+                }
+            }
+        }
+    }
+}
+
+private struct AppIconPickerRow: View {
+    @EnvironmentObject private var app: AppModel
+    @State private var isUpdating = false
+
+    var body: some View {
+        let activePreset = AppIconPreset.currentPreset(forAlternateIconName: UIApplication.shared.alternateIconName)
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(I18n.t("App Icon"))
+                Spacer()
+                Text(I18n.t(activePreset.labelKey))
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 12) {
+                ForEach(AppIconPreset.allCases) { preset in
+                    let isSelected = (app.settings.appIconPreset == preset)
+                    Button {
+                        guard !isUpdating else { return }
+                        MyGoHaptics.selection()
+                        isUpdating = true
+                        MyGoAppIconSwitcher.apply(preset: preset, app: app) { _ in
+                            isUpdating = false
+                        }
+                    } label: {
+                        VStack(spacing: 8) {
+                            ZStack(alignment: .topTrailing) {
+                                Image(preset.previewAssetName)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: 56, height: 56)
+                                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                            .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.6)
+                                    )
+
+                                if isSelected {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundStyle(MyGoTheme.accent)
+                                        .background(
+                                            Circle()
+                                                .fill(Color(.systemBackground))
+                                                .frame(width: 15, height: 15)
+                                        )
+                                        .offset(x: 5, y: -5)
+                                }
+                            }
+                            .padding(.top, 2)
+
+                            Text(I18n.t(preset.labelKey))
+                                .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                                .foregroundStyle(isSelected ? .primary : .secondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 10)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(isSelected ? MyGoTheme.accent.opacity(0.10) : Color.secondary.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(isSelected ? MyGoTheme.accent : Color.primary.opacity(0.08), lineWidth: isSelected ? 1.5 : 0.8)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isUpdating)
+                    .accessibilityLabel(I18n.t(preset.labelKey))
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear {
+            MyGoAppIconSwitcher.syncCurrentPreset(into: app)
+        }
+    }
+}
+#endif

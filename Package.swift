@@ -7,7 +7,7 @@ let package = Package(
     name: "MyGoMusic",
     defaultLocalization: "zh-Hans",
     platforms: [
-        .iOS(.v17),
+        .iOS(.v16),
         .macOS(.v14)
     ],
     products: [

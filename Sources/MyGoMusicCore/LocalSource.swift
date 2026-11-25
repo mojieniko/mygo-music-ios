@@ -40,6 +40,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
 
     public let dataDir: URL
     public let defaultMusicFolder: URL
+    public let sharedDocumentsFolder: URL?
 
     private let lock = NSLock()
     private var lib: LocalLibraryPersistence
@@ -56,11 +57,15 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
 
     public var onChange: (@Sendable () -> Void)?
 
-    public init(dataDir: URL, eagerSyncScan: Bool = true) {
+    public init(dataDir: URL, sharedDocumentsFolder: URL? = nil, eagerSyncScan: Bool = true) {
         self.dataDir = dataDir
         self.defaultMusicFolder = dataDir.appendingPathComponent("MusicFiles", isDirectory: true)
+        self.sharedDocumentsFolder = sharedDocumentsFolder
         try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: defaultMusicFolder, withIntermediateDirectories: true)
+        if let sharedDocumentsFolder {
+            try? FileManager.default.createDirectory(at: sharedDocumentsFolder, withIntermediateDirectories: true)
+        }
 
         let libFile = dataDir.appendingPathComponent("library.json")
         var didMigrate = false
@@ -69,6 +74,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
             let (normalized, changed) = Self.normalizePersistence(
                 decoded,
                 defaultMusicFolder: defaultMusicFolder,
+                sharedDocumentsFolder: sharedDocumentsFolder,
                 dataDir: dataDir
             )
             self.lib = normalized
@@ -79,6 +85,10 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
 
         if !self.lib.folders.contains(defaultMusicFolder.path) {
             self.lib.folders.insert(defaultMusicFolder.path, at: 0)
+            didMigrate = true
+        }
+        if let sharedPath = sharedDocumentsFolder?.path, !self.lib.folders.contains(sharedPath) {
+            self.lib.folders.append(sharedPath)
             didMigrate = true
         }
         if didMigrate {
@@ -125,6 +135,13 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         withLock { orderedTracks.count }
     }
 
+    public func track(forFileURL url: URL) -> Track? {
+        let path = url.standardizedFileURL.path
+        return withLock {
+            tracksByID[path] ?? (FileManager.default.fileExists(atPath: path) ? Self.skeletonTrack(at: url) : nil)
+        }
+    }
+
     public func addFolders(_ paths: [String]) {
         lock.lock()
         for raw in paths where !raw.isEmpty {
@@ -150,9 +167,15 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     /// 导入外部音频文件或目录到沙盒本地音乐目录
     @discardableResult
     public func importAudioFiles(_ urls: [URL]) -> Int {
+        importAudioFilesReturningURLs(urls).count
+    }
+
+    /// 导入外部音频文件或目录到沙盒本地音乐目录，并返回已落盘的目标音频文件 URL 列表
+    @discardableResult
+    public func importAudioFilesReturningURLs(_ urls: [URL]) -> [URL] {
         let fm = FileManager.default
         try? fm.createDirectory(at: defaultMusicFolder, withIntermediateDirectories: true)
-        var importedCount = 0
+        var importedURLs: [URL] = []
         for url in urls {
             let secured = url.startAccessingSecurityScopedResource()
             defer {
@@ -176,7 +199,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
                 do {
                     try fm.copyItem(at: source, to: staging)
                     try fm.moveItem(at: staging, to: destination)
-                    importedCount += 1
+                    importedURLs.append(destination)
                 } catch {
                     try? fm.removeItem(at: staging)
                     continue
@@ -195,8 +218,8 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
                 }
             }
         }
-        if importedCount > 0 { rescan() }
-        return importedCount
+        if !importedURLs.isEmpty { rescan() }
+        return importedURLs
     }
 
     // MARK: - 主动离线下载持久化与本地曲库联动
@@ -598,6 +621,11 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
                 continue
             }
             for case let fileURL as URL in enumerator {
+                if fileURL.lastPathComponent == "Inbox",
+                   fileURL.deletingLastPathComponent().lastPathComponent == "Documents" {
+                    enumerator.skipDescendants()
+                    continue
+                }
                 let ext = fileURL.pathExtension.lowercased()
                 guard supportedExtensions.contains(ext) else { continue }
                 let cleanPath = fileURL.standardizedFileURL.path
@@ -624,7 +652,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     private static func skeletonTrack(at fileURL: URL) -> Track {
         let inferred = inferNamesFromFilename(fileURL)
         let albumName = fileURL.deletingLastPathComponent().lastPathComponent
-        let cleanAlbum = albumName.isEmpty || albumName == "MusicFiles" ? "Unknown Album" : albumName
+        let cleanAlbum = albumName.isEmpty || albumName == "MusicFiles" || albumName == "Documents" ? "Unknown Album" : albumName
         let artistID = "artist:" + inferred.artist.lowercased()
         let albumID = "album:" + cleanAlbum.lowercased() + ":" + inferred.artist.lowercased()
         let artist = Artist(id: artistID, name: inferred.artist)
@@ -1155,9 +1183,14 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
 
     private static let sandboxLocalMarker = "/Library/Application Support/MyGoMusic/local/"
     private static let sandboxMusicFilesMarker = "/local/MusicFiles/"
+    private static let sandboxDocumentsMarker = "/Documents/"
 
     /// 将历史 iOS 容器 UUID 下的本地音频/目录路径自动重写到当前有效沙盒目录
-    private static func relocateSandboxPath(_ rawPath: String, to currentDataDir: URL) -> String {
+    private static func relocateSandboxPath(
+        _ rawPath: String,
+        to currentDataDir: URL,
+        sharedDocumentsFolder: URL? = nil
+    ) -> String {
         if let range = rawPath.range(of: sandboxLocalMarker) {
             let tail = String(rawPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             return tail.isEmpty ? currentDataDir.path : currentDataDir.appendingPathComponent(tail).path
@@ -1167,6 +1200,12 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
             let tail = String(rawPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             let base = currentDataDir.appendingPathComponent("MusicFiles", isDirectory: true)
             return tail.isEmpty ? base.path : base.appendingPathComponent(tail).path
+        }
+        if let sharedDocumentsFolder,
+           rawPath.contains("/var/mobile/Containers/Data/Application/") || rawPath.contains("/CoreSimulator/Devices/"),
+           let range = rawPath.range(of: sandboxDocumentsMarker) {
+            let tail = String(rawPath[range.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return tail.isEmpty ? sharedDocumentsFolder.path : sharedDocumentsFolder.appendingPathComponent(tail).path
         }
         return rawPath
     }
@@ -1184,11 +1223,12 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
     private static func normalizePersistence(
         _ raw: LocalLibraryPersistence,
         defaultMusicFolder: URL,
+        sharedDocumentsFolder: URL? = nil,
         dataDir: URL
     ) -> (LocalLibraryPersistence, Bool) {
         let fm = FileManager.default
         let migratedFolders = raw.folders.compactMap { folder -> String? in
-            let relocated = relocateSandboxPath(folder, to: dataDir)
+            let relocated = relocateSandboxPath(folder, to: dataDir, sharedDocumentsFolder: sharedDocumentsFolder)
             // 清理因老版本重装累加且已失效的历史沙盒 MusicFiles 路径，保留用户自选外置目录
             if relocated != defaultMusicFolder.path,
                relocated.contains("/MusicFiles"),
@@ -1198,13 +1238,13 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
             return relocated
         }
         let folders = deduplicatedPreservingOrder(migratedFolders)
-        let likes = deduplicatedPreservingOrder(raw.likes.map { relocateSandboxPath($0, to: dataDir) })
-        let recent = deduplicatedPreservingOrder(raw.recent.map { relocateSandboxPath($0, to: dataDir) })
+        let likes = deduplicatedPreservingOrder(raw.likes.map { relocateSandboxPath($0, to: dataDir, sharedDocumentsFolder: sharedDocumentsFolder) })
+        let recent = deduplicatedPreservingOrder(raw.recent.map { relocateSandboxPath($0, to: dataDir, sharedDocumentsFolder: sharedDocumentsFolder) })
         let playlists = raw.playlists.map { pl in
             StoredPlaylist(
                 id: pl.id,
                 name: pl.name,
-                tracks: deduplicatedPreservingOrder(pl.tracks.map { relocateSandboxPath($0, to: dataDir) })
+                tracks: deduplicatedPreservingOrder(pl.tracks.map { relocateSandboxPath($0, to: dataDir, sharedDocumentsFolder: sharedDocumentsFolder) })
             )
         }
         let changed = folders != raw.folders
@@ -1222,7 +1262,7 @@ public final class LocalMusicSource: MusicSource, @unchecked Sendable {
         if tracksByID[rawID] != nil && fm.fileExists(atPath: rawID) {
             return rawID
         }
-        let relocated = Self.relocateSandboxPath(rawID, to: dataDir)
+        let relocated = Self.relocateSandboxPath(rawID, to: dataDir, sharedDocumentsFolder: sharedDocumentsFolder)
         if tracksByID[relocated] != nil && fm.fileExists(atPath: relocated) {
             return relocated
         }

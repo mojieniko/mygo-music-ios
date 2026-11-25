@@ -42,7 +42,7 @@ public struct SearchView: View {
                             .onSubmit {
                                 submitSearch()
                             }
-                            .onChange(of: app.searchQuery) { _, newValue in
+                            .mygoOnChange(of: app.searchQuery) { _, newValue in
                                 Task { await app.updateSuggestions(for: newValue) }
                             }
                         if !app.searchQuery.isEmpty {
@@ -71,7 +71,7 @@ public struct SearchView: View {
                     .mygoElevatedSurface(cornerRadius: 12)
 
                     searchKindChips
-                        .onChange(of: app.searchKind) { _, _ in
+                        .mygoOnChange(of: app.searchKind) { _, _ in
                             dismissSearchKeyboard()
                             if !app.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
                                 Task { await app.performSearch() }
@@ -107,7 +107,7 @@ public struct SearchView: View {
                 .mygoTrackVerticalScroll()
             }
             .background(MyGoTheme.pageBackground.ignoresSafeArea())
-            .onChange(of: app.activeSourceID) { _, _ in
+            .mygoOnChange(of: app.activeSourceID) { _, _ in
                 dismissSearchKeyboard()
             }
             .onReceive(NotificationCenter.default.publisher(for: .mygoFocusSearchField)) { _ in
@@ -526,6 +526,9 @@ public struct LibraryView: View {
                 }
             }
             .mygoTrackVerticalScroll()
+            .refreshable {
+                await app.refreshActiveSource()
+            }
             .navigationTitle(I18n.t("Library"))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

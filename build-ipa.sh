@@ -27,7 +27,7 @@ BUILD_DIR="${SCRIPT_DIR}/.build-ipa"
 PAYLOAD_DIR="${BUILD_DIR}/Payload"
 APP_BUNDLE="${PAYLOAD_DIR}/MyGoMusic.app"
 IPA_OUT="${SCRIPT_DIR}/${IPA_FILENAME}"
-TARGET_TRIPLE="${IOS_TARGET_TRIPLE:-arm64-apple-ios17.0}"
+TARGET_TRIPLE="${IOS_TARGET_TRIPLE:-arm64-apple-ios16.0}"
 
 echo "==> [1/4] 检查 iOS SDK 环境..."
 if ! xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
@@ -87,8 +87,13 @@ sed \
     -e 's/\$(PRODUCT_NAME)/MyGo Music/g' \
     "${SCRIPT_DIR}/App/Info.plist" > "${APP_BUNDLE}/Info.plist"
 
-# 添加 iOS 必需的平台字段到 Info.plist
-/usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 17.0" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
+# 添加 iOS 必需的平台字段到 Info.plist（与 Xcode Archive 对齐，保障 mediaremoted / SpringBoard 正常识别与拉起）
+SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo '18.0')"
+SDK_NAME="iphoneos${SDK_VERSION}"
+/usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 16.0" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :DTPlatformName string iphoneos" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :DTPlatformVersion string ${SDK_VERSION}" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :DTSDKName string ${SDK_NAME}" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily array" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:0 integer 1" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :UIDeviceFamily:1 integer 2" "${APP_BUNDLE}/Info.plist" 2>/dev/null || true
@@ -102,7 +107,7 @@ if [ -d "${SCRIPT_DIR}/App/Assets.xcassets" ]; then
     xcrun actool "${SCRIPT_DIR}/App/Assets.xcassets" \
         --compile "${APP_BUNDLE}" \
         --platform iphoneos \
-        --minimum-deployment-target 17.0 \
+        --minimum-deployment-target 16.0 \
         --app-icon "${PRIMARY_ICON_NAME}" \
         --alternate-app-icon "${ALTERNATE_ICON_NAME}" \
         --output-partial-info-plist "${BUILD_DIR}/assetcatalog_generated_info.plist" >/dev/null 2>&1 || true
@@ -131,12 +136,6 @@ if os.path.exists(partial_path):
         if key in partial:
             data[key] = partial[key]
 
-alt = {
-    alternate_icon: {
-        "CFBundleIconName": alternate_icon
-    }
-}
-
 for key, default_files in (
     ("CFBundleIcons", [f"{primary_icon}60x60"]),
     ("CFBundleIcons~ipad", [f"{primary_icon}60x60", f"{primary_icon}76x76"]),
@@ -147,15 +146,43 @@ for key, default_files in (
             "CFBundleIconFiles": default_files,
             "CFBundleIconName": primary_icon,
         }
-    sec["CFBundleAlternateIcons"] = alt
+    existing_alt = dict(sec.get("CFBundleAlternateIcons") or {})
+    if alternate_icon not in existing_alt:
+        # 仅声明 CFBundleIconName 指向 Assets.car 内编译资产，不注入不存在的散装 CFBundleIconFiles
+        existing_alt[alternate_icon] = {
+            "CFBundleIconName": alternate_icon,
+        }
+    else:
+        entry = dict(existing_alt[alternate_icon])
+        entry.pop("CFBundleIconFiles", None)
+        entry.setdefault("CFBundleIconName", alternate_icon)
+        existing_alt[alternate_icon] = entry
+    sec["CFBundleAlternateIcons"] = existing_alt
     data[key] = sec
 
 with open(plist_path, "wb") as f:
     plistlib.dump(data, f)
 PY_EOF
 
-# 进行 Ad-hoc 签名（便于爱思助手/AltStore/Sideloadly 重签或 TrollStore 直接安装）
-codesign --force --deep --sign - "${APP_BUNDLE}"
+# 生成标准 Entitlements 并进行 Ad-hoc 签名（嵌入 application-identifier 以确保巨魔 TrollStore 安装后 mediaremoted/SpringBoard 可正常跳转回 App；自签工具重签时会自动替换）
+ENTITLEMENTS_PLIST="${BUILD_DIR}/entitlements.plist"
+cat > "${ENTITLEMENTS_PLIST}" << 'ENT_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>EGOIST0001.com.egoist.mygomusic.ios</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>EGOIST0001</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>EGOIST0001.com.egoist.mygomusic.ios</string>
+	</array>
+</dict>
+</plist>
+ENT_EOF
+codesign --force --deep --sign - --entitlements "${ENTITLEMENTS_PLIST}" "${APP_BUNDLE}"
 
 echo "==> [4/4] 压缩生成 MyGoMusic.ipa..."
 rm -f "${IPA_OUT}"

@@ -701,6 +701,11 @@ public struct BrowsePageView: View {
         }
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
+        .refreshable {
+            if let res = try? await app.activeSource.browse(page: page) {
+                self.browseData = res
+            }
+        }
         .navigationTitle(browseData?.title ?? fallbackTitle ?? I18n.t("Discover"))
         .task {
             isLoading = true
@@ -956,6 +961,16 @@ public struct AlbumDetailView: View {
         .coordinateSpace(name: MyGoDetailScrollSpace.name)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
+        .refreshable {
+            if let loaded = await app.loadAlbumPage(albumID: albumID, sourceID: sourceID) {
+                albumPage = loaded.page
+                resolvedSourceID = loaded.resolvedSourceID
+                isSaved = loaded.page.album.saved ?? app.savedAlbums.contains(where: { $0.id == albumID })
+                if let tracks = loaded.page.tracks {
+                    await app.checkLikes(for: tracks)
+                }
+            }
+        }
         .navigationTitle(isHeaderCollapsed ? albumTitle : "")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -1135,6 +1150,9 @@ public struct ArtistDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         #endif
         .mygoTrackVerticalScroll()
+        .refreshable {
+            await loadArtistDetails()
+        }
         .navigationTitle(isHeaderCollapsed ? (artistPage?.artist.name ?? fallbackName) : "")
         .toolbar {
             let tracks = artistPage?.tracks ?? []
@@ -1415,6 +1433,15 @@ public struct PlaylistDetailView: View {
         .coordinateSpace(name: MyGoDetailScrollSpace.name)
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
+        .refreshable {
+            if let loaded = try? await app.activeSource.playlist(id: playlistID) {
+                playlistData = loaded
+                isSaved = loaded.saved ?? app.savedPlaylists.contains(where: { $0.id == playlistID })
+                if let tracks = loaded.tracks {
+                    await app.checkLikes(for: tracks)
+                }
+            }
+        }
         .navigationTitle(isHeaderCollapsed ? (playlistData?.name ?? fallbackName) : "")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -1573,6 +1600,12 @@ public struct PodcastShowDetailView: View {
         }
         .background(MyGoTheme.pageBackground.ignoresSafeArea())
         .mygoTrackVerticalScroll()
+        .refreshable {
+            if let loaded = try? await app.activeSource.show(id: showID, offset: 0) {
+                showPage = loaded
+                isSubscribed = loaded.show.subscribed ?? app.subscribedShows.contains(where: { $0.id == showID })
+            }
+        }
         .navigationTitle(showPage?.show.name ?? fallbackName)
         .task {
             isLoading = true

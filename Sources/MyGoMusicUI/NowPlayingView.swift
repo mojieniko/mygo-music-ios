@@ -34,6 +34,10 @@ final class NowPlayingModalBridge: ObservableObject {
     @Published var hideInnerHeroArtwork: Bool = false
     /// 展开或回弹结束解锁快照时递增，主动驱动 SwiftUI 上报静止全屏的真实封面坐标
     @Published var snapshotRefreshTick: Int = 0
+    /// 宿主隐藏时置 true，暂停后台歌词滚动、舞台频谱等周期性动效实现零开销常驻复用
+    @Published var isHostHidden: Bool = false
+    /// 正在执行进出转场时置 true，减少并发重绘抢占 120Hz 转场帧率
+    @Published var isTransitioning: Bool = false
     var currentHeroSnapshot: NowPlayingHeroArtworkSnapshot = .init()
     /// 在卡片外框正缩在底部或处于动画变形期间冻结快照写入，避免用缩放后的脏坐标污染全屏基准
     var freezeHeroSnapshotUpdates: Bool = false
@@ -135,6 +139,21 @@ private struct HeroArtworkOuterVisibilityGate<Content: View>: View {
     }
 }
 
+/// 将宿主显隐态映射为子树的 `mygoIsViewVisible` 环境键，保证常驻隐藏时后台零 GPU/CPU 消耗
+private struct NowPlayingVisibilityScope<Content: View>: View {
+    @ObservedObject var bridge: NowPlayingModalBridge
+    let content: Content
+
+    init(bridge: NowPlayingModalBridge, @ViewBuilder content: () -> Content) {
+        self.bridge = bridge
+        self.content = content()
+    }
+
+    var body: some View {
+        content.environment(\.mygoIsViewVisible, !bridge.isHostHidden)
+    }
+}
+
 /// 仅订阅快照刷新与解锁事件，在展开/回弹静止后主动同步真实全屏封面坐标，零开销隔离重绘
 private struct HeroSnapshotObserverOverlay: View {
     @ObservedObject var bridge: NowPlayingModalBridge
@@ -149,13 +168,13 @@ private struct HeroSnapshotObserverOverlay: View {
             .onAppear {
                 publish(globalFrame)
             }
-            .onChange(of: globalFrame) { _, newFrame in
+            .mygoOnChange(of: globalFrame) { _, newFrame in
                 publish(newFrame)
             }
-            .onChange(of: bridge.snapshotRefreshTick) { _, _ in
+            .mygoOnChange(of: bridge.snapshotRefreshTick) { _, _ in
                 publish(globalFrame)
             }
-            .onChange(of: bridge.hideInnerHeroArtwork) { _, hidden in
+            .mygoOnChange(of: bridge.hideInnerHeroArtwork) { _, hidden in
                 if !hidden {
                     publish(globalFrame)
                 }
@@ -218,37 +237,40 @@ public struct NowPlayingView: View {
     public init() {}
 
     public var body: some View {
-        NavigationStack(path: $navPath) {
-            ZStack(alignment: .top) {
-                NowPlayingBackdropView(
-                    imageURL: app.player.currentTrack?.album.imageUrl,
-                    player: app.player,
-                    fogEnabled: app.settings.fog
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea(.all)
+        NowPlayingVisibilityScope(bridge: activeBridge) {
+            NavigationStack(path: $navPath) {
+                ZStack(alignment: .top) {
+                    NowPlayingBackdropView(
+                        imageURL: app.player.currentTrack?.album.imageUrl,
+                        player: app.player,
+                        fogEnabled: app.settings.fog
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea(.all)
 
-                playerMainContent
+                    playerMainContent
+                }
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea(.container, edges: app.activeNowPlayingPane == .cover ? .bottom : [])
+                #if os(iOS)
+                .toolbar(.hidden, for: .navigationBar)
+                #endif
+                .navigationDestination(for: NavigationTarget.self) { target in
+                    HomeView.buildDestination(for: target)
+                }
+                .environment(\.mygoNavigate) { target in
+                    navPath.append(target)
+                }
             }
-            .contentShape(Rectangle())
+            .preferredColorScheme(.dark)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .ignoresSafeArea(.container, edges: app.activeNowPlayingPane == .cover ? .bottom : [])
-            #if os(iOS)
-            .toolbar(.hidden, for: .navigationBar)
-            #endif
-            .navigationDestination(for: NavigationTarget.self) { target in
-                HomeView.buildDestination(for: target)
-            }
-            .environment(\.mygoNavigate) { target in
-                navPath.append(target)
-            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
             GeometryReader { proxy in
                 Color.clear
                     .onAppear { containerSize = proxy.size }
-                    .onChange(of: proxy.size) { _, newSize in
+                    .mygoOnChange(of: proxy.size) { _, newSize in
                         containerSize = newSize
                     }
             }
@@ -274,18 +296,21 @@ public struct NowPlayingView: View {
             isPaneArtworkFlying = false
             awaitingFlightTarget = nil
         }
-        .onChange(of: navPath.count) { _, newCount in
+        .mygoOnChange(of: navPath.count) { _, newCount in
             let canDismiss = (newCount == 0)
             onCanDismissChanged?(canDismiss)
             activeBridge.canInteractiveDismiss = canDismiss
         }
-        .onChange(of: app.activeNowPlayingPane) { _, _ in
+        .mygoOnChange(of: app.activeNowPlayingPane) { _, _ in
             syncIdleTimerState()
         }
-        .onChange(of: app.player.isPlaying) { _, _ in
+        .mygoOnChange(of: app.player.isPlaying) { _, _ in
             syncIdleTimerState()
         }
-        .onChange(of: scenePhase) { _, _ in
+        .mygoOnChange(of: scenePhase) { _, _ in
+            syncIdleTimerState()
+        }
+        .mygoOnChange(of: app.isNowPlayingPresented) { _, _ in
             syncIdleTimerState()
         }
         #if DEBUG
@@ -303,25 +328,6 @@ public struct NowPlayingView: View {
             }
         }
         #endif
-        .background {
-            // 外接键盘 / iPad 媒体快捷键支持（Cmd+左右切歌）
-            Group {
-                Button("") {
-                    MyGoHaptics.impact(.light)
-                    app.player.previous()
-                }
-                .keyboardShortcut(.leftArrow, modifiers: .command)
-
-                Button("") {
-                    MyGoHaptics.impact(.light)
-                    app.player.next()
-                }
-                .keyboardShortcut(.rightArrow, modifiers: .command)
-            }
-            .frame(width: 0, height: 0)
-            .opacity(0.001)
-            .accessibilityHidden(true)
-        }
         .alert(I18n.t("Save Queue"), isPresented: $showSaveQueueAlert) {
             TextField(I18n.t("New Playlist Name"), text: $saveQueuePlaylistName)
             Button(I18n.t("Cancel"), role: .cancel) {}
@@ -339,7 +345,8 @@ public struct NowPlayingView: View {
 
     private func syncIdleTimerState() {
         let shouldKeepScreenAwake = (scenePhase == .active)
-            && app.activeNowPlayingPane == .stage
+            && app.isNowPlayingPresented
+            && (app.activeNowPlayingPane == .stage || app.activeNowPlayingPane == .lyrics)
             && app.player.isPlaying
         setIdleTimerDisabled(shouldKeepScreenAwake)
     }
@@ -679,7 +686,7 @@ public struct NowPlayingView: View {
                                         widthRange: 12.01...CGFloat.greatestFiniteMagnitude
                                     )
                                 }
-                                .onChange(of: globalFrame) { _, newFrame in
+                                .mygoOnChange(of: globalFrame) { _, newFrame in
                                     activeBridge.updateHeroSnapshotIfValid(
                                         globalFrame: newFrame,
                                         cornerRadius: flyingArtworkCornerRadius,
@@ -1317,7 +1324,7 @@ public struct NowPlayingView: View {
                             }
                         }
                     }
-                    .onChange(of: app.activeNowPlayingPane) { _, pane in
+                    .mygoOnChange(of: app.activeNowPlayingPane) { _, pane in
                         if pane == .queue {
                             let target = app.player.currentOrderIndex
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
@@ -1503,7 +1510,7 @@ public struct NowPlayingView: View {
                                         .id("cap-\(idx)")
                                 }
                             }
-                            .onChange(of: activeCapIdx) { _, newIdx in
+                            .mygoOnChange(of: activeCapIdx) { _, newIdx in
                                 guard newIdx >= 0 else { return }
                                 withAnimation(.easeInOut(duration: 0.25)) {
                                     capProxy.scrollTo("cap-\(newIdx)", anchor: .center)
@@ -2020,7 +2027,7 @@ private struct NowPlayingBottomControlsView: View {
                 isActivelySmoking: isActivelySmoking,
                 timelinePaused: timelinePaused
             )
-            .onChange(of: isActivelySmoking) { _, active in
+            .mygoOnChange(of: isActivelySmoking) { _, active in
                 if wasActivelySmoking && !active {
                     trailDrainUntil = Date().addingTimeInterval(1.6)
                 }
@@ -3597,13 +3604,13 @@ private struct LyricsScrollView: View {
                                     }
                             )
                             // 自然播放推进换行（含从间奏或拖回前奏）
-                            .onChange(of: curIdx) { _, newIdx in
+                            .mygoOnChange(of: curIdx) { _, newIdx in
                                 if scrubbingPosition == nil && !isUserScrolling {
                                     scrollToFocus(index: newIdx, proxy: proxy, animated: true)
                                 }
                             }
                             // 用户在底栏进度条拖拽时：仅当目标行索引发生变化才即时定位，避免手抖打断滚动状态机
-                            .onChange(of: scrubbingPosition) { _, newScrub in
+                            .mygoOnChange(of: scrubbingPosition) { _, newScrub in
                                 guard let newScrub else {
                                     lastScrubTargetIndex = nil
                                     return
@@ -3619,7 +3626,7 @@ private struct LyricsScrollView: View {
                                 }
                             }
                             // 发起 Seek 与底层解码真落地两阶段对焦校准：确保“拖到哪就稳稳停在哪”
-                            .onChange(of: player.seekRevision) { _, revision in
+                            .mygoOnChange(of: player.seekRevision) { _, revision in
                                 autoSnapTask?.cancel()
                                 seekAlignmentTask?.cancel()
                                 layoutAlignmentTask?.cancel()
@@ -3630,7 +3637,7 @@ private struct LyricsScrollView: View {
                                     scrollToFocus(index: currentIndex, proxy: proxy, animated: true)
                                 }
                             }
-                            .onChange(of: player.seekSettledRevision) { _, settledRev in
+                            .mygoOnChange(of: player.seekSettledRevision) { _, settledRev in
                                 autoSnapTask?.cancel()
                                 seekAlignmentTask?.cancel()
                                 layoutAlignmentTask?.cancel()
@@ -3649,12 +3656,12 @@ private struct LyricsScrollView: View {
                                 refreshCachedLineMetadata()
                                 scheduleReliableAlignment(proxy: proxy, animated: false)
                             }
-                            .onChange(of: activePane) { _, pane in
+                            .mygoOnChange(of: activePane) { _, pane in
                                 guard pane == .lyrics else { return }
                                 isUserScrolling = false
                                 scheduleReliableAlignment(proxy: proxy, animated: false)
                             }
-                            .onChange(of: player.currentTrack?.id) { _, _ in
+                            .mygoOnChange(of: player.currentTrack?.id) { _, _ in
                                 refreshCachedLineMetadata()
                                 autoSnapTask?.cancel()
                                 seekAlignmentTask?.cancel()
@@ -3662,7 +3669,7 @@ private struct LyricsScrollView: View {
                                 isUserScrolling = false
                                 scheduleReliableAlignment(proxy: proxy, animated: false)
                             }
-                            .onChange(of: player.lyricsSignature) { _, _ in
+                            .mygoOnChange(of: player.lyricsSignature) { _, _ in
                                 refreshCachedLineMetadata()
                                 scheduleReliableAlignment(proxy: proxy, animated: false)
                             }
@@ -3751,7 +3758,9 @@ private struct LyricsScrollView: View {
             }
         }
         .animation(.easeInOut(duration: 0.36), value: activeQuietComment != nil)
-        .sensoryFeedback(.impact(weight: .light), trigger: seekHapticTrigger)
+        .mygoOnChange(of: seekHapticTrigger) { _, _ in
+            MyGoHaptics.impact(.light)
+        }
     }
 }
 
@@ -4185,13 +4194,14 @@ struct NowPlayingBackdropView: View {
         let tint = resolvedTint
         // 统一升级为 Apple Music 同款纯洁专辑主色模糊漫射渐变背景（全面告别浊白烟雾层）
         stillBackdropView(tint: tint)
+            .drawingGroup(opaque: true)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea(.all)
             .allowsHitTesting(false)
             .onAppear {
                 externalModalBridge?.currentBackdropTint = tint
             }
-            .onChange(of: tint) { _, newTint in
+            .mygoOnChange(of: tint) { _, newTint in
                 externalModalBridge?.currentBackdropTint = newTint
             }
             .task(id: imageURL ?? "") {

@@ -1482,10 +1482,12 @@ public final class PlayerEngine: ObservableObject {
     private var tapBassMovingMean: Double = 0.15
     private var lockScreenArtwork: MPMediaItemArtwork?
     private var lastPublishedNowPlayingMeta: NowPlayingDisplayMetadata?
+    private var lastLyricNowPlayingPublishUptime: TimeInterval = 0
     private var systemObservers: [NSObjectProtocol] = []
     private var wasPlayingBeforeInterruption: Bool = false
     private var sleepTimerTask: Task<Void, Never>?
     private var sleepTimerTargetDate: Date? = nil
+    private var isAppInBackgroundForTimer: Bool = false
     // 音频信号路径实时信息
     private var activeSignalDeliveryMode: String = "Direct Stream"
     private var activeSignalSampleRateHz: Int = 44_100
@@ -1496,6 +1498,9 @@ public final class PlayerEngine: ObservableObject {
     private var standbyTrackKey: String?
     private var standbyOrderIndex: Int?
     private var standbyStreamInfo: StreamInfo?
+    #if os(iOS) && canImport(UIKit)
+    private var transitionBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    #endif
     private var standbyResolvedLocalURL: URL?
     private var standbyDeliveryMode: String?
 
@@ -1634,7 +1639,7 @@ public final class PlayerEngine: ObservableObject {
 
     public func resume() {
         guard currentTrack != nil else { return }
-        ensureAudioSessionActive()
+        ensureAudioSessionActive(isSpokenAudio: currentTrack?.isEpisode == true)
         isPlaying = true
         if let player = avPlayer {
             applyPlayerVolume()
@@ -1921,18 +1926,39 @@ public final class PlayerEngine: ObservableObject {
             let target = Date().addingTimeInterval(TimeInterval(clampedSeconds))
             sleepTimerTargetDate = target
             sleepTimerRemainingSeconds = clampedSeconds
-            sleepTimerTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    guard let self, !Task.isCancelled else { return }
-                    guard let deadline = self.sleepTimerTargetDate else { return }
-                    let remaining = Int(ceil(deadline.timeIntervalSinceNow))
-                    if remaining <= 0 {
-                        self.completeSleepTimer()
-                        return
-                    }
-                    self.sleepTimerRemainingSeconds = remaining
+            restartSleepTimerLoopIfNeeded()
+        }
+    }
+
+    private func restartSleepTimerLoopIfNeeded() {
+        sleepTimerTask?.cancel()
+        sleepTimerTask = nil
+        guard let target = sleepTimerTargetDate else { return }
+        let immediateRemaining = Int(ceil(target.timeIntervalSinceNow))
+        if immediateRemaining <= 0 {
+            completeSleepTimer()
+            return
+        }
+        sleepTimerRemainingSeconds = immediateRemaining
+        let inBackground = isAppInBackgroundForTimer
+        sleepTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let sleepSeconds: TimeInterval
+                if inBackground {
+                    sleepSeconds = max(0.5, target.timeIntervalSinceNow)
+                } else {
+                    sleepSeconds = 1.0
                 }
+                let ns = UInt64((sleepSeconds * 1_000_000_000).rounded())
+                try? await Task.sleep(nanoseconds: max(100_000_000, ns))
+                guard let self, !Task.isCancelled else { return }
+                guard let deadline = self.sleepTimerTargetDate else { return }
+                let remaining = Int(ceil(deadline.timeIntervalSinceNow))
+                if remaining <= 0 {
+                    self.completeSleepTimer()
+                    return
+                }
+                self.sleepTimerRemainingSeconds = remaining
             }
         }
     }
@@ -2093,6 +2119,9 @@ public final class PlayerEngine: ObservableObject {
 
         updateNowPlayingCenter()
         onSessionChanged?()
+        if autoPlay {
+            ensureAudioSessionActive(isSpokenAudio: track.isEpisode)
+        }
 
         let offlineAudioURL = localOfflineFileResolver?(track)
 
@@ -2182,6 +2211,7 @@ public final class PlayerEngine: ObservableObject {
             return
         }
         cleanupStandbyPlayer()
+        beginPlaybackTransitionBackgroundTask()
 
         // 流媒体/本地文件播放处理（优先使用下一首流地址预取缓存）
         let quality = qualityProvider?() ?? "high"
@@ -2578,7 +2608,11 @@ public final class PlayerEngine: ObservableObject {
                         self.avPlayer?.play()
                         if self.isLoading {
                             armWatchdog()
+                        } else {
+                            self.endPlaybackTransitionBackgroundTask()
                         }
+                    } else {
+                        self.endPlaybackTransitionBackgroundTask()
                     }
                     self.updateNowPlayingCenter()
                 case .failed:
@@ -2600,6 +2634,7 @@ public final class PlayerEngine: ObservableObject {
                         return
                     }
                     self.cleanupAVPlayer()
+                    self.endPlaybackTransitionBackgroundTask()
                     self.isLoading = false
                     self.isPlaying = false
                     let comment = observedItem.errorLog()?.events.last?.errorComment
@@ -2621,6 +2656,7 @@ public final class PlayerEngine: ObservableObject {
                 case .playing:
                     self.isLoading = false
                     self.cancelBufferWatchdog()
+                    self.endPlaybackTransitionBackgroundTask()
                     self.updateNowPlayingCenter(useLiveClock: true)
                     if !usedProxy && !url.isFileURL && !isHLS, let cacheKey,
                        self.activeSpectrumTimeline == nil && self.backgroundCacheTask == nil {
@@ -3144,6 +3180,33 @@ public final class PlayerEngine: ObservableObject {
         audioBands = [0.12, 0.12, 0.12, 0.12, 0.12]
     }
 
+    /// 音质或网络制式变化时立即失效已预取/预热的备用流，避免在蜂窝下仍消耗 Wi-Fi 无损缓存流量
+    public func invalidatePrefetchedMediaForQualityChange() {
+        prefetchedStream = nil
+        prefetchAttemptedKey = nil
+        cleanupStandbyPlayer()
+    }
+
+    private func beginPlaybackTransitionBackgroundTask() {
+        #if os(iOS) && canImport(UIKit)
+        endPlaybackTransitionBackgroundTask()
+        transitionBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "MyGoMusic.PlaybackTransition") { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.endPlaybackTransitionBackgroundTask()
+            }
+        }
+        #endif
+    }
+
+    private func endPlaybackTransitionBackgroundTask() {
+        #if os(iOS) && canImport(UIKit)
+        guard transitionBackgroundTaskID != .invalid else { return }
+        let taskID = transitionBackgroundTaskID
+        transitionBackgroundTaskID = .invalid
+        UIApplication.shared.endBackgroundTask(taskID)
+        #endif
+    }
+
     private func makeAudioTap(for meter: AudioBandMeter) -> MTAudioProcessingTap? {
         let retainedMeter = Unmanaged.passRetained(meter).toOpaque()
         var callbacks = MTAudioProcessingTapCallbacks(
@@ -3194,18 +3257,19 @@ public final class PlayerEngine: ObservableObject {
 
     // MARK: - iOS 系统音频会话与锁屏/灵动岛控制中心
 
-    /// 统一配置长音频后台播放类别（声明 `.longFormAudio` 路由策略以激活灵动岛与 AirPlay 独立音轨）
-    nonisolated public static func configurePlaybackAudioSessionCategory() {
+    /// 统一配置长音频后台播放类别（声明 `.longFormAudio` 路由策略以激活灵动岛与 AirPlay 独立音轨，播客自动启用 `.spokenAudio`）
+    nonisolated public static func configurePlaybackAudioSessionCategory(isSpokenAudio: Bool = false) {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        if session.category == .playback && session.routeSharingPolicy == .longFormAudio {
+        let targetMode: AVAudioSession.Mode = isSpokenAudio ? .spokenAudio : .default
+        if session.category == .playback && session.mode == targetMode && session.routeSharingPolicy == .longFormAudio {
             return
         }
         do {
-            try session.setCategory(.playback, mode: .default, policy: .longFormAudio, options: [])
+            try session.setCategory(.playback, mode: targetMode, policy: .longFormAudio, options: [])
         } catch {
             do {
-                try session.setCategory(.playback, mode: .default, options: [])
+                try session.setCategory(.playback, mode: targetMode, options: [])
             } catch {
                 print("AVAudioSession category setup failed: \(error)")
             }
@@ -3214,16 +3278,16 @@ public final class PlayerEngine: ObservableObject {
     }
 
     private func configureAudioSession() {
-        ensureAudioSessionActive()
+        ensureAudioSessionActive(isSpokenAudio: currentTrack?.isEpisode == true)
     }
 
     nonisolated private static func preparePlaybackAudioCategory() {
         configurePlaybackAudioSessionCategory()
     }
 
-    private func ensureAudioSessionActive() {
+    private func ensureAudioSessionActive(isSpokenAudio: Bool = false) {
         #if os(iOS)
-        Self.configurePlaybackAudioSessionCategory()
+        Self.configurePlaybackAudioSessionCategory(isSpokenAudio: isSpokenAudio)
         do {
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
@@ -3296,7 +3360,10 @@ public final class PlayerEngine: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.syncSystemNowPlayingForTransition()
+                guard let self else { return }
+                self.isAppInBackgroundForTimer = true
+                self.restartSleepTimerLoopIfNeeded()
+                self.syncSystemNowPlayingForTransition()
             }
         }
         systemObservers.append(bgToken)
@@ -3307,7 +3374,10 @@ public final class PlayerEngine: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.currentTrack != nil else { return }
+                guard let self else { return }
+                self.isAppInBackgroundForTimer = false
+                self.restartSleepTimerLoopIfNeeded()
+                guard self.currentTrack != nil else { return }
                 if !self.isSeeking {
                     self.position = self.livePlaybackPosition()
                 }
@@ -3632,7 +3702,7 @@ public final class PlayerEngine: ObservableObject {
         }
     }
 
-    /// 仅当锁屏歌词行或曲目展示元数据确实变化时刷新 MPNowPlayingInfoCenter，避免高频写入被系统限流
+    /// 仅当锁屏歌词行或曲目展示元数据确实变化时刷新 MPNowPlayingInfoCenter，并节流避免高频刷新灵动岛吞点击
     private func syncNowPlayingLyricsIfNeeded(at sec: TimeInterval) {
         guard let tr = currentTrack else { return }
         let enabled = lockScreenLyricsProvider?() ?? true
@@ -3643,6 +3713,11 @@ public final class PlayerEngine: ObservableObject {
             lockScreenLyricsEnabled: enabled
         )
         if nextMeta != lastPublishedNowPlayingMeta {
+            let now = ProcessInfo.processInfo.systemUptime
+            if lastPublishedNowPlayingMeta != nil && (now - lastLyricNowPlayingPublishUptime) < 1.0 {
+                return
+            }
+            lastLyricNowPlayingPublishUptime = now
             updateNowPlayingCenter()
         }
     }
@@ -3666,6 +3741,15 @@ public final class PlayerEngine: ObservableObject {
         return isPlaying ? .playing : .paused
     }
 
+    /// 计算同步给系统媒体卡片的即时播放速率（seek 过程中暂锚定为 0.0，避免拖拽后进度条先跳回再回弹）
+    nonisolated public static func resolvedNowPlayingPlaybackRate(
+        isPlaying: Bool,
+        isLoading: Bool,
+        isSeeking: Bool
+    ) -> Double {
+        (isPlaying && !isLoading && !isSeeking) ? 1.0 : 0.0
+    }
+
     private func updateNowPlayingCenter(useLiveClock: Bool = false) {
         let center = MPNowPlayingInfoCenter.default()
         guard let tr = currentTrack else {
@@ -3685,14 +3769,21 @@ public final class PlayerEngine: ObservableObject {
             lockScreenLyricsEnabled: enabled
         )
         lastPublishedNowPlayingMeta = meta
+        lastLyricNowPlayingPublishUptime = ProcessInfo.processInfo.systemUptime
 
         let mediaType: MPMediaType = tr.isEpisode ? .podcast : .music
-        let playbackRate: Double = (isPlaying && !isLoading) ? 1.0 : 0.0
+        let playbackRate = Self.resolvedNowPlayingPlaybackRate(
+            isPlaying: isPlaying,
+            isLoading: isLoading,
+            isSeeking: isSeeking
+        )
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: meta.title,
             MPMediaItemPropertyArtist: meta.artist,
             MPMediaItemPropertyAlbumTitle: meta.albumTitle,
             MPMediaItemPropertyMediaType: mediaType.rawValue,
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            MPNowPlayingInfoPropertyExternalContentIdentifier: tr.compositeKey,
             MPMediaItemPropertyPersistentID: NSNumber(value: Self.persistentMediaID(for: tr)),
             MPMediaItemPropertyPlaybackDuration: duration > 0 ? duration : tr.durationSeconds,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
@@ -3700,6 +3791,9 @@ public final class PlayerEngine: ObservableObject {
             MPNowPlayingInfoPropertyPlaybackRate: playbackRate,
             MPNowPlayingInfoPropertyIsLiveStream: false
         ]
+        if !tr.album.id.isEmpty {
+            info[MPNowPlayingInfoCollectionIdentifier] = tr.album.id
+        }
         if !order.isEmpty, currentOrderIndex >= 0 {
             info[MPNowPlayingInfoPropertyPlaybackQueueIndex] = currentOrderIndex
             info[MPNowPlayingInfoPropertyPlaybackQueueCount] = order.count

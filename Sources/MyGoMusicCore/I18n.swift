@@ -658,6 +658,7 @@ public final class I18n: @unchecked Sendable {
         "Cover": "封面",
         "Cover Player": "经典封面播放页",
         "Display the Apple Music-style large cover player by default": "打开播放器时优先展现 Apple Music 风格大封面界面",
+        "Imported %d track(s)": "已导入 %d 首本地歌曲",
         "View Mode": "切换视图"
     ]
 }
