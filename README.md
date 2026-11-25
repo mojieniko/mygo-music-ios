@@ -14,6 +14,10 @@
 </p>
 
 <p align="center">
+  简体中文 | <a href="./README.en.md">English</a>
+</p>
+
+<p align="center">
   MyGo Music 的非官方 iOS / iPadOS 移植版。将插件生态、本地曲库、Apple Music 级大封面与歌词体验带到 Apple 移动设备，由社区独立维护。
 </p>
 
