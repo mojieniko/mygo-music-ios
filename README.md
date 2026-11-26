@@ -14,8 +14,40 @@
 </p>
 
 <p align="center">
-  简体中文 | <a href="./README.en.md">English</a>
+  <b>简体中文</b> | <a href="https://github.com/mojieniko/mygo-music-ios/blob/main/README.en.md">English (独立页)</a>
 </p>
+
+<details>
+<summary align="center"><b>🌐 English Version（点击在当前简介页直接展开英文版）</b></summary>
+
+<br>
+
+<p align="center">
+  An unofficial iOS / iPadOS port of MyGo Music. Bringing the plugin ecosystem, local music library, Apple Music-style Now Playing experience, and live lyrics to Apple mobile devices, independently maintained by the community.
+</p>
+
+### Key Features
+- **Playback & Visual Experience**: Apple Music-style full-screen Now Playing UI, adaptive artwork-tinted gradient backdrop, fluid cover-to-lyrics transitions, high-stiffness spring physics for bottom bar expand/dismiss, horizontal swipe on mini bar to skip tracks, marquee titles, pull-to-refresh, and line/word-synced lyrics with translation & Lock Screen lyrics.
+- **High-Resolution Audio**: Dynamic lossless format badges (FLAC / MP3 / WAV / AAC / M4A), real-time audio signal path, independent Wi-Fi & Cellular quality, gapless playback, offline downloads with background keep-alive, sleep timer, `.spokenAudio` podcast mode with resume memory, hot comments, and save queue as playlist.
+- **Deep iOS / iPadOS Integration**: Dynamic Island / Lock Screen / Control Center controls with tap-to-open app, iOS Files shared folder scanning, open audio & `.zip` plugins from other apps, Spotlight search recovery, Home Screen Quick Actions, global keyboard shortcuts (`⌘P` / `⌘←` / `⌘→` / `⌘F`), iPhone portrait lock & iPad full orientation.
+- **Plugins & Personalization**: Native JavaScriptCore plugin engine, Light / Dark / System themes, 5 accent colors, and one-tap alternate app icon switching (**MyGo Music / Apple Music**) in **Settings → Appearance**.
+
+### Download & Sideloading (iOS / iPadOS 16.0+)
+Download the latest `MyGoMusic.ipa` from [Releases](https://github.com/mojieniko/mygo-music-ios/releases/latest):
+- **TrollStore (Recommended, Permanent)**: Share `MyGoMusic.ipa` to [TrollStore](https://github.com/opa334/TrollStore) to install directly (run **Refresh App Registrations** in TrollStore Settings if icon or Dynamic Island caching occurs after updating).
+- **Sideloadly / AltStore / SideStore (Non-Jailbroken)**: Install via [Sideloadly](https://sideloadly.io/), [AltStore](https://altstore.io/), [SideStore](https://sidestore.io/), Feather, or ESign. Keep the default Bundle ID (`com.egoist.mygomusic.ios`) or preserve entitlements so Dynamic Island tap-to-open and in-app icon switching work properly.
+
+### Build from Source
+```bash
+git clone https://github.com/mojieniko/mygo-music-ios.git
+cd mygo-music-ios
+./build-ipa.sh
+```
+Open `MyGoMusic.xcodeproj` in Xcode to run on a device/simulator, or run `swift run MyGoMusicVerifier && swift test`.
+
+> Community-maintained port of [MyGo Music](https://github.com/egoist/mygo-music), licensed under [AGPL-3.0](./LICENSE). For the full standalone English page, see [README.en.md](./README.en.md).
+
+</details>
 
 <p align="center">
   MyGo Music 的非官方 iOS / iPadOS 移植版。将插件生态、本地曲库、Apple Music 级大封面与歌词体验带到 Apple 移动设备，由社区独立维护。

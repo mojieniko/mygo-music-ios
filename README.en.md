@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="./README.md">简体中文</a> | English
+  <a href="https://github.com/mojieniko/mygo-music-ios">简体中文</a> | <b>English</b>
 </p>
 
 <p align="center">
